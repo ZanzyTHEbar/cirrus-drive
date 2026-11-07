@@ -1,16 +1,22 @@
 # Cirrus Drive
 
-Cirrus Drive is an experimental Linux OpenCloud client. A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control the daemon. Files are read on demand, and edits are staged locally for synchronization.
+Cirrus Drive is an `experimental` early alpha Linux OpenCloud client. 
 
-**Use only a disposable server, account and data. This is not production-ready.** Reads cannot guarantee that OpenCloud's returned bytes are atomically bound to the observed version. Concurrent server changes can also cause lost updates during writes, deletes and renames. Namespace and open-handle behavior is incomplete, and filesystem, power-loss and lifecycle guarantees remain unqualified. Local `fsync` does not mean an upload is confirmed. Keep independent backups; pinned or staged data is not a backup.
+This was made partially because u do not like the native Qt OpenCloud app, interface, or filesystem implementation on Linux.
+
+A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control the daemon. Files are read on demand, and edits are staged locally for synchronization.
 
 ## Requirements
 
 - Linux with FUSE 3 (`/dev/fuse` and `fusermount3`), a private `XDG_RUNTIME_DIR`, and Linux 5.6 or newer with `openat2` available.
 - A graphical session with a browser, desktop portal and an unlocked Secret Service keyring for sign-in. The desktop window also needs a working Vulkan implementation.
-- Rust toolchain from `rust-toolchain.toml` and the native libraries required to build the workspace. State must be on a supported local filesystem; network and FUSE filesystems are not supported for state.
+- Rust toolchain from `rust-toolchain.toml` and the native libraries required to build the workspace. State must be on a supported local filesystem. Network and FUSE filesystems are not supported for state.
 
-Only one account is supported. Multiple Spaces may be mounted at separate locations. Credentials are stored in Secret Service; local state and file content are stored under `~/.local/state/cirrus-drive` without application-level encryption. Same-user processes are not isolated from one another. Storage controls do not impose a hard global limit. There is no state migration or account-removal workflow; updates may reject older state rather than migrate it.
+Only one account is supported for now. Multiple Spaces may be mounted at separate locations. Credentials are stored in Secret Service. Local state and file content are stored under `~/.local/state/cirrus-drive` without application-level encryption. Same-user processes are not isolated from one another. Storage controls do not impose a hard global limit. 
+
+> [!NOTE]
+> This is eadly aloha and experimental
+> There is no state migration or account-removal workflow yet. Updates may reject older state rather than migrate it. This will be fixed soon.
 
 ## Build and install
 
@@ -21,9 +27,9 @@ systemctl --user daemon-reload
 systemctl --user start cirrus-drive.service
 ```
 
-The installer uses the debug binaries in `target/debug`, installs user-local binaries, a systemd user service and a desktop launcher, and refuses to replace existing installation files. It does not start or enable the service. To use release binaries instead, build with `cargo build --locked --workspace --release` and run `CIRRUS_BIN_DIR="$PWD/target/release" ./packaging/install.sh`. An experimental Arch package recipe is described in [packaging/arch/README.md](packaging/arch/README.md). The packaging recipes do not yet include a complete set of third-party license notices; review and supply them before distributing binaries or packages.
+The installer uses the debug binaries in `target/debug`, installs user-local binaries, a systemd user service and a desktop launcher, and refuses to replace existing installation files. It does not start or enable the service. To use release binaries instead, build with `cargo build --locked --workspace --release` and run `CIRRUS_BIN_DIR="$PWD/target/release" ./packaging/install.sh`. An experimental Arch package recipe is described in [packaging/arch/README.md](packaging/arch/README.md).
 
-Alternatively, run `target/debug/cirrus-daemon` in a terminal; the daemon must remain running while the mount is in use. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
+Alternatively, run `target/debug/cirrus-daemon` in a terminal. The daemon must remain running while the mount is in use. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
 
 ## Connect and mount
 
@@ -35,7 +41,7 @@ cirrus-daemon --mount-space https://cloud.example SPACE_ID /absolute/path/to/emp
 cirrus-daemon --mounts
 ```
 
-Replace the URL and Space ID with those of your disposable instance. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
+Replace the URL and Space ID with those of your instance. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
 
 ## Sync, status and recovery
 
@@ -47,7 +53,7 @@ cirrus-daemon --journal https://cloud.example
 cirrus-daemon --unmount-space https://cloud.example SPACE_ID
 ```
 
-A successful mount enables automatic write-back for that Space; explicit sync is also available. Check sync status and the journal for pending, conflict or uncertain operations. Do not assume a failed or uncertain operation was applied or safely replayed. If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
+A successful mount enables automatic write-back for that Space. Explicit sync is also available. Check sync status and the journal for pending, conflict or uncertain operations. Do not assume a failed or uncertain operation was applied or safely replayed. If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
 
 Retained staged files and pinned copies can be inspected and exported using the commands in `cirrus-daemon --help`; retain the local state when investigating a problem. Saved metadata can be stale, and offline reads fail when the necessary content is unavailable. Do not delete local state or keyring entries to resolve an error without first preserving the data you need.
 
