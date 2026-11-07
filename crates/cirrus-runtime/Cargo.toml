@@ -1,0 +1,8 @@
+[package]
+name = "cirrus-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }

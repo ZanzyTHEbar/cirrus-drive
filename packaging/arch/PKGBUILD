@@ -1,0 +1,35 @@
+# Package a previously built, target-compatible release. See README.md.
+pkgname=cirrus-drive
+pkgver=0.1.0
+pkgrel=2
+pkgdesc='Experimental OpenCloud desktop client (disposable data only)'
+arch=('x86_64')
+license=('Apache-2.0')
+depends=("glibc>=${CIRRUS_GLIBC_MIN:?set CIRRUS_GLIBC_MIN}" 'gcc-libs' 'wayland' 'libxkbcommon' 'vulkan-icd-loader' 'fuse3' 'systemd' 'xdg-utils')
+optdepends=('vulkan-driver: Vulkan implementation required for the window'
+            'xdg-desktop-portal: browser login, folder picker and appearance settings'
+            'secret-service: credential storage')
+options=(!strip)
+source=('cirrus-daemon' 'cirrus-ui' 'cirrus-drive.service' 'cirrus-drive.desktop')
+sha256sums=("${CIRRUS_DAEMON_SHA256:?set CIRRUS_DAEMON_SHA256}"
+            "${CIRRUS_UI_SHA256:?set CIRRUS_UI_SHA256}"
+            "${CIRRUS_SERVICE_SHA256:?set CIRRUS_SERVICE_SHA256}"
+            "${CIRRUS_DESKTOP_SHA256:?set CIRRUS_DESKTOP_SHA256}")
+
+package() {
+    local status=0
+    "$srcdir/cirrus-daemon" --lab-capabilities >/dev/null 2>&1 || status=$?
+    if [[ $status -ne 2 ]]; then
+        error 'Refusing fault-injection or incompatible daemon binary'
+        return 1
+    fi
+    install -Dm755 "$srcdir/cirrus-daemon" "$pkgdir/usr/bin/cirrus-daemon"
+    install -Dm755 "$srcdir/cirrus-ui" "$pkgdir/usr/bin/cirrus-ui"
+    install -Dm644 "$srcdir/cirrus-drive.service" "$pkgdir/usr/lib/systemd/user/cirrus-drive.service"
+    install -Dm644 "$srcdir/cirrus-drive.desktop" "$pkgdir/usr/share/applications/cirrus-drive.desktop"
+    sed -i -e 's|^ExecStart=cirrus-daemon$|ExecStart=/usr/bin/cirrus-daemon|' \
+        -e 's|cirrus-daemon --stop|/usr/bin/cirrus-daemon --stop|' \
+        "$pkgdir/usr/lib/systemd/user/cirrus-drive.service"
+    sed -i 's|^Exec=cirrus-ui$|Exec=/usr/bin/cirrus-ui|' \
+        "$pkgdir/usr/share/applications/cirrus-drive.desktop"
+}

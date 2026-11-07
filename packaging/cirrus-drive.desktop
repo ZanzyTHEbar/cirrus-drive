@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Cirrus Drive
+Comment=Open the experimental Cirrus Drive control window
+Exec=cirrus-ui
+Terminal=false
+Categories=Network;FileTransfer;

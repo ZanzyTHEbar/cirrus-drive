@@ -1,0 +1,17 @@
+[package]
+name = "cirrus-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+cirrus-account = { path = "../cirrus-account" }
+cirrus-runtime = { path = "../cirrus-runtime" }
+cirrus-discovery = { path = "../cirrus-discovery" }
+cirrus-fuse = { path = "../cirrus-fuse" }
+rustix = { version = "1.1", features = ["fs", "net", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+fault-injection = ["cirrus-fuse/fault-injection", "cirrus-account/fault-injection"]

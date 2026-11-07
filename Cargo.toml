@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/cirrus-account", "crates/cirrus-daemon", "crates/cirrus-discovery", "crates/cirrus-fuse", "crates/cirrus-runtime", "crates/cirrus-ui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false

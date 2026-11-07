@@ -1,0 +1,14 @@
+/target/
+
+# Local design and development records; retained but not part of the release.
+/.impeccable/
+/DESIGN.md
+/PRODUCT.md
+/docs/
+
+# Generated files and local configuration.
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example

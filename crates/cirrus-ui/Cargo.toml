@@ -1,0 +1,11 @@
+[package]
+name = "cirrus-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+cirrus-daemon = { path = "../cirrus-daemon" }
+cirrus-runtime = { path = "../cirrus-runtime" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "f401bce5a9658413b559760c0c6774c4421324a9", default-features = false, features = ["native-file-dialog"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }

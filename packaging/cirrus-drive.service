@@ -1,0 +1,13 @@
+[Unit]
+Description=Cirrus Drive experimental daemon
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=cirrus-daemon
+ExecStop=/bin/sh -c 'while kill -0 "$$MAINPID" 2>/dev/null; do cirrus-daemon --stop && break; sleep 5; done; while kill -0 "$$MAINPID" 2>/dev/null; do sleep 1; done'
+Restart=on-failure
+TimeoutStopSec=infinity
+
+[Install]
+WantedBy=default.target
