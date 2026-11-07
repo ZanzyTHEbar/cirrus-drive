@@ -15,7 +15,7 @@ A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control t
 Only one account is supported for now. Multiple Spaces may be mounted at separate locations. Credentials are stored in Secret Service. Local state and file content are stored under `~/.local/state/cirrus-drive` without application-level encryption. Same-user processes are not isolated from one another. Storage controls do not impose a hard global limit. 
 
 > [!NOTE]
-> This is eadly aloha and experimental
+> This is early alpha and experimental
 > There is no state migration or account-removal workflow yet. Updates may reject older state rather than migrate it. This will be fixed soon.
 
 ## Build and install
