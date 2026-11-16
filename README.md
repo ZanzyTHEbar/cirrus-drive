@@ -1,8 +1,8 @@
 # Cirrus Drive
 
-Cirrus Drive is an `experimental` early alpha Linux OpenCloud client. 
+Cirrus Drive is an `experimental` early alpha Linux and MacOS OpenCloud client. 
 
-This was made partially because u do not like the native Qt OpenCloud app, interface, or filesystem implementation on Linux.
+This was made partially because I do not like the native Qt OpenCloud app, interface, or filesystem implementation on Linux.
 
 A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control the daemon. Files are read on demand, and edits are staged locally for synchronization.
 
