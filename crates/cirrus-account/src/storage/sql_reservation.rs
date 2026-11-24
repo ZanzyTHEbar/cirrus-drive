@@ -5,12 +5,13 @@ use std::os::fd::OwnedFd;
 
 use rusqlite::Connection;
 use rustix::{
-    fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, FileType, Mode, OFlags},
     process,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{StorageStatus, limits};
+use crate::account_storage::StorageRoot;
 use crate::{AccountError, offline, ownership};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,12 +67,11 @@ fn invalid() -> AccountError {
 }
 
 fn record(dir: &OwnedFd, store: Store) -> Result<Option<Record>, AccountError> {
-    let fd = match fs::openat2(
+    let fd = match ownership::open_private_file(
         dir,
         store.record(),
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     ) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::NOENT) => return Ok(None),
@@ -87,6 +87,8 @@ fn record(dir: &OwnedFd, store: Store) -> Result<Option<Record>, AccountError> {
         return Err(invalid());
     }
     let mut bytes = Vec::new();
+    #[cfg(target_os = "macos")]
+    ownership::darwin_acl::check_file(&fd).map_err(|_| invalid())?;
     std::fs::File::from(fd)
         .take(4097)
         .read_to_end(&mut bytes)
@@ -129,27 +131,30 @@ pub(crate) fn observe(
 
 /// Reservation ownership, never the global allocator lock. Nonblocking: a
 /// competing writer refuses/skips rather than waiting through a pin download.
-pub(crate) fn cleanup_lease(store: Store) -> Result<Option<ownership::StoreLease>, AccountError> {
+pub(crate) fn cleanup_lease_in(
+    root: &StorageRoot,
+    store: Store,
+) -> Result<Option<ownership::StoreLease>, AccountError> {
     // Cleanup is not new growth: malformed policy must not prohibit clean
     // release, but still coordinate it with any existing store reservation.
-    if limits::view().is_ok_and(|view| view.limits.is_none()) {
+    if limits::view_in(root).is_ok_and(|view| view.limits.is_none()) {
         return Ok(None);
     }
-    ownership::acquire_storage_store(store.name()).map(Some)
+    ownership::acquire_storage_store_in(root, store.name()).map(Some)
 }
 
-pub(crate) fn release(store: &str, token: &str) -> Result<(), AccountError> {
+pub(crate) fn release_in(root: &StorageRoot, store: &str, token: &str) -> Result<(), AccountError> {
     if store == "namespace" {
-        return super::namespace::release(token);
+        return super::namespace::release_in(root, token);
     }
     let store = match store {
         "state" => Store::State,
         "cache" => Store::Cache,
         _ => return Err(invalid()),
     };
-    let _lease = ownership::acquire_storage_store(store.name())?;
-    let _budget = ownership::acquire_staging()?;
-    let dir = ownership::state_dir()?;
+    let _lease = ownership::acquire_storage_store_in(root, store.name())?;
+    let _budget = ownership::acquire_staging_in(root)?;
+    let dir = root.directory();
     if record(&dir, store)?.is_none_or(|record| record.token != token) {
         return Err(invalid());
     }
@@ -160,28 +165,97 @@ pub(crate) fn release(store: &str, token: &str) -> Result<(), AccountError> {
 }
 
 pub(crate) struct SqlReservation {
+    root: StorageRoot,
     store: Store,
     token: String,
     dir: OwnedFd,
     _lease: ownership::StoreLease,
     own_record: bool,
-    scratch: Option<(String, std::fs::File, u64, u64)>,
+    scratch: Option<(String, std::fs::File, fs::Dev, u64)>,
     ceiling: u64,
     page_limit: u64,
 }
 
+// Pin download bytes stay named and globally charged while the State lease
+// is released for network and local capture. This owner cleans up only its inode.
+pub(crate) struct PinDownload {
+    root: StorageRoot,
+    dir: OwnedFd,
+    scratch: Option<(String, std::fs::File, fs::Dev, u64)>,
+}
+
+impl PinDownload {
+    pub(crate) fn file(&self) -> Result<&std::fs::File, AccountError> {
+        #[cfg(target_os = "macos")]
+        if let Some((_, file, ..)) = &self.scratch {
+            ownership::darwin_acl::check_file(file).map_err(|_| invalid())?;
+        }
+        self.scratch
+            .as_ref()
+            .map(|(_, file, ..)| file)
+            .ok_or_else(invalid)
+    }
+}
+
+impl Drop for PinDownload {
+    fn drop(&mut self) {
+        if let Some((name, file, dev, ino)) = self.scratch.take() {
+            if let Ok(_budget) = ownership::acquire_staging_in(&self.root) {
+                if let Ok(stat) = fs::statat(&self.dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    && (stat.st_dev, stat.st_ino, stat.st_nlink) == (dev, ino, 1)
+                {
+                    let _ = fs::unlinkat(&self.dir, name.as_str(), AtFlags::empty());
+                    let _ = fs::fsync(&self.dir);
+                }
+                // Pin identity through unlink, then close before budget sampling resumes.
+                drop(file);
+            }
+        }
+    }
+}
+
 impl SqlReservation {
-    pub(crate) fn begin(
+    pub(crate) fn release_download(mut self) -> Result<PinDownload, AccountError> {
+        let dir = self.dir.try_clone().map_err(|_| invalid())?;
+        {
+            let _budget = ownership::acquire_staging_in(&self.root)?;
+            let saved = record(&self.dir, self.store)?.ok_or_else(invalid)?;
+            let (name, file, dev, ino) = self.scratch.as_ref().ok_or_else(invalid)?;
+            let stat = fs::statat(&self.dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| invalid())?;
+            let actual = fs::fstat(file).map_err(|_| invalid())?;
+            if self.store != Store::State
+                || saved.token != self.token
+                || saved.scratch.as_ref() != Some(name)
+                || (stat.st_dev, stat.st_ino, stat.st_nlink) != (*dev, *ino, 1)
+                || (actual.st_dev, actual.st_ino) != (*dev, *ino)
+            {
+                return Err(invalid());
+            }
+            fs::unlinkat(&self.dir, self.store.record(), AtFlags::empty())
+                .map_err(|_| invalid())?;
+            fs::fsync(&self.dir).map_err(|_| invalid())?;
+            self.own_record = false;
+        }
+        Ok(PinDownload {
+            root: self.root.clone(),
+            dir,
+            scratch: self.scratch.take(),
+        })
+    }
+
+    pub(crate) fn begin_in(
+        root: &StorageRoot,
         store: Store,
         conn: Option<&Connection>,
         incoming: u64,
         metadata: u64,
         scratch: bool,
     ) -> Result<Option<Self>, AccountError> {
-        if limits::view()?.limits.is_none() {
+        if limits::view_in(root)?.limits.is_none() {
             return Ok(None);
         }
-        let lease = ownership::acquire_storage_store(store.name())?;
+        let lease = ownership::acquire_storage_store_in(root, store.name())?;
         // These queries happen before the budget flock, never during contention
         // on that lock. This is a conservative disk planning allowance, not a
         // claim that logical BLOB bytes equal physical SQLite growth.
@@ -213,9 +287,10 @@ impl SqlReservation {
             .and_then(|bytes| bytes.checked_add(pages.checked_mul(page)?.checked_mul(2)?))
             .ok_or_else(invalid)?;
         let mut reservation = Self {
+            root: root.clone(),
             store,
             token: offline::namespace_token()?,
-            dir: ownership::state_dir()?,
+            dir: root.directory().try_clone().map_err(|_| invalid())?,
             _lease: lease,
             own_record: false,
             scratch: None,
@@ -231,7 +306,7 @@ impl SqlReservation {
             {
                 // No allocator lock is held. Cache reservation acquisition is
                 // nonblocking and cache writers never acquire the State lease.
-                if crate::cache::reclaim_for_storage_pressure()? {
+                if crate::cache::reclaim_for_storage_pressure_in(root)? {
                     reservation.prepare(allowance, scratch.then_some(incoming))?;
                 } else {
                     return Err(error);
@@ -247,12 +322,12 @@ impl SqlReservation {
     }
 
     fn prepare(&mut self, allowance: u64, scratch: Option<u64>) -> Result<(), AccountError> {
-        let _budget = ownership::acquire_staging()?;
+        let _budget = ownership::acquire_staging_in(&self.root)?;
         if record(&self.dir, self.store)?.is_some() {
             return Err(invalid());
         }
-        let reservations = offline::storage_reservations()?;
-        let observation = super::allocation_status(&reservations)?;
+        let reservations = offline::storage_reservations_in(&self.root)?;
+        let observation = super::allocation_status_in(&self.root, &reservations)?;
         let rounded = allowance
             .checked_add(observation.filesystem_fragment_bytes - 1)
             .map(|bytes| {
@@ -260,7 +335,8 @@ impl SqlReservation {
                     * observation.filesystem_fragment_bytes
             })
             .ok_or_else(invalid)?;
-        limits::check(
+        limits::check_in(
+            &self.root,
             rounded
                 .checked_add(scratch.unwrap_or(0))
                 .and_then(|bytes| bytes.checked_add(observation.filesystem_fragment_bytes))
@@ -274,24 +350,22 @@ impl SqlReservation {
             .ok_or_else(invalid)?;
         if let Some(bytes) = scratch {
             let name = format!(".pin-download-{}", self.token);
-            let fd = fs::openat2(
+            let fd = ownership::open_private_file(
                 &self.dir,
                 name.as_str(),
                 OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
-                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
             )
             .map_err(|_| invalid())?;
             let stat = fs::fstat(&fd).map_err(|_| invalid())?;
             self.scratch = Some((name, std::fs::File::from(fd), stat.st_dev, stat.st_ino));
+            // Install the existing owned scratch cleanup before ACL admission.
+            #[cfg(target_os = "macos")]
+            ownership::darwin_acl::check_file(&self.scratch.as_ref().ok_or_else(invalid)?.1)
+                .map_err(|_| invalid())?;
             if bytes > 0 {
-                fs::fallocate(
-                    &self.scratch.as_ref().ok_or_else(invalid)?.1,
-                    fs::FallocateFlags::empty(),
-                    0,
-                    bytes,
-                )
-                .map_err(|_| AccountError::new("local storage capacity exhausted"))?;
+                ownership::file_ops::allocate(&self.scratch.as_ref().ok_or_else(invalid)?.1, bytes)
+                    .map_err(|_| AccountError::new("local storage capacity exhausted"))?;
             }
         }
         let record = Record {
@@ -301,16 +375,17 @@ impl SqlReservation {
             scratch: self.scratch.as_ref().map(|(name, ..)| name.clone()),
         };
         let temporary = format!(".sql-reservation-{}", self.token);
-        let fd = fs::openat2(
+        let fd = ownership::open_private_file(
             &self.dir,
             temporary.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(|_| invalid())?;
         let mut file = std::fs::File::from(fd);
         let published = (|| {
+            #[cfg(target_os = "macos")]
+            ownership::darwin_acl::check_file(&file).map_err(|_| invalid())?;
             file.write_all(&serde_json::to_vec(&record).map_err(|_| invalid())?)
                 .and_then(|()| file.sync_all())
                 .map_err(|_| invalid())?;
@@ -327,10 +402,14 @@ impl SqlReservation {
         let _ = fs::unlinkat(&self.dir, temporary.as_str(), AtFlags::empty());
         published?;
         fs::fsync(&self.dir).map_err(|_| invalid())?;
-        limits::check(0, &reservations)
+        limits::check_in(&self.root, 0, &reservations)
     }
 
     pub(crate) fn scratch(&self) -> Result<&std::fs::File, AccountError> {
+        #[cfg(target_os = "macos")]
+        if let Some((_, file, ..)) = &self.scratch {
+            ownership::darwin_acl::check_file(file).map_err(|_| invalid())?;
+        }
         self.scratch
             .as_ref()
             .map(|(_, file, ..)| file)
@@ -355,7 +434,7 @@ impl SqlReservation {
     }
 
     pub(crate) fn validate(&self, conn: &Connection) -> Result<(), AccountError> {
-        if limits::view()?.limits.is_none() {
+        if limits::view_in(&self.root)?.limits.is_none() {
             return Ok(());
         }
         // Actual SQLite page count includes BLOB/index/metadata pages, unlike
@@ -374,36 +453,34 @@ impl SqlReservation {
         {
             return Err(AccountError::new(limits::PRESSURE));
         }
-        let _budget = ownership::acquire_staging()?;
+        let _budget = ownership::acquire_staging_in(&self.root)?;
         if record(&self.dir, self.store)?.is_none_or(|record| record.token != self.token) {
             return Err(invalid());
         }
-        let reservations = offline::storage_reservations()?;
+        let reservations = offline::storage_reservations_in(&self.root)?;
         if self
             .store
-            .allocated(&super::allocation_status(&reservations)?)
+            .allocated(&super::allocation_status_in(&self.root, &reservations)?)
             > self.ceiling
         {
             return Err(AccountError::new(limits::PRESSURE));
         }
-        limits::check(0, &reservations)
+        limits::check_in(&self.root, 0, &reservations)
     }
 }
 
 impl Drop for SqlReservation {
     fn drop(&mut self) {
-        // Close scratch before unlink/releasing its ceiling so no anonymous
-        // allocation escapes cross-process measurement during normal cleanup.
-        let scratch = self.scratch.take().map(|(name, file, dev, ino)| {
-            drop(file);
-            (name, dev, ino)
-        });
-        if let Ok(_budget) = ownership::acquire_staging() {
-            if let Some((name, dev, ino)) = scratch
-                && let Ok(stat) = fs::statat(&self.dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                && (stat.st_dev, stat.st_ino, stat.st_nlink) == (dev, ino, 1)
-            {
-                let _ = fs::unlinkat(&self.dir, name.as_str(), AtFlags::empty());
+        let scratch = self.scratch.take();
+        if let Ok(_budget) = ownership::acquire_staging_in(&self.root) {
+            if let Some((name, file, dev, ino)) = scratch {
+                if let Ok(stat) = fs::statat(&self.dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    && (stat.st_dev, stat.st_ino, stat.st_nlink) == (dev, ino, 1)
+                {
+                    let _ = fs::unlinkat(&self.dir, name.as_str(), AtFlags::empty());
+                }
+                // Keep identity pinned until unlink, and close before releasing the ceiling.
+                drop(file);
             }
             if self.own_record
                 && record(&self.dir, self.store)

@@ -1,0 +1,4 @@
+module CirrusRetained {
+    header "CirrusRetained.h"
+    export *
+}

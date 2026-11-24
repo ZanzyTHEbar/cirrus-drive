@@ -7,10 +7,10 @@ use rustix::event::{self, PollFd, PollFlags, Timespec};
 use subtle::ConstantTimeEq;
 use url::Url;
 
-use crate::AccountError;
+use crate::{AccountError, SignIn};
 
 const MAX_REQUEST: usize = 8192;
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+pub(crate) const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const PAGE_START: &str = r#"<!doctype html>
@@ -67,20 +67,40 @@ impl Listener {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    #[cfg(test)]
     pub fn wait(
         self,
         state: &str,
         issuer: &str,
         require_issuer: bool,
         cancelled: &AtomicBool,
-        sign_in_cancelled: &AtomicBool,
+        attempt: &SignIn,
     ) -> Result<String, AccountError> {
-        let deadline = Instant::now() + CALLBACK_TIMEOUT;
+        self.wait_for_browser(
+            state,
+            issuer,
+            require_issuer,
+            cancelled,
+            attempt,
+            &mut crate::browser::BrowserRequest::default(),
+            Instant::now() + CALLBACK_TIMEOUT,
+        )
+    }
+
+    pub fn wait_for_browser(
+        self,
+        state: &str,
+        issuer: &str,
+        require_issuer: bool,
+        cancelled: &AtomicBool,
+        attempt: &SignIn,
+        browser: &mut crate::browser::BrowserRequest,
+        deadline: Instant,
+    ) -> Result<String, AccountError> {
         let mut attempts = 0;
         while attempts < 16 {
-            if sign_in_cancelled.load(Ordering::Acquire) {
-                return Err(AccountError::new("sign-in cancelled; you can try again"));
-            }
+            browser.poll();
+            attempt.check()?;
             if cancelled.load(Ordering::Acquire) {
                 return Err(AccountError::new(
                     "authorization cancelled by daemon shutdown",

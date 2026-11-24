@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -11,13 +14,25 @@ use std::time::{Duration, Instant};
 
 use cirrus_runtime::RuntimeDir;
 use nix::unistd::{Uid, User};
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use rustix::{
-    net::{self, sockopt},
-    process,
-};
+use rustix::fs::{self, Mode, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{FileType, ResolveFlags};
+#[cfg(target_os = "linux")]
+use rustix::net::{self, sockopt};
+use rustix::process;
 
 use crate::AccountError;
+use crate::account_storage::{RootIdentity, StorageRoot};
+
+pub(crate) mod credentials;
+#[cfg(target_os = "macos")]
+pub(crate) mod darwin_acl;
+pub(crate) mod file_ops;
+mod marker;
+pub(super) mod state_dir;
+
+// Default wrappers are temporary C6b migration boundaries for unrooted data
+// helpers. They do not bind nested helper I/O to an outer Guard's root.
 
 const MARKER: &str = "account.lock";
 const CONTENT: &[u8] = b"cirrus-drive account lock v1\n";
@@ -25,101 +40,287 @@ const SYNC_MARKER: &str = "sync.lock";
 const SYNC_CONTENT: &[u8] = b"cirrus-drive sync lock v1\n";
 const STAGING_MARKER: &str = "staging.lock";
 const STAGING_CONTENT: &[u8] = b"cirrus-drive staging lock v1\n";
-// Linux filesystem magic values for local filesystems with kernel-managed locks.
-const LOCAL_FILESYSTEMS: &[u64] = &[
-    0xef53,     // ext2/3/4
-    0x58465342, // XFS
-    0x9123683e, // Btrfs
-    0x01021994, // tmpfs
-    0xf2f52010, // F2FS
-    0x2fc12fc1, // ZFS
-];
-
 pub(crate) struct Guard {
     _lock: OwnedFd,
-    bus: zbus::blocking::Connection,
+    root: StorageRoot,
+    credentials: credentials::Context,
+    mode: LockMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Shared,
+    Exclusive,
+    // A failed flock conversion cannot prove that the old lock survived.
+    Unknown,
 }
 
 impl Guard {
-    pub fn connection(&self) -> &zbus::blocking::Connection {
-        &self.bus
+    pub(crate) fn storage_root(&self) -> &StorageRoot {
+        &self.root
+    }
+
+    pub fn is_exclusive(&self) -> bool {
+        self.mode == LockMode::Exclusive
+    }
+
+    pub fn credential_context(&self) -> &credentials::Context {
+        &self.credentials
     }
 
     pub fn reconnect(&mut self) -> Result<(), AccountError> {
-        if self.bus.is_closed() {
-            self.bus = connect_bus(true)?;
+        if self.mode == LockMode::Unknown {
+            return Err(AccountError::new("account lock mode is unavailable"));
+        }
+        self.root.revalidate()?;
+        #[cfg(target_os = "linux")]
+        if self.credentials.bus.is_closed() {
+            self.credentials.bus = connect_bus(true)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.credentials
+                .revalidate_principal(&self._lock, MARKER, CONTENT)?;
         }
         Ok(())
     }
 
-    pub fn downgrade(&self) -> Result<(), AccountError> {
+    pub fn downgrade(&mut self) -> Result<(), AccountError> {
+        #[cfg(target_os = "macos")]
+        if self.mode == LockMode::Unknown {
+            return Err(AccountError::new("account lock mode is unavailable"));
+        }
+        if self.mode == LockMode::Shared {
+            return Ok(());
+        }
+        self.mode = LockMode::Unknown;
         fs::flock(&self._lock, fs::FlockOperation::NonBlockingLockShared)
-            .map_err(|_| AccountError::new("cannot retain shared account ownership"))
+            .map_err(|_| AccountError::new("cannot retain shared account ownership"))?;
+        self.mode = LockMode::Shared;
+        Ok(())
     }
 }
 
-pub(crate) fn acquire(runtime: &RuntimeDir) -> Result<Guard, AccountError> {
+pub(crate) fn acquire_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+    #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
+) -> Result<Guard, AccountError> {
+    acquire_principal_in(
+        root,
+        runtime,
+        #[cfg(target_os = "macos")]
+        config,
+        false,
+    )
+}
+
+pub(crate) fn acquire_local_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+    #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
+) -> Result<Guard, AccountError> {
+    acquire_principal_in(
+        root,
+        runtime,
+        #[cfg(target_os = "macos")]
+        config,
+        true,
+    )
+}
+
+fn acquire_principal_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+    #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
+    local: bool,
+) -> Result<Guard, AccountError> {
     runtime
         .revalidate()
         .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
-    let lock = lock_file(
+    // Local namespace preparation needs fresh EX, even when credentials must
+    // remain noninteractive. Never upgrade a retained shared owner.
+    let automatic = crate::executor::is_automatic() && !local;
+    #[cfg(target_os = "linux")]
+    let lock = lock_file_in(
+        root,
         MARKER,
         CONTENT,
         // Automatic work may rotate only the already-bound principal's token.
         // Keep the exclusive bus owner for cross-process credential writers,
         // but do not exclude local retained-principal mounts/edits while the
         // keyring or network is slow. Principal changes still require EX flock.
-        if crate::executor::is_automatic() {
+        if automatic {
             fs::FlockOperation::NonBlockingLockShared
         } else {
             fs::FlockOperation::NonBlockingLockExclusive
         },
     )?;
-    let bus = connect_bus(true)?;
-    Ok(Guard { _lock: lock, bus })
+    #[cfg(target_os = "linux")]
+    let credentials = credentials::Context {
+        bus: connect_bus(true)?,
+    };
+    #[cfg(target_os = "macos")]
+    let (lock, credentials) = credential_ownership(
+        root,
+        config,
+        if automatic {
+            fs::FlockOperation::NonBlockingLockShared
+        } else {
+            fs::FlockOperation::NonBlockingLockExclusive
+        },
+        true,
+    )?;
+    Ok(Guard {
+        _lock: lock,
+        root: root.clone(),
+        credentials,
+        mode: if automatic {
+            LockMode::Shared
+        } else {
+            LockMode::Exclusive
+        },
+    })
 }
 
-pub(crate) fn acquire_shared(runtime: &RuntimeDir) -> Result<Guard, AccountError> {
+pub(crate) fn acquire_shared_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+    #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
+) -> Result<Guard, AccountError> {
     runtime
         .revalidate()
         .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
-    let lock = lock_file(MARKER, CONTENT, fs::FlockOperation::NonBlockingLockShared)?;
+    #[cfg(target_os = "linux")]
+    let lock = lock_file_in(
+        root,
+        MARKER,
+        CONTENT,
+        fs::FlockOperation::NonBlockingLockShared,
+    )?;
     // Staging may coexist with sync's exclusive bus name and same-principal
     // automatic rotation. Shared flock still excludes foreground account changes.
-    let bus = connect_bus(false)?;
-    Ok(Guard { _lock: lock, bus })
+    #[cfg(target_os = "linux")]
+    let credentials = credentials::Context {
+        bus: connect_bus(false)?,
+    };
+    #[cfg(target_os = "macos")]
+    let (lock, credentials) = credential_ownership(
+        root,
+        config,
+        fs::FlockOperation::NonBlockingLockShared,
+        false,
+    )?;
+    Ok(Guard {
+        _lock: lock,
+        root: root.clone(),
+        credentials,
+        mode: LockMode::Shared,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn credential_ownership(
+    root: &StorageRoot,
+    config: Option<&credentials::KeychainConfig>,
+    principal: fs::FlockOperation,
+    writer: bool,
+) -> Result<(OwnedFd, credentials::Context), AccountError> {
+    let config = config.ok_or_else(|| AccountError::new("Keychain access group is required"))?;
+    let directory = root.directory();
+    // Both markers are admitted under the SAME directory and home binding.
+    let lock =
+        marker::lock(directory, MARKER, CONTENT, principal, true).map_err(native_marker_error)?;
+    // Principal admission has completed. marker::lock releases its publication
+    // leaf before this requested writer flock; save never acquires either lock.
+    let fd = if writer {
+        Some(
+            marker::lock(
+                directory,
+                credentials::Context::MARKER,
+                credentials::Context::CONTENT,
+                fs::FlockOperation::NonBlockingLockExclusive,
+                true,
+            )
+            .map_err(native_marker_error)?,
+        )
+    } else {
+        None
+    };
+    Ok((lock, credentials::Context::new(config, root.clone(), fd)?))
+}
+
+#[cfg(target_os = "macos")]
+fn native_marker_error(error: marker::MarkerError) -> AccountError {
+    match error {
+        marker::MarkerError::Failure(message) => AccountError::new(message),
+        marker::MarkerError::Contended => {
+            AccountError::retryable_read("another account operation is in progress")
+        }
+    }
 }
 
 // Local retained-principal operations exclude foreground account changes
 // without contacting Secret Service or acquiring its bus name.
-pub(crate) fn acquire_offline(runtime: &RuntimeDir) -> Result<OwnedFd, AccountError> {
+pub(crate) fn acquire_offline_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+) -> Result<OwnedFd, AccountError> {
     runtime
         .revalidate()
         .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
-    lock_file(MARKER, CONTENT, fs::FlockOperation::NonBlockingLockShared)
+    lock_file_in(
+        root,
+        MARKER,
+        CONTENT,
+        fs::FlockOperation::NonBlockingLockShared,
+    )
 }
 
-pub(crate) fn acquire_sync(runtime: &RuntimeDir) -> Result<OwnedFd, AccountError> {
+// Pin removal/replacement must exclude an entire local staging turn, including an
+// immutable candidate not yet registered in SQLite. No Secret Service/bus.
+pub(crate) fn acquire_offline_exclusive_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+) -> Result<OwnedFd, AccountError> {
     runtime
         .revalidate()
         .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
-    lock_file(
+    lock_file_in(
+        root,
+        MARKER,
+        CONTENT,
+        fs::FlockOperation::NonBlockingLockExclusive,
+    )
+}
+
+pub(crate) fn acquire_sync_in(
+    root: &StorageRoot,
+    runtime: &RuntimeDir,
+) -> Result<OwnedFd, AccountError> {
+    runtime
+        .revalidate()
+        .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
+    lock_file_in(
+        root,
         SYNC_MARKER,
         SYNC_CONTENT,
         fs::FlockOperation::NonBlockingLockExclusive,
     )
 }
 
-pub(crate) fn acquire_scheduler() -> Result<OwnedFd, AccountError> {
-    lock_file(
+pub(crate) fn acquire_scheduler_in(root: &StorageRoot) -> Result<OwnedFd, AccountError> {
+    lock_file_in(
+        root,
         "scheduler.lock",
         b"cirrus-drive scheduler lock v1\n",
         fs::FlockOperation::NonBlockingLockExclusive,
     )
 }
 
-pub(crate) fn acquire_staging() -> Result<OwnedFd, AccountError> {
-    lock_file(
+pub(crate) fn acquire_staging_in(root: &StorageRoot) -> Result<OwnedFd, AccountError> {
+    lock_file_in(
+        root,
         STAGING_MARKER,
         STAGING_CONTENT,
         fs::FlockOperation::LockExclusive,
@@ -132,6 +333,7 @@ struct StoreSlot {
 }
 
 struct StoreOwners {
+    // Reserved through acquisition and final FD close, not just active use.
     owner: Option<std::thread::ThreadId>,
     waiting: VecDeque<std::thread::ThreadId>,
 }
@@ -155,12 +357,14 @@ pub(crate) type StoreLease = Arc<StoreLeaseInner>;
 pub(crate) struct StoreLeaseInner {
     fd: Option<OwnedFd>,
     slot: &'static StoreSlot,
+    root: StorageRoot,
+    identity: RootIdentity,
 }
 
 impl Drop for StoreLeaseInner {
     fn drop(&mut self) {
-        let mut state = self.slot.state.lock().expect("Store owner lock poisoned");
         drop(self.fd.take());
+        let mut state = self.slot.state.lock().expect("Store owner lock poisoned");
         state.owner = None;
         self.slot.released.notify_all();
     }
@@ -173,6 +377,8 @@ thread_local! {
 struct StateAdmission {
     lease: Option<StoreLease>,
     cancelled: Arc<AtomicBool>,
+    root: StorageRoot,
+    identity: RootIdentity,
 }
 pub(crate) struct LocalStateTurn {
     previous: Option<StateAdmission>,
@@ -191,8 +397,14 @@ impl Drop for LocalStateTurn {
 // Payload candidates retain their existing durability-before-admission order.
 // Each SQL phase admits before planning and lends its SAME flock to the
 // reservation/recovery in that phase, not across independent phases.
-pub(crate) fn local_state_turn(cancelled: Arc<AtomicBool>) -> Result<LocalStateTurn, AccountError> {
-    if crate::storage::limits::view()?.limits.is_none() {
+pub(crate) fn local_state_turn_in(
+    root: &StorageRoot,
+    cancelled: Arc<AtomicBool>,
+) -> Result<LocalStateTurn, AccountError> {
+    // Check before limits I/O or replacing the outer admission. TLS lends
+    // ownership only; it never chooses a storage root for a caller.
+    check_state_root(root)?;
+    if crate::storage::limits::view_in(root)?.limits.is_none() {
         return Ok(LocalStateTurn {
             previous: None,
             active: false,
@@ -202,6 +414,8 @@ pub(crate) fn local_state_turn(cancelled: Arc<AtomicBool>) -> Result<LocalStateT
         turn.replace(Some(StateAdmission {
             lease: None,
             cancelled,
+            root: root.clone(),
+            identity: root.identity(),
         }))
     });
     Ok(LocalStateTurn {
@@ -224,7 +438,10 @@ impl Drop for LocalStatePhase {
     }
 }
 
-pub(crate) fn admit_local_state_turn() -> Result<LocalStatePhase, AccountError> {
+pub(crate) fn admit_local_state_turn_in(
+    root: &StorageRoot,
+) -> Result<LocalStatePhase, AccountError> {
+    check_state_root(root)?;
     let cancelled = LOCAL_STATE_TURN.with(|turn| {
         turn.borrow()
             .as_ref()
@@ -232,7 +449,7 @@ pub(crate) fn admit_local_state_turn() -> Result<LocalStatePhase, AccountError> 
             .map(|turn| Arc::clone(&turn.cancelled))
     });
     if let Some(cancelled) = cancelled {
-        let lease = acquire_store("state", Some(&cancelled))?;
+        let lease = acquire_store_in(root, "state", Some(&cancelled))?;
         LOCAL_STATE_TURN.with(|turn| {
             turn.borrow_mut()
                 .as_mut()
@@ -244,8 +461,22 @@ pub(crate) fn admit_local_state_turn() -> Result<LocalStatePhase, AccountError> 
     Ok(LocalStatePhase(false))
 }
 
-pub(crate) fn acquire_storage_store(store: &str) -> Result<StoreLease, AccountError> {
-    acquire_store(store, None)
+pub(crate) fn acquire_storage_store_in(
+    root: &StorageRoot,
+    store: &str,
+) -> Result<StoreLease, AccountError> {
+    acquire_store_in(root, store, None)
+}
+
+fn check_state_root(root: &StorageRoot) -> Result<(), AccountError> {
+    LOCAL_STATE_TURN.with(|turn| {
+        if turn.borrow().as_ref().is_some_and(|turn| {
+            turn.identity != root.identity() || turn.root.identity() != root.identity()
+        }) {
+            return Err(AccountError::new("local State ownership root changed"));
+        }
+        Ok(())
+    })
 }
 
 fn store_busy(mut error: AccountError, store: &str) -> AccountError {
@@ -267,11 +498,21 @@ fn store_busy(mut error: AccountError, store: &str) -> AccountError {
     error
 }
 
-fn acquire_store(store: &str, wait: Option<&AtomicBool>) -> Result<StoreLease, AccountError> {
+fn acquire_store_in(
+    root: &StorageRoot,
+    store: &str,
+    wait: Option<&AtomicBool>,
+) -> Result<StoreLease, AccountError> {
+    if store == "state" {
+        check_state_root(root)?;
+    }
     if store == "state"
         && let Some(lease) =
             LOCAL_STATE_TURN.with(|turn| turn.borrow().as_ref().and_then(|turn| turn.lease.clone()))
     {
+        if lease.identity != root.identity() || lease.root.identity() != root.identity() {
+            return Err(AccountError::new("local State ownership root changed"));
+        }
         return Ok(lease);
     }
     let slot = match store {
@@ -351,17 +592,29 @@ fn acquire_store(store: &str, wait: Option<&AtomicBool>) -> Result<StoreLease, A
         ),
         _ => return Err(AccountError::new("invalid storage reservation store")),
     };
-    let fd = lock_file(
-        marker,
-        content,
-        fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .map_err(|error| store_busy(error, store))?;
     state.owner = Some(requester);
-    Ok(Arc::new(StoreLeaseInner { fd: Some(fd), slot }))
+    drop(state);
+    // This local owner also releases the reservation if filesystem admission
+    // fails. No other caller may acquire while it is opening or closing the FD.
+    let mut lease = StoreLeaseInner {
+        fd: None,
+        slot,
+        root: root.clone(),
+        identity: root.identity(),
+    };
+    lease.fd = Some(
+        lock_file_in(
+            root,
+            marker,
+            content,
+            fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|error| store_busy(error, store))?,
+    );
+    Ok(Arc::new(lease))
 }
 
-fn home() -> Result<PathBuf, AccountError> {
+pub(super) fn home() -> Result<PathBuf, AccountError> {
     #[cfg(feature = "fault-injection")]
     if let Some(path) = std::env::var_os("CIRRUS_TEST_ACCOUNT_HOME") {
         return Ok(PathBuf::from(path));
@@ -372,186 +625,85 @@ fn home() -> Result<PathBuf, AccountError> {
     Ok(user.dir)
 }
 
-fn checked_dir(parent: &OwnedFd, name: &str, private: bool) -> Result<OwnedFd, AccountError> {
-    let open = || {
-        fs::openat2(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-        )
-    };
-    let fd = match open() {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => {
-            match fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
-                Ok(()) => fs::fsync(parent).map_err(|_| {
-                    AccountError::new("cannot persist account coordination directory")
-                })?,
-                Err(rustix::io::Errno::EXIST) => (),
-                Err(_) => {
-                    return Err(AccountError::new(
-                        "cannot create account coordination directory",
-                    ));
-                }
-            }
-            open().map_err(|_| AccountError::new("cannot open account coordination directory"))?
-        }
-        Err(_) => {
-            return Err(AccountError::new(
-                "account coordination directory is unsafe",
-            ));
-        }
-    };
-    let stat = fs::fstat(&fd)
-        .map_err(|_| AccountError::new("cannot inspect account coordination directory"))?;
-    if stat.st_uid != process::geteuid().as_raw()
-        || stat.st_mode & 0o022 != 0
-        || (private && stat.st_mode & 0o7777 != 0o700)
-    {
-        return Err(AccountError::new(
-            "account coordination directory has unsafe ownership or permissions",
-        ));
-    }
-    Ok(fd)
-}
-
-fn check_local_filesystem(fd: &OwnedFd) -> Result<(), AccountError> {
-    let filesystem = fs::fstatfs(fd)
-        .map_err(|_| AccountError::new("cannot inspect account lock filesystem"))?
-        .f_type as u64;
-    if !LOCAL_FILESYSTEMS.contains(&filesystem) {
-        return Err(AccountError::new(
-            "account coordination requires a supported local filesystem; inspect the system home",
-        ));
-    }
-    Ok(())
-}
-
-fn check_home_ancestors(path: &Path) -> Result<(), AccountError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AccountError::new("account owner's home is unsafe"))?;
-    let mut fd = fs::openat2(
-        fs::CWD,
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|_| AccountError::new("cannot inspect account home ancestors"))?;
-    for component in parent.components() {
-        match component {
-            Component::RootDir => (),
-            Component::Normal(name) => {
-                fd = fs::openat2(
-                    &fd,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                    ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-                )
-                .map_err(|_| AccountError::new("cannot inspect account home ancestors"))?;
-            }
-            _ => return Err(AccountError::new("account home has unsafe path components")),
-        }
-        let stat = fs::fstat(&fd)
-            .map_err(|_| AccountError::new("cannot inspect account home ancestors"))?;
-        if (stat.st_uid != 0 && stat.st_uid != process::geteuid().as_raw())
-            || (stat.st_mode & 0o022 != 0 && stat.st_mode & 0o1000 == 0)
-        {
-            return Err(AccountError::new(
-                "account home has unsafe writable ancestors",
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn state_dir() -> Result<OwnedFd, AccountError> {
-    let path = home()?;
-    if !path.is_absolute()
-        || path == Path::new("/")
-        || path.components().any(|p| p == Component::ParentDir)
-    {
-        return Err(AccountError::new(
-            "account owner's system home directory is unsafe",
-        ));
-    }
-    check_home_ancestors(&path)?;
-    let home = fs::openat2(
-        fs::CWD,
-        &path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| AccountError::new("cannot safely open account owner's system home directory"))?;
-    let stat =
-        fs::fstat(&home).map_err(|_| AccountError::new("cannot inspect account owner's home"))?;
-    if stat.st_uid != process::geteuid().as_raw() || stat.st_mode & 0o022 != 0 {
-        return Err(AccountError::new(
-            "account owner's home has unsafe ownership or permissions",
-        ));
-    }
-    check_local_filesystem(&home)?;
-    let local = checked_dir(&home, ".local", false)?;
-    check_local_filesystem(&local)?;
-    let state = checked_dir(&local, "state", false)?;
-    check_local_filesystem(&state)?;
-    let directory = checked_dir(&state, "cirrus-drive", true)?;
-    check_local_filesystem(&directory)?;
-    Ok(directory)
-}
-
-pub(crate) fn staging_dir() -> Result<OwnedFd, AccountError> {
-    let state = state_dir()?;
-    let staging = checked_dir(&state, "staging", true)?;
-    check_local_filesystem(&staging)?;
-    Ok(staging)
-}
-
-pub(crate) fn directory_snapshots_dir() -> Result<OwnedFd, AccountError> {
-    let state = state_dir()?;
-    let directory = checked_dir(&state, "directory-snapshots", true)?;
-    check_local_filesystem(&directory)?;
-    Ok(directory)
-}
-
-fn lock_file(
+fn lock_file_in(
+    root: &StorageRoot,
     marker: &str,
     expected_content: &[u8],
     operation: fs::FlockOperation,
 ) -> Result<OwnedFd, AccountError> {
-    lock_file_mode(marker, expected_content, operation, true)
+    lock_file_mode_in(root, marker, expected_content, operation, true)
 }
 
-pub(crate) fn namespace_lease(token: &str, create: bool) -> Result<OwnedFd, AccountError> {
+// Only fixed private basenames or already validated/generated tokens. Not a
+// general path resolver: physical ancestor admission belongs to StorageRoot.
+pub(crate) fn open_private_file(
+    dir: &impl std::os::fd::AsFd,
+    name: &str,
+    flags: OFlags,
+    mode: Mode,
+) -> rustix::io::Result<OwnedFd> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(rustix::io::Errno::INVAL);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::openat2(
+            dir,
+            name,
+            flags,
+            mode,
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        fs::openat(dir, name, flags | OFlags::NOFOLLOW, mode)
+    }
+}
+
+pub(crate) fn namespace_lease_in(
+    root: &StorageRoot,
+    token: &str,
+    create: bool,
+) -> Result<OwnedFd, AccountError> {
     if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AccountError::new("invalid namespace reservation token"));
     }
     let marker = format!(".namespace-lease-{token}");
     let content = b"cirrus namespace scratch reservation v1\n";
     if create {
-        let dir = state_dir()?;
+        let dir = root.directory();
+        #[cfg(target_os = "linux")]
         let fd = fs::openat2(
-            &dir,
+            dir,
             marker.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-        )
-        .map_err(|_| AccountError::new("cannot create namespace reservation lease"))?;
+        );
+        #[cfg(target_os = "macos")]
+        let fd = fs::openat(
+            dir,
+            marker.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        );
+        let fd = fd.map_err(|_| AccountError::new("cannot create namespace reservation lease"))?;
         let mut output = std::fs::File::from(fd);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = darwin_acl::check_file(&output) {
+            darwin_acl::discard_unwritten_candidate(dir, &marker, &output);
+            return Err(AccountError::new(error));
+        }
         output
             .write_all(content)
             .and_then(|()| output.sync_all())
             .map_err(|_| AccountError::new("cannot persist namespace reservation lease"))?;
-        fs::fsync(&dir)
+        fs::fsync(dir)
             .map_err(|_| AccountError::new("cannot persist namespace reservation lease"))?;
     }
-    lock_file_mode(
+    lock_file_mode_in(
+        root,
         &marker,
         content,
         fs::FlockOperation::NonBlockingLockExclusive,
@@ -559,95 +711,29 @@ pub(crate) fn namespace_lease(token: &str, create: bool) -> Result<OwnedFd, Acco
     )
 }
 
-fn lock_file_mode(
+fn lock_file_mode_in(
+    root: &StorageRoot,
     marker: &str,
     expected_content: &[u8],
     operation: fs::FlockOperation,
     create: bool,
 ) -> Result<OwnedFd, AccountError> {
-    let directory = state_dir()?;
-    let open = || {
-        fs::openat2(
-            &directory,
-            marker,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-        )
-    };
-    let fd = match open() {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) if create => {
-            let tmp = fs::openat(
-                &directory,
-                ".",
-                OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o600),
-            )
-            .map_err(|_| AccountError::new("cannot create account coordination marker"))?;
-            let mut tmp = std::fs::File::from(tmp);
-            tmp.write_all(expected_content)
-                .and_then(|()| tmp.sync_all())
-                .map_err(|_| AccountError::new("cannot persist account coordination marker"))?;
-            match fs::linkat(&tmp, "", &directory, marker, AtFlags::EMPTY_PATH) {
-                Ok(()) => fs::fsync(&directory)
-                    .map_err(|_| AccountError::new("cannot persist account coordination marker"))?,
-                Err(rustix::io::Errno::EXIST) => (),
-                Err(_) => {
-                    return Err(AccountError::new(
-                        "cannot publish account coordination marker",
-                    ));
-                }
-            }
-            open().map_err(|_| AccountError::new("cannot open account coordination marker"))?
-        }
-        Err(_) => return Err(AccountError::new("account coordination marker is unsafe")),
-    };
-    let stat = fs::fstat(&fd)
-        .map_err(|_| AccountError::new("cannot inspect account coordination marker"))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != process::geteuid().as_raw()
-        || stat.st_mode & 0o7777 != 0o600
-        || stat.st_nlink != 1
-    {
-        return Err(AccountError::new("account coordination marker is unsafe"));
-    }
-    let mut content = Vec::new();
-    std::fs::File::from(
-        fd.try_clone()
-            .map_err(|_| AccountError::new("cannot inspect account coordination marker"))?,
+    marker::lock(
+        root.directory(),
+        marker,
+        expected_content,
+        operation,
+        create,
     )
-    .take((expected_content.len() + 1) as u64)
-    .read_to_end(&mut content)
-    .map_err(|_| AccountError::new("cannot inspect account coordination marker"))?;
-    if content != expected_content {
-        return Err(AccountError::new(
-            "unrecognized account coordination marker; inspect it manually",
-        ));
-    }
-    fs::flock(&fd, operation).map_err(|_| {
-        #[cfg(feature = "fault-injection")]
-        if std::env::var_os("CIRRUS_TEST_NAMESPACE_TRACE").is_some() {
-            eprintln!("cirrus lab coordination contention: marker={marker}");
+    .map_err(|error| match error {
+        marker::MarkerError::Failure(message) => AccountError::new(message),
+        marker::MarkerError::Contended => {
+            AccountError::retryable_read("another account operation is in progress")
         }
-        #[cfg(feature = "fault-injection")]
-        if std::env::var_os("CIRRUS_TEST_BLOCKER_TRACE").is_some() {
-            let inode = format!(":{}", stat.st_ino);
-            let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
-            let owners: Vec<_> = locks.lines().filter(|line| line.split_whitespace().nth(5).is_some_and(|key| key.ends_with(&inode))).collect();
-            eprintln!("cirrus lab flock refusal: pid={} thread={:?} marker={marker} requested={operation:?} owners={owners:?}", std::process::id(), std::thread::current().id());
-        }
-        AccountError::retryable_read("another account operation is in progress")
-    })?;
-    let current = open().map_err(|_| AccountError::new("account coordination marker changed"))?;
-    let current =
-        fs::fstat(current).map_err(|_| AccountError::new("account coordination marker changed"))?;
-    if (stat.st_dev, stat.st_ino) != (current.st_dev, current.st_ino) || current.st_nlink != 1 {
-        return Err(AccountError::new("account coordination marker changed"));
-    }
-    Ok(fd)
+    })
 }
 
+#[cfg(target_os = "linux")]
 fn bus_dir() -> PathBuf {
     #[cfg(feature = "fault-injection")]
     if let Some(path) = std::env::var_os("CIRRUS_TEST_USER_BUS_DIR") {
@@ -656,6 +742,7 @@ fn bus_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{}", process::geteuid().as_raw()))
 }
 
+#[cfg(target_os = "linux")]
 fn transient_bus_io(kind: std::io::ErrorKind) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -671,6 +758,7 @@ fn transient_bus_io(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn transient_bus_error(error: &zbus::Error) -> bool {
     match error {
         zbus::Error::InputOutput(error) | zbus::Error::Connection(error, _) => {
@@ -699,6 +787,7 @@ fn transient_bus_error(error: &zbus::Error) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn bus_failure(message: &'static str, transient: bool) -> AccountError {
     if crate::executor::is_automatic() && transient {
         AccountError::retryable_read(message)
@@ -707,6 +796,7 @@ fn bus_failure(message: &'static str, transient: bool) -> AccountError {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn connect_bus(exclusive: bool) -> Result<zbus::blocking::Connection, AccountError> {
     let directory = RuntimeDir::open(&bus_dir()).map_err(|_| {
         AccountError::new("standard per-user bus directory is unavailable or unsafe")

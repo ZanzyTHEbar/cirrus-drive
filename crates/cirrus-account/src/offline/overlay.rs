@@ -3,16 +3,17 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AccountError, FileVersion, database};
+use super::{AccountError, FileVersion, database_in};
+use crate::account_storage::{RootIdentity, StorageRoot};
 
 mod integrity;
-pub(crate) use integrity::verify_protected;
+pub(crate) use integrity::verify_protected_in;
 
 pub(crate) const MAX_FILE: u64 = 1024 * 1024 * 1024 * 1024;
 const BLOCK: u64 = 128 * 1024;
@@ -40,6 +41,9 @@ struct Extent {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Overlay {
+    // Runtime-only ownership. Never serialized into a manifest or digest.
+    #[serde(skip)]
+    storage: Option<StorageRoot>,
     size: u64,
     // Never rebased when a predecessor confirms a new replacement ETag.
     base: Option<FileVersion>,
@@ -47,16 +51,56 @@ pub(crate) struct Overlay {
     extents: Vec<Extent>,
 }
 
+// Full immutable version identity plus block offset, not pathname/ETag alone.
+// Bound physical work by the union shared across historical interpretations.
+pub(super) struct OriginalBudget {
+    remaining: u64,
+    verified: std::collections::BTreeSet<([u8; 32], u64)>,
+}
+
+impl OriginalBudget {
+    pub(super) fn new() -> Self {
+        Self {
+            remaining: super::MAX_PIN_BYTES,
+            verified: Default::default(),
+        }
+    }
+
+    fn first(
+        &mut self,
+        base: &FileVersion,
+        offset: u64,
+        length: u64,
+    ) -> Result<bool, AccountError> {
+        let identity = Sha256::digest(serde_json::to_vec(base).map_err(|_| invalid())?).into();
+        if self.verified.contains(&(identity, offset)) {
+            return Ok(false);
+        }
+        if self.verified.len() == 8192 {
+            return Err(AccountError::new(
+                "local pin protection block limit reached; pin retained",
+            ));
+        }
+        self.remaining = self.remaining.checked_sub(length).ok_or_else(|| AccountError::new(
+            "local pin protection verification limit reached; pin retained; required original union exceeds 1 GiB",
+        ))?;
+        self.verified.insert((identity, offset));
+        Ok(true)
+    }
+}
+
 fn invalid() -> AccountError {
     AccountError::new("dirty snapshot integrity check failed; local data retained")
 }
 
 fn save_bytes(
+    storage: &StorageRoot,
     bytes: &[u8],
     #[cfg(feature = "fault-injection")] manifest: bool,
 ) -> Result<String, AccountError> {
-    let (mut file, dir, reservation) = super::create_staged_file(bytes.len() as u64)?;
-    #[cfg(feature = "fault-injection")]
+    let (mut file, dir, reservation) = super::create_staged_file_in(storage, bytes.len() as u64)?;
+    // This ENOSPC lab hook is Linux-only and ignored on other platforms.
+    #[cfg(all(feature = "fault-injection", target_os = "linux"))]
     let written = if let Some(marker) = std::env::var_os("CIRRUS_TEST_DIRTY_OBJECT_ENOSPC")
         && std::fs::remove_file(marker).is_ok()
     {
@@ -85,7 +129,7 @@ fn save_bytes(
     } else {
         file.write_all(bytes)
     };
-    #[cfg(not(feature = "fault-injection"))]
+    #[cfg(not(all(feature = "fault-injection", target_os = "linux")))]
     let written = file.write_all(bytes);
     written.and_then(|()| file.sync_all()).map_err(|error| {
         if matches!(
@@ -122,7 +166,7 @@ fn save_bytes(
 }
 
 impl Object {
-    fn save(bytes: &[u8]) -> Result<Self, AccountError> {
+    fn save(storage: &StorageRoot, bytes: &[u8]) -> Result<Self, AccountError> {
         if bytes.is_empty() || bytes.len() > OBJECT {
             return Err(invalid());
         }
@@ -132,6 +176,7 @@ impl Object {
             .collect();
         Ok(Self {
             name: save_bytes(
+                storage,
                 bytes,
                 #[cfg(feature = "fault-injection")]
                 false,
@@ -141,7 +186,22 @@ impl Object {
         })
     }
 
-    fn range(&self, offset: u64, length: usize) -> Result<Vec<u8>, AccountError> {
+    fn range(
+        &self,
+        storage: &StorageRoot,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, AccountError> {
+        self.verified_range(storage, offset, length)
+            .map(|(bytes, _)| bytes)
+    }
+
+    fn verified_range(
+        &self,
+        storage: &StorageRoot,
+        offset: u64,
+        length: usize,
+    ) -> Result<(Vec<u8>, std::fs::Metadata), AccountError> {
         let end = offset
             .checked_add(length as u64)
             .filter(|end| *end <= self.size)
@@ -152,7 +212,7 @@ impl Object {
         {
             return Err(invalid());
         }
-        let (file, before) = super::open_staged(&self.name)?;
+        let (file, before) = super::open_staged_in(storage, &self.name)?;
         if before.len() != self.size {
             return Err(invalid());
         }
@@ -173,13 +233,14 @@ impl Object {
             block_offset += BLOCK;
         }
         super::verify_staged_metadata(&file, &before)?;
-        Ok(result)
+        Ok((result, before))
     }
 }
 
 impl Overlay {
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty_in(storage: &StorageRoot) -> Self {
         Self {
+            storage: Some(storage.clone()),
             size: 0,
             base: None,
             visible_end: 0,
@@ -187,11 +248,15 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn original(version: &FileVersion) -> Result<Self, AccountError> {
+    pub(crate) fn original_in(
+        storage: &StorageRoot,
+        version: &FileVersion,
+    ) -> Result<Self, AccountError> {
         if version.size > MAX_FILE || version.id.starts_with("cirrus-staged:") {
             return Err(invalid());
         }
         Ok(Self {
+            storage: Some(storage.clone()),
             size: version.size,
             base: Some(version.clone()),
             visible_end: version.size,
@@ -199,11 +264,15 @@ impl Overlay {
         })
     }
 
-    pub(crate) fn import(input: &mut impl Read, size: u64) -> Result<Self, AccountError> {
+    pub(crate) fn import_in(
+        storage: &StorageRoot,
+        input: &mut impl Read,
+        size: u64,
+    ) -> Result<Self, AccountError> {
         if size > MAX_FILE {
             return Err(AccountError::new("file exceeds 1 TiB"));
         }
-        let mut root = Self::empty();
+        let mut root = Self::empty_in(storage);
         let mut bytes = vec![0; OBJECT];
         while root.size < size {
             let length = (size - root.size).min(OBJECT as u64) as usize;
@@ -219,12 +288,87 @@ impl Overlay {
         Ok(root)
     }
 
-    pub(crate) fn load(name: &str) -> Result<Self, AccountError> {
-        Self::load_in(&database()?, name)
+    /// An unpublished request import owns every object it creates. Cancellation
+    /// can discard those candidates; it must never reclaim a journaled root.
+    pub(crate) fn import_candidate_in(
+        storage: &StorageRoot,
+        input: &mut impl Read,
+        size: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, AccountError> {
+        if size > MAX_FILE {
+            return Err(invalid());
+        }
+        let mut root = Self::empty_in(storage);
+        let mut bytes = vec![0; OBJECT];
+        while root.size < size {
+            let length = (size - root.size).min(OBJECT as u64) as usize;
+            let result = input.read_exact(&mut bytes[..length]);
+            if cancelled() {
+                root.discard_candidate(None)?;
+                return Err(AccountError::new("request cancelled before staging"));
+            }
+            result.map_err(|_| AccountError::new("cannot read staging source"))?;
+            if bytes[..length].iter().all(|b| *b == 0) {
+                root.resize(root.size + length as u64)?;
+            } else {
+                root.write(root.size, &bytes[..length])?;
+            }
+        }
+        Ok(root)
     }
 
-    pub(crate) fn load_in(conn: &Connection, name: &str) -> Result<Self, AccountError> {
-        let (mut file, before) = super::open_staged(name)?;
+    pub(crate) fn discard_candidate(&self, manifest: Option<&str>) -> Result<(), AccountError> {
+        let storage = self.storage()?;
+        let mut names = std::collections::BTreeSet::new();
+        // Only imported objects are uniquely owned; an original-only move has
+        // no extents. Never reclaim borrowed original ranges or pinned bytes.
+        if self.base.is_some() && !self.extents.is_empty() {
+            return Err(invalid());
+        }
+        for extent in &self.extents {
+            names.insert(extent.object.name.clone());
+        }
+        if let Some(name) = manifest {
+            let mut conn = database_in(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|_| invalid())?;
+            let published: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE staged_file=?1)",
+                    [name],
+                    |r| r.get(0),
+                )
+                .map_err(|_| invalid())?;
+            if published {
+                return Err(invalid());
+            }
+            tx.execute("DELETE FROM dirty_roots WHERE root=?1", [name])
+                .map_err(|_| invalid())?;
+            tx.commit().map_err(|_| invalid())?;
+            names.insert(name.to_owned());
+        }
+        let dir = storage.staging_dir()?;
+        for name in names {
+            let (file, before) = super::open_staged_in(storage, &name)?;
+            super::verify_staged_metadata(&file, &before)?;
+            rustix::fs::unlinkat(&dir, name.as_str(), rustix::fs::AtFlags::empty())
+                .map_err(|_| invalid())?;
+        }
+        rustix::fs::fsync(&dir).map_err(|_| invalid())
+    }
+
+    pub(crate) fn load_at(storage: &StorageRoot, name: &str) -> Result<Self, AccountError> {
+        Self::load_in_root(storage, &database_in(storage)?, name)
+    }
+
+    pub(crate) fn load_in_root(
+        storage: &StorageRoot,
+        conn: &Connection,
+        name: &str,
+    ) -> Result<Self, AccountError> {
+        let (mut file, before) = super::open_staged_in(storage, name)?;
         if before.len() > MAX_MANIFEST {
             return Err(invalid());
         }
@@ -244,9 +388,14 @@ impl Overlay {
         if format!("{:x}", Sha256::digest(&bytes)) != expected {
             return Err(invalid());
         }
-        let root: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        let mut root: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        root.storage = Some(storage.clone());
         root.validate()?;
         Ok(root)
+    }
+
+    pub(super) fn storage(&self) -> Result<&StorageRoot, AccountError> {
+        self.storage.as_ref().ok_or_else(invalid)
     }
 
     fn validate(&self) -> Result<(), AccountError> {
@@ -295,6 +444,7 @@ impl Overlay {
         &self,
         check: impl Fn(&Connection) -> Result<(), AccountError>,
     ) -> Result<String, AccountError> {
+        let storage = self.storage()?;
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| invalid())?;
         if bytes.len() as u64 > MAX_MANIFEST {
@@ -302,6 +452,7 @@ impl Overlay {
         }
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let name = save_bytes(
+            storage,
             &bytes,
             #[cfg(feature = "fault-injection")]
             true,
@@ -313,7 +464,7 @@ impl Overlay {
             .transpose()
             .map_err(|_| invalid())?;
         let check_candidate = || -> Result<(), AccountError> {
-            let (mut candidate, before) = super::open_staged(&name)?;
+            let (mut candidate, before) = super::open_staged_in(storage, &name)?;
             if before.len() != bytes.len() as u64 {
                 return Err(invalid());
             }
@@ -338,9 +489,9 @@ impl Overlay {
             // other callers retain the ordinary per-reservation ownership.
             #[cfg(feature = "fault-injection")]
             crate::wait_test_window("CIRRUS_TEST_ROOT_REGISTRATION_ADMISSION_WINDOW")?;
-            let _state_phase = crate::ownership::admit_local_state_turn()?;
+            let _state_phase = crate::ownership::admit_local_state_turn_in(storage)?;
             let reservation;
-            let mut conn = database()?;
+            let mut conn = database_in(storage)?;
             let planning_version: i64 = conn
                 .pragma_query_value(None, "data_version", |row| row.get(0))
                 .map_err(|_| AccountError::new("cannot inspect dirty root registration plan"))?;
@@ -351,14 +502,15 @@ impl Overlay {
                     self.size
                 );
             }
-            let planned = if crate::storage::limits::view()?.limits.is_some() {
+            let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
                 serde_json::to_vec(&(&name, &digest, self.size, &base))
                     .map_err(|_| invalid())?
                     .len() as u64
             } else {
                 0
             };
-            reservation = crate::storage::sql_reservation::SqlReservation::begin(
+            reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+                storage,
                 crate::storage::sql_reservation::Store::State,
                 Some(&conn),
                 planned,
@@ -448,7 +600,7 @@ impl Overlay {
             crate::wait_test_window("CIRRUS_TEST_ROOT_REGISTRATION_COMMIT_WINDOW")?;
             if let Some(reservation) = &reservation {
                 reservation.validate(&tx)?;
-            } else if crate::storage::limits::view()?.limits.is_some() {
+            } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
                 return Err(AccountError::new(crate::storage::limits::PRESSURE));
             }
             let committed = tx.commit();
@@ -504,13 +656,98 @@ impl Overlay {
             .map_err(|_| invalid())
     }
 
+    // A pin may be removed only when every original gap in this immutable
+    // interpretation has independent durable bytes. No pin/cache fallback,
+    // durable object allocation or second State connection is allowed here.
+    pub(super) fn originals_independent_in(
+        &self,
+        conn: &Connection,
+        budget: &mut OriginalBudget,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, AccountError> {
+        let Some(base) = &self.base else {
+            return Ok(true);
+        };
+        let mut offset = 0;
+        let mut verified_block = None;
+        while offset < self.visible_end {
+            super::check_pin_cancelled(cancelled)?;
+            let index = self
+                .extents
+                .partition_point(|extent| extent.start + extent.length <= offset);
+            let extent = self.extents.get(index);
+            if let Some(extent) = extent.filter(|extent| extent.start <= offset) {
+                offset = (extent.start + extent.length).min(self.visible_end);
+                continue;
+            }
+            let block = offset / BLOCK * BLOCK;
+            if verified_block != Some(block) {
+                let Some(object) = retained_in(conn, base, block)? else {
+                    return Ok(false);
+                };
+                let length = (base.size - block).min(BLOCK);
+                if object.size != length {
+                    return Err(invalid());
+                }
+                if budget.first(base, block, length)? {
+                    object.range(self.storage()?, 0, length as usize)?;
+                }
+                verified_block = Some(block);
+            }
+            offset = (block + BLOCK)
+                .min(self.visible_end)
+                .min(extent.map_or(self.visible_end, |extent| extent.start));
+        }
+        Ok(true)
+    }
+
+    // Advance through required original blocks, verifying already durable
+    // objects. The caller closes its pin read transaction before capture.
+    pub(super) fn next_missing_original_in(
+        &self,
+        conn: &Connection,
+        cursor: &mut u64,
+        budget: &mut OriginalBudget,
+    ) -> Result<Option<(FileVersion, u64, u32)>, AccountError> {
+        let Some(base) = &self.base else {
+            return Ok(None);
+        };
+        while *cursor < self.visible_end {
+            let index = self
+                .extents
+                .partition_point(|extent| extent.start + extent.length <= *cursor);
+            let extent = self.extents.get(index);
+            if let Some(extent) = extent.filter(|extent| extent.start <= *cursor) {
+                *cursor = (extent.start + extent.length).min(self.visible_end);
+                continue;
+            }
+            let block = *cursor / BLOCK * BLOCK;
+            let length = (base.size - block).min(BLOCK);
+            let first = budget.first(base, block, length)?;
+            *cursor = (block + BLOCK).min(self.visible_end);
+            if let Some(object) = retained_in(conn, base, block)? {
+                if object.size != length {
+                    return Err(invalid());
+                }
+                if first {
+                    object.range(self.storage()?, 0, length as usize)?;
+                }
+            } else {
+                return Ok(Some((base.clone(), block, length as u32)));
+            }
+        }
+        Ok(None)
+    }
+
     // Recovery verifies local extents without fetching missing original bytes.
     // Original-byte protected-union admission remains mandatory before PUT.
     pub(super) fn verify_payloads(&self) -> Result<(), AccountError> {
         let mut seen = std::collections::BTreeSet::new();
         for extent in &self.extents {
             if seen.insert(&extent.object.name) {
-                extent.object.range(0, extent.object.size as usize)?;
+                extent
+                    .object
+                    .range(self.storage()?, 0, extent.object.size as usize)?;
             }
         }
         Ok(())
@@ -536,10 +773,10 @@ impl Overlay {
                 offset = (extent.start + extent.length).min(self.visible_end);
             } else {
                 let block = offset / BLOCK * BLOCK;
-                if retained(base, block)?.is_none()
+                if retained(self.storage()?, base, block)?.is_none()
                     && let Some(bytes) = local(base, block, (base.size - block).min(BLOCK) as u32)
                 {
-                    capture(base, block, &bytes)?;
+                    capture(self.storage()?, base, block, &bytes)?;
                 }
                 offset = (block + BLOCK)
                     .min(self.visible_end)
@@ -598,7 +835,7 @@ impl Overlay {
             extents.push(Extent {
                 start: start + (index * OBJECT) as u64,
                 length: bytes.len() as u64,
-                object: Object::save(bytes)?,
+                object: Object::save(self.storage()?, bytes)?,
                 offset: 0,
             });
         }
@@ -615,10 +852,10 @@ impl Overlay {
         mut fetch: impl FnMut(&FileVersion, u64, u32) -> Result<Vec<u8>, AccountError>,
     ) -> Result<Vec<u8>, AccountError> {
         self.range_objects(offset, length, |base, offset, length| {
-            if let Some(object) = retained(base, offset)? {
+            if let Some(object) = retained(self.storage()?, base, offset)? {
                 return Ok(object);
             }
-            capture(base, offset, &fetch(base, offset, length)?)
+            capture(self.storage()?, base, offset, &fetch(base, offset, length)?)
         })
     }
 
@@ -631,7 +868,7 @@ impl Overlay {
             return Ok(objects);
         }
         let version = serde_json::to_string(base).map_err(|_| invalid())?;
-        let conn = database()?;
+        let conn = database_in(self.storage()?)?;
         let mut stmt = conn.prepare("SELECT offset,CASE WHEN length(object)<=24000 THEN object END FROM dirty_bases WHERE version=?1 ORDER BY offset LIMIT 4097").map_err(|_| invalid())?;
         let rows = stmt
             .query_map([version], |row| {
@@ -686,6 +923,7 @@ impl Overlay {
             let finish = if let Some(extent) = extent.filter(|extent| extent.start <= cursor) {
                 let finish = end.min(extent.start + extent.length);
                 let part = extent.object.range(
+                    self.storage()?,
                     extent.offset + cursor - extent.start,
                     (finish - cursor) as usize,
                 )?;
@@ -704,8 +942,11 @@ impl Overlay {
                         let block_end = (block_start + BLOCK).min(base.size);
                         let part_end = base_end.min(block_end);
                         let object = original(base, block_start, (block_end - block_start) as u32)?;
-                        let part =
-                            object.range(position - block_start, (part_end - position) as usize)?;
+                        let part = object.range(
+                            self.storage()?,
+                            position - block_start,
+                            (part_end - position) as usize,
+                        )?;
                         bytes[(position - offset) as usize..(part_end - offset) as usize]
                             .copy_from_slice(&part);
                         position = part_end;
@@ -780,8 +1021,12 @@ impl Overlay {
     }
 }
 
-fn retained(base: &FileVersion, offset: u64) -> Result<Option<Object>, AccountError> {
-    retained_in(&database()?, base, offset)
+fn retained(
+    storage: &StorageRoot,
+    base: &FileVersion,
+    offset: u64,
+) -> Result<Option<Object>, AccountError> {
+    retained_in(&database_in(storage)?, base, offset)
 }
 
 fn retained_in(
@@ -803,7 +1048,21 @@ fn retained_in(
         .transpose()
 }
 
-fn capture(base: &FileVersion, offset: u64, bytes: &[u8]) -> Result<Object, AccountError> {
+pub(super) fn capture_local_in(
+    storage: &StorageRoot,
+    base: &FileVersion,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), AccountError> {
+    capture(storage, base, offset, bytes).map(|_| ())
+}
+
+fn capture(
+    storage: &StorageRoot,
+    base: &FileVersion,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<Object, AccountError> {
     if offset >= base.size
         || !offset.is_multiple_of(BLOCK)
         || bytes.len() as u64 != (base.size - offset).min(BLOCK)
@@ -811,28 +1070,28 @@ fn capture(base: &FileVersion, offset: u64, bytes: &[u8]) -> Result<Object, Acco
         return Err(invalid());
     }
     let verified = |object: Object| -> Result<Object, AccountError> {
-        if object.size != bytes.len() as u64 || object.range(0, bytes.len())? != bytes {
+        if object.size != bytes.len() as u64 || object.range(storage, 0, bytes.len())? != bytes {
             return Err(invalid());
         }
         Ok(object)
     };
     // Already published exact-base blocks need neither new allocation nor a
     // State lease, even under pressure. Verify actual bytes, not metadata alone.
-    if let Some(object) = retained(base, offset)? {
+    if let Some(object) = retained(storage, base, offset)? {
         return verified(object);
     }
     // The conditional GET has already completed at every caller. Save/sync the
     // bounded candidate before taking State or SQLite writer ownership. A
     // racing loser remains a charged orphan; never delete/reassign its name.
-    let object = Object::save(bytes)?;
+    let object = Object::save(storage, bytes)?;
     let encoded = serde_json::to_string(&object).map_err(|_| invalid())?;
     let version = serde_json::to_string(base).map_err(|_| invalid())?;
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect original content retention plan"))?;
-    let planned = if crate::storage::limits::view()?.limits.is_some() {
+    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
         serde_json::to_vec(&(&version, offset, &encoded))
             .map_err(|_| invalid())?
             .len() as u64
@@ -841,7 +1100,8 @@ fn capture(base: &FileVersion, offset: u64, bytes: &[u8]) -> Result<Object, Acco
     };
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_BASE_CAPTURE_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -885,9 +1145,19 @@ fn capture(base: &FileVersion, offset: u64, bytes: &[u8]) -> Result<Object, Acco
         crate::wait_test_window("CIRRUS_TEST_BASE_CAPTURE_COMMIT_WINDOW")?;
         if let Some(reservation) = &reservation {
             reservation.validate(&tx)?;
-        } else if crate::storage::limits::view()?.limits.is_some() {
+        } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
             return Err(AccountError::new(crate::storage::limits::PRESSURE));
         }
+    }
+    #[cfg(feature = "fault-injection")]
+    if inserted
+        && std::env::var_os("CIRRUS_TEST_BASE_CAPTURE_COMMIT_ABORT")
+            .is_some_and(|path| std::fs::remove_file(path).is_ok())
+    {
+        tx.commit_hook(Some(|| {
+            eprintln!("cirrus lab original capture COMMIT hook veto (SQLite rollback)");
+            true
+        }));
     }
     let committed = tx.commit();
     #[cfg(feature = "fault-injection")]
@@ -920,13 +1190,14 @@ fn capture(base: &FileVersion, offset: u64, bytes: &[u8]) -> Result<Object, Acco
 }
 
 fn persist_preparation(
+    storage: &StorageRoot,
     version: &str,
     offset: u64,
     prepared: &BTreeMap<u64, Object>,
     bounded: bool,
 ) -> Result<bool, AccountError> {
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect preparation progress plan"))?;
@@ -940,14 +1211,14 @@ fn persist_preparation(
         .map_err(|_| invalid())?;
     // Actual-byte verification is outside State/SQLite writer ownership. Only
     // unchanged metadata witnesses are checked during the short transaction.
-    if !integrity::verify_preparation(prepared, bounded)? {
+    if !integrity::verify_preparation(storage, prepared, bounded)? {
         return Ok(false);
     }
-    integrity::preparation_unchanged(prepared)?;
+    integrity::preparation_unchanged(storage, prepared)?;
     if previous.is_some_and(|previous| previous >= offset) {
         return Ok(true);
     }
-    let planned = if crate::storage::limits::view()?.limits.is_some() {
+    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
         serde_json::to_vec(&(version, offset))
             .map_err(|_| invalid())?
             .len() as u64
@@ -956,7 +1227,8 @@ fn persist_preparation(
     };
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_PREPARATION_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -983,10 +1255,10 @@ fn persist_preparation(
         .map_err(|error| super::sqlite_storage_error(error,"cannot persist original content preparation"))?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_PREPARATION_COMMIT_WINDOW")?;
-    integrity::preparation_unchanged(prepared)?;
+    integrity::preparation_unchanged(storage, prepared)?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     let committed = tx.commit();
@@ -1022,6 +1294,7 @@ pub(crate) fn prepare_base(
     mut fetch: impl FnMut(&FileVersion, u64, u32) -> Result<Vec<u8>, AccountError>,
     bounded: bool,
 ) -> Result<bool, AccountError> {
+    let storage = root.storage()?;
     let Some(base) = &root.base else {
         return Ok(true);
     };
@@ -1034,7 +1307,7 @@ pub(crate) fn prepare_base(
     // Inspect the bounded reference map once, rather than spending another
     // automatic turn (and SQLite commit) on every four already retained blocks.
     let mut available = root.local_objects()?;
-    let saved: u64 = database()?
+    let saved: u64 = database_in(storage)?
         .query_row(
             "SELECT offset FROM dirty_preparations WHERE version=?1",
             [&version],
@@ -1069,7 +1342,7 @@ pub(crate) fn prepare_base(
     if cursor < root.visible_end {
         gap(cursor, root.visible_end);
     }
-    if !integrity::verify_preparation(&prepared, bounded)? {
+    if !integrity::verify_preparation(storage, &prepared, bounded)? {
         return Ok(false);
     }
     let mut offset = 0;
@@ -1089,7 +1362,7 @@ pub(crate) fn prepare_base(
                 }
                 let length = (base.size - block).min(BLOCK) as u32;
                 let body = fetch(base, block, length)?;
-                let object = capture(base, block, &body)?;
+                let object = capture(storage, base, block, &body)?;
                 prepared.insert(block, object.clone());
                 slot.insert(object);
                 crate::executor::mark_progress();
@@ -1099,22 +1372,23 @@ pub(crate) fn prepare_base(
             offset = (block + BLOCK)
                 .min(root.visible_end)
                 .min(extent.map_or(root.visible_end, |extent| extent.start));
-            if captured && !persist_preparation(&version, offset, &prepared, bounded)? {
+            if captured && !persist_preparation(storage, &version, offset, &prepared, bounded)? {
                 return Ok(false);
             }
         }
     }
-    persist_preparation(&version, offset, &prepared, bounded)
+    persist_preparation(storage, &version, offset, &prepared, bounded)
 }
 
 /// Protect every journal-referenced byte interpretation, including resolved
 /// recovery and detached roots. Unreferenced objects are still never collected.
-pub(crate) fn protected_bases(
+pub(crate) fn protected_bases_in(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<Vec<String>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut stmt = conn.prepare("SELECT DISTINCT r.root,r.base FROM dirty_roots r JOIN operation_journal j ON j.staged_file=r.root WHERE r.base IS NOT NULL AND j.op_type='write' AND j.instance=?1 AND j.space=?2")
         .map_err(|_| invalid())?;
     let rows = stmt
@@ -1133,11 +1407,17 @@ pub(crate) fn protected_bases(
     Ok(roots)
 }
 
-struct HashPass {
-    offset: u64,
-    hash: Sha256,
+enum HashPass {
+    Advancing {
+        _storage: StorageRoot,
+        offset: u64,
+        hash: Sha256,
+    },
+    Retired,
 }
-static HASH_PASSES: OnceLock<Mutex<BTreeMap<(String, String), HashPass>>> = OnceLock::new();
+static HASH_PASSES: OnceLock<
+    Mutex<BTreeMap<(RootIdentity, String, String), Arc<Mutex<HashPass>>>>,
+> = OnceLock::new();
 
 /// At most 1 MiB per turn. Never trust a process-local prefix across restart.
 pub(crate) fn digest_step(
@@ -1145,39 +1425,64 @@ pub(crate) fn digest_step(
     purpose: &str,
     root: &Overlay,
 ) -> Result<Option<String>, AccountError> {
-    let mut passes = HASH_PASSES
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| invalid())?;
-    let key = (name.to_owned(), purpose.to_owned());
-    if !passes.contains_key(&key) && passes.len() >= 4096 {
-        return Err(AccountError::new("dirty hashing capacity exhausted"));
-    }
-    let pass = passes.entry(key.clone()).or_insert_with(|| HashPass {
-        offset: 0,
-        hash: Sha256::new(),
-    });
-    let end = root.len().min(pass.offset.saturating_add(1024 * 1024));
-    let mut budget = 1024 * 1024;
-    while pass.offset < end {
-        let (length, cost) =
-            root.bounded_range(pass.offset, (end - pass.offset).min(BLOCK) as u32, budget)?;
-        if length == 0 {
-            break;
+    let storage = root.storage()?;
+    let key = (storage.identity(), name.to_owned(), purpose.to_owned());
+    let registry = HASH_PASSES.get_or_init(Default::default);
+    loop {
+        let entry = {
+            let mut passes = registry.lock().map_err(|_| invalid())?;
+            if !passes.contains_key(&key) && passes.len() >= 4096 {
+                return Err(AccountError::new("dirty hashing capacity exhausted"));
+            }
+            Arc::clone(passes.entry(key.clone()).or_insert_with(|| {
+                Arc::new(Mutex::new(HashPass::Advancing {
+                    _storage: storage.clone(),
+                    offset: 0,
+                    hash: Sha256::new(),
+                }))
+            }))
+        };
+        // Only this immutable manifest/purpose waits for its payload work.
+        let mut pass = entry.lock().map_err(|_| invalid())?;
+        let HashPass::Advancing { offset, hash, .. } = &mut *pass else {
+            // Another caller consumed this entry while we waited for it.
+            continue;
+        };
+        let end = root.len().min(offset.saturating_add(1024 * 1024));
+        let mut budget = 1024 * 1024;
+        while *offset < end {
+            let (length, cost) =
+                root.bounded_range(*offset, (end - *offset).min(BLOCK) as u32, budget)?;
+            if length == 0 {
+                break;
+            }
+            hash.update(root.range(*offset, length, |_, _, _| {
+                Err(AccountError::new(
+                    "exact original content base is unavailable locally",
+                ))
+            })?);
+            *offset += u64::from(length);
+            crate::executor::mark_progress();
+            budget -= cost;
         }
-        pass.hash.update(root.range(pass.offset, length, |_, _, _| {
-            Err(AccountError::new(
-                "exact original content base is unavailable locally",
-            ))
-        })?);
-        pass.offset += u64::from(length);
-        crate::executor::mark_progress();
-        budget -= cost;
-    }
-    if pass.offset == root.len() {
-        let pass = passes.remove(&key).ok_or_else(invalid)?;
-        Ok(Some(format!("{:x}", pass.hash.finalize())))
-    } else {
-        Ok(None)
+        if *offset != root.len() {
+            return Ok(None);
+        }
+        let HashPass::Advancing { hash, .. } = std::mem::replace(&mut *pass, HashPass::Retired)
+        else {
+            unreachable!();
+        };
+        let removed = {
+            let mut passes = registry.lock().map_err(|_| invalid())?;
+            if !passes
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                return Err(invalid());
+            }
+            passes.remove(&key)
+        };
+        drop(removed);
+        return Ok(Some(format!("{:x}", hash.finalize())));
     }
 }

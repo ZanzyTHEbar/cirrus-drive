@@ -220,7 +220,8 @@ fn segments(url: &Url) -> Result<Vec<String>, AccountError> {
         .collect()
 }
 
-pub(crate) fn directory_snapshot(
+pub(crate) fn directory_snapshot_in(
+    storage: &crate::account_storage::StorageRoot,
     base: &Url,
     space: &str,
     path: &[String],
@@ -228,7 +229,7 @@ pub(crate) fn directory_snapshot(
     client: &Client,
 ) -> Result<DirectorySnapshot, AccountError> {
     for attempt in 0..5 {
-        match directory_snapshot_once(base, space, path, token, client) {
+        match directory_snapshot_once_in(storage, base, space, path, token, client) {
             Err(error)
                 if error.message == "directory metadata is temporarily unavailable"
                     && attempt < 4 =>
@@ -243,14 +244,16 @@ pub(crate) fn directory_snapshot(
     ))
 }
 
-pub(crate) fn directory_snapshot_once(
+pub(crate) fn directory_snapshot_once_in(
+    storage: &crate::account_storage::StorageRoot,
     base: &Url,
     space: &str,
     path: &[String],
     token: &str,
     client: &Client,
 ) -> Result<DirectorySnapshot, AccountError> {
-    directory_snapshot_timed(
+    directory_snapshot_timed_in(
+        storage,
         base,
         space,
         path,
@@ -260,7 +263,8 @@ pub(crate) fn directory_snapshot_once(
     )
 }
 
-pub(crate) fn directory_snapshot_timed(
+pub(crate) fn directory_snapshot_timed_in(
+    storage: &crate::account_storage::StorageRoot,
     base: &Url,
     space: &str,
     path: &[String],
@@ -325,7 +329,7 @@ pub(crate) fn directory_snapshot_timed(
     }) {
         return Err(AccountError::new("directory endpoint did not return XML"));
     }
-    let mut entries = DirectorySnapshot::empty()?;
+    let mut entries = DirectorySnapshot::empty_in(storage)?;
     let mut found_self = false;
     listing::responses(response, |item| {
         let Response::Propstat {

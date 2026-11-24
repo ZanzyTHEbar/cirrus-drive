@@ -1,5 +1,6 @@
 //! Private ephemeral complete listings, independent of dirty objects and clean ranges.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::{
     Arc, Mutex,
@@ -7,9 +8,10 @@ use std::sync::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
-use rustix::fs::{self, AtFlags, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self, AtFlags, Mode, OFlags};
 
-use crate::{AccountError, Entry, ownership};
+use crate::account_storage::StorageRoot;
+use crate::{AccountError, Entry};
 
 const PAGE: usize = 32;
 const MAX_SNAPSHOTS: usize = 256;
@@ -33,6 +35,7 @@ struct Storage {
     // Drop order closes SQLite and the original anonymous fd before releasing
     // its allowance. This does not change the outer Arc's uniqueness rules.
     reservation: Option<crate::storage::namespace::NamespaceReservation>,
+    root: StorageRoot,
     _slot: Slot,
     count: usize,
     bytes: usize,
@@ -63,7 +66,134 @@ pub struct DirectoryChild {
     pub name: String,
 }
 
+#[cfg(target_os = "macos")]
+fn open_darwin_snapshot(
+    root: &StorageRoot,
+    directory: &std::os::fd::OwnedFd,
+    name: &str,
+    file: &std::os::fd::OwnedFd,
+) -> Result<Connection, AccountError> {
+    // Created exclusively by this invocation. Install cleanup BEFORE admission;
+    // after SQLite opens, its connection drops before this borrowed-FD guard.
+    // Never reopen an existing SQLite inode: close would release POSIX locks.
+    struct Candidate<'a> {
+        directory: &'a std::os::fd::OwnedFd,
+        file: &'a std::os::fd::OwnedFd,
+        name: &'a str,
+        named: bool,
+    }
+    impl Drop for Candidate<'_> {
+        fn drop(&mut self) {
+            if !self.named {
+                return;
+            }
+            let Ok(held) = fs::fstat(self.file) else {
+                return;
+            };
+            let Ok(named) = fs::statat(self.directory, self.name, AtFlags::SYMLINK_NOFOLLOW) else {
+                return;
+            };
+            let safe = |s: &fs::Stat| {
+                fs::FileType::from_raw_mode(s.st_mode) == fs::FileType::RegularFile
+                    && s.st_uid == rustix::process::geteuid().as_raw()
+                    && s.st_mode & 0o7777 == 0o600
+                    && s.st_nlink == 1
+            };
+            if safe(&held)
+                && safe(&named)
+                && (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+                && fs::unlinkat(self.directory, self.name, AtFlags::empty()).is_ok()
+            {
+                let _ = fs::fsync(self.directory);
+            }
+        }
+    }
+    let mut candidate = Candidate {
+        directory,
+        file,
+        name,
+        named: true,
+    };
+    crate::ownership::darwin_acl::check_file(file).map_err(|_| unavailable())?;
+    let path = root
+        .private_state_path()
+        .join("directory-snapshots")
+        .join(name);
+    let check = || -> Result<(), AccountError> {
+        root.revalidate()?;
+        let held_dir = fs::fstat(directory).map_err(|_| unavailable())?;
+        let named_dir = fs::statat(
+            root.directory(),
+            "directory-snapshots",
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| unavailable())?;
+        if (
+            held_dir.st_dev,
+            held_dir.st_ino,
+            held_dir.st_mode,
+            held_dir.st_uid,
+        ) != (
+            named_dir.st_dev,
+            named_dir.st_ino,
+            named_dir.st_mode,
+            named_dir.st_uid,
+        ) {
+            return Err(unavailable());
+        }
+        crate::ownership::darwin_acl::check_directory(directory).map_err(|_| unavailable())?;
+        let held = fs::fstat(file).map_err(|_| unavailable())?;
+        let named =
+            fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| unavailable())?;
+        let acl = crate::ownership::darwin_acl::checked_path(&path).map_err(|_| unavailable())?;
+        for stat in [&held, &named] {
+            if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::RegularFile
+                || stat.st_uid != rustix::process::geteuid().as_raw()
+                || stat.st_mode & 0o7777 != 0o600
+                || stat.st_nlink != 1
+                || (
+                    stat.st_dev as u64,
+                    stat.st_ino as u64,
+                    stat.st_mode as u32,
+                    stat.st_uid,
+                    stat.st_nlink as u64,
+                ) != (
+                    acl.st_dev as u64,
+                    acl.st_ino as u64,
+                    acl.st_mode as u32,
+                    acl.st_uid,
+                    acl.st_nlink as u64,
+                )
+            {
+                return Err(unavailable());
+            }
+        }
+        Ok(())
+    };
+    check()?;
+    let conn = Connection::open_with_flags_and_vfs(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        "unix-posix",
+    )
+    .map_err(|_| unavailable())?;
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
+    check()?;
+    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
+        .map_err(|_| unavailable())?;
+    check()?;
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
+    fs::unlinkat(directory, name, AtFlags::empty()).map_err(|_| unavailable())?;
+    candidate.named = false;
+    fs::fsync(directory).map_err(|_| unavailable())?;
+    Ok(conn)
+}
+
 impl DirectorySnapshot {
+    pub(crate) fn storage_root(&self) -> Result<StorageRoot, AccountError> {
+        Ok(self.0.lock().map_err(|_| unavailable())?.root.clone())
+    }
+
     /// Tests emptiness of a complete snapshot, never a partially received page.
     pub fn is_empty(&self) -> Result<bool, AccountError> {
         Ok(self.0.lock().map_err(|_| unavailable())?.count == 0)
@@ -73,39 +203,45 @@ impl DirectorySnapshot {
     pub fn same_observation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
-    pub(crate) fn empty() -> Result<Self, AccountError> {
+    pub(crate) fn empty_in(root: &StorageRoot) -> Result<Self, AccountError> {
         LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_SNAPSHOTS).then_some(n + 1)
         })
         .map_err(|_| unavailable())?;
         let slot = Slot;
         let reservation;
-        let directory = ownership::directory_snapshots_dir()?;
+        let directory = root.directory_snapshots_dir()?;
         let name = crate::offline::namespace_token()?;
-        let file = fs::openat2(
+        let file = crate::ownership::open_private_file(
             &directory,
             name.as_str(),
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(|_| unavailable())?;
         // SQLite resolves /proc descriptor paths to the original filename. Open
         // while that exclusively created name still exists, then unlink before
         // allocating contents; opening an O_TMPFILE alias can create a new file.
+        #[cfg(target_os = "linux")]
         let opened =
             Connection::open(format!("/proc/self/fd/{}", file.as_raw_fd())).and_then(|conn| {
                 conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")?;
                 Ok(conn)
             });
-        fs::unlinkat(&directory, name.as_str(), AtFlags::empty()).map_err(|_| unavailable())?;
-        fs::fsync(&directory).map_err(|_| unavailable())?;
-        let conn = opened.map_err(|_| unavailable())?;
+        #[cfg(target_os = "linux")]
+        let conn = {
+            fs::unlinkat(&directory, name.as_str(), AtFlags::empty()).map_err(|_| unavailable())?;
+            fs::fsync(&directory).map_err(|_| unavailable())?;
+            opened.map_err(|_| unavailable())?
+        };
+        #[cfg(target_os = "macos")]
+        let conn = open_darwin_snapshot(root, &directory, &name, &file)?;
         let file = crate::storage::track(
+            root,
             std::fs::File::from(file),
             crate::storage::AnonymousKind::Directory,
         );
-        reservation = crate::storage::namespace::NamespaceReservation::begin(&file)?;
+        reservation = crate::storage::namespace::NamespaceReservation::begin_in(root, &file)?;
         // No durable state or journal: an incomplete scratch listing is never
         // published, and a process crash closes its last anonymous descriptor.
         conn.execute_batch("PRAGMA page_size=4096; PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA max_page_count=4096; CREATE TABLE entries(seq INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,entry TEXT NOT NULL,inode INTEGER NOT NULL DEFAULT 0);").map_err(|_| unavailable())?;
@@ -113,6 +249,7 @@ impl DirectorySnapshot {
             reservation.validate_file(&file)?;
         }
         Ok(Self(Arc::new(Mutex::new(Storage {
+            root: root.clone(),
             conn,
             _file: file,
             reservation,
@@ -134,8 +271,10 @@ impl DirectorySnapshot {
         // Owners created while disabled must reserve before later mutation
         // under enabled policy. Immutable retained readers need no new charge.
         if state.reservation.is_none() {
-            state.reservation =
-                crate::storage::namespace::NamespaceReservation::begin(&state._file)?;
+            state.reservation = crate::storage::namespace::NamespaceReservation::begin_in(
+                &state.root,
+                &state._file,
+            )?;
         }
         Ok(state)
     }
@@ -263,14 +402,16 @@ impl DirectorySnapshot {
 
     /// Looks up one validated entry without decoding the complete directory.
     pub fn get(&self, name: &str) -> Result<Option<Entry>, AccountError> {
-        let state = self.0.lock().map_err(|_| unavailable())?;
-        let encoded: Option<String> = state
-            .conn
-            .query_row("SELECT entry FROM entries WHERE name=?1", [name], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(|_| unavailable())?;
+        let encoded: Option<String> = {
+            let state = self.0.lock().map_err(|_| unavailable())?;
+            state
+                .conn
+                .query_row("SELECT entry FROM entries WHERE name=?1", [name], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|_| unavailable())?
+        };
         encoded
             .map(|json| serde_json::from_str(&json).map_err(|_| unavailable()))
             .transpose()
@@ -278,37 +419,42 @@ impl DirectorySnapshot {
 
     /// Decodes at most 32 metadata records after an opaque snapshot cookie.
     pub fn page(&self, after: u64) -> Result<Vec<(u64, Entry)>, AccountError> {
-        let state = self.0.lock().map_err(|_| unavailable())?;
-        let sql = "SELECT seq,entry FROM entries WHERE seq>?1 ORDER BY seq LIMIT ?2";
-        #[cfg(feature = "fault-injection")]
-        let sql = if after > 0
-            && state.count > PAGE
-            && state.publication_fault
-            && let Some(marker) = std::env::var_os("CIRRUS_TEST_PUBLICATION_READ_FAULT")
-            && std::fs::remove_file(marker).is_ok()
-        {
-            // A one-shot SQLite read/step failure on the candidate's second
-            // traversal after a complete page. Never corrupt another owner or
-            // require host disk exhaustion to exercise publication rollback.
-            eprintln!("cirrus lab publication scratch read fault: after={after}");
-            "SELECT seq,entry FROM entries WHERE seq>?1 AND abs(-9223372036854775808)>0 ORDER BY seq LIMIT ?2"
-        } else {
-            sql
+        let encoded = {
+            let state = self.0.lock().map_err(|_| unavailable())?;
+            let sql = "SELECT seq,entry FROM entries WHERE seq>?1 ORDER BY seq LIMIT ?2";
+            #[cfg(feature = "fault-injection")]
+            let sql = if after > 0
+                && state.count > PAGE
+                && state.publication_fault
+                && let Some(marker) = std::env::var_os("CIRRUS_TEST_PUBLICATION_READ_FAULT")
+                && std::fs::remove_file(marker).is_ok()
+            {
+                // A one-shot SQLite read/step failure on the candidate's second
+                // traversal after a complete page. Never corrupt another owner or
+                // require host disk exhaustion to exercise publication rollback.
+                eprintln!("cirrus lab publication scratch read fault: after={after}");
+                "SELECT seq,entry FROM entries WHERE seq>?1 AND abs(-9223372036854775808)>0 ORDER BY seq LIMIT ?2"
+            } else {
+                sql
+            };
+            let mut stmt = state.conn.prepare(sql).map_err(|_| unavailable())?;
+            let rows = stmt
+                .query_map(params![after, PAGE], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| unavailable())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| unavailable())?
         };
-        let mut stmt = state.conn.prepare(sql).map_err(|_| unavailable())?;
-        let rows = stmt
-            .query_map(params![after, PAGE], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        encoded
+            .into_iter()
+            .map(|(cookie, json)| {
+                Ok((
+                    cookie,
+                    serde_json::from_str(&json).map_err(|_| unavailable())?,
+                ))
             })
-            .map_err(|_| unavailable())?;
-        rows.map(|row| {
-            let (cookie, json) = row.map_err(|_| unavailable())?;
-            Ok((
-                cookie,
-                serde_json::from_str(&json).map_err(|_| unavailable())?,
-            ))
-        })
-        .collect()
+            .collect()
     }
 
     #[cfg(feature = "fault-injection")]

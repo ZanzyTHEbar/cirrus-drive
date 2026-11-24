@@ -679,6 +679,150 @@ fn escape_mount_path(path: &Path) -> Vec<u8> {
 }
 
 #[derive(Clone)]
+// Slots are allocated before a journal fence and bound once to its actual result.
+struct SharedVersion(Arc<std::sync::OnceLock<FileVersion>>);
+
+impl SharedVersion {
+    fn new(version: FileVersion) -> Self {
+        let owner = Self::unbound();
+        owner.bind(version);
+        owner
+    }
+
+    fn unbound() -> Self {
+        Self(Arc::new(std::sync::OnceLock::new()))
+    }
+
+    fn bind(&self, version: FileVersion) {
+        assert!(self.0.set(version).is_ok(), "version already bound");
+    }
+
+    fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for SharedVersion {
+    type Target = FileVersion;
+
+    fn deref(&self) -> &FileVersion {
+        self.0.get().expect("published version is bound")
+    }
+}
+
+impl PartialEq for SharedVersion {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for SharedVersion {}
+
+impl PartialEq<FileVersion> for SharedVersion {
+    fn eq(&self, other: &FileVersion) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<SharedVersion> for FileVersion {
+    fn eq(&self, other: &SharedVersion) -> bool {
+        *self == **other
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+impl std::hash::Hash for SharedVersion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&**self, state);
+    }
+}
+
+#[derive(Clone)]
+enum ResourceText {
+    Literal(String),
+    VersionId(SharedVersion),
+    VersionTag(SharedVersion),
+}
+
+impl From<String> for ResourceText {
+    fn from(value: String) -> Self {
+        Self::Literal(value)
+    }
+}
+
+impl ResourceText {
+    fn as_str(&self) -> &str {
+        self
+    }
+
+    fn bind_directory_id(identity: &mut String, id: i64) {
+        // "cirrus-dir:" plus any signed i64 fits the prepared 32-byte buffer.
+        let mut digits = [0u8; 20];
+        let mut remaining = id.unsigned_abs();
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (remaining % 10) as u8;
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if id < 0 {
+            identity.push('-');
+        }
+        for digit in &digits[start..] {
+            identity.push(char::from(*digit));
+        }
+    }
+}
+
+impl std::ops::Deref for ResourceText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Literal(value) => value,
+            Self::VersionId(version) => version.id(),
+            Self::VersionTag(version) => version.etag(),
+        }
+    }
+}
+
+impl PartialEq for ResourceText {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for ResourceText {}
+
+impl PartialEq<&str> for ResourceText {
+    fn eq(&self, other: &&str) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<ResourceText> for &str {
+    fn eq(&self, other: &ResourceText) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<String> for ResourceText {
+    fn eq(&self, other: &String) -> bool {
+        **self == **other
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+impl std::hash::Hash for ResourceText {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&**self, state);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "fault-injection", derive(Hash))]
 struct Node {
     path: Vec<String>,
@@ -686,8 +830,8 @@ struct Node {
     directory: bool,
     size: u64,
     modified: SystemTime,
-    resource_id: String,
-    etag: Option<String>,
+    resource_id: ResourceText,
+    etag: Option<ResourceText>,
     checksums: Vec<String>,
     revision: u64,
 }
@@ -703,23 +847,55 @@ impl Node {
 }
 
 #[derive(Clone)]
-struct State {
-    next_node: u64,
-    next_handle: u64,
+struct Namespace {
     nodes: HashMap<u64, Node>,
     paths: HashMap<Vec<String>, u64>,
-    handles: HashMap<u64, OpenDirectory>,
-    files: HashMap<u64, OpenFile>,
-    detached: HashSet<u64>,
-    cache: VecDeque<CachedRange>,
-    cache_bytes: usize,
-    cache_generation: u64,
-    directories: VecDeque<CachedDirectory>,
-    next_scan: u64,
     scans: HashMap<u64, u64>,
     mutation_epoch: u64,
     observed: HashMap<Vec<String>, (String, String)>,
     observations_exhausted: bool,
+}
+
+struct State {
+    namespace: Arc<Namespace>,
+    next_node: u64,
+    next_handle: u64,
+    handles: HashMap<u64, OpenDirectory>,
+    files: HashMap<u64, OpenFile>,
+    detached: HashMap<u64, Arc<Node>>,
+    cache: VecDeque<Arc<CachedRange>>,
+    cache_bytes: usize,
+    cache_generation: u64,
+    directories: VecDeque<CachedDirectory>,
+    next_scan: u64,
+}
+
+struct ListingEffects {
+    promotions: Vec<FilePromotion>,
+    invalidated_handles: Vec<u64>,
+    removed_range_versions: Vec<SharedVersion>,
+}
+
+struct FilePromotion {
+    handle: u64,
+    expected: SharedVersion,
+    replacement: SharedVersion,
+}
+
+struct PreparedListing {
+    namespace: Namespace,
+    next_node: u64,
+    children: DirectoryView,
+    promotions: Vec<(usize, u64)>,
+    invalidated: Vec<String>,
+}
+
+impl std::ops::Deref for State {
+    type Target = Namespace;
+
+    fn deref(&self) -> &Namespace {
+        &self.namespace
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -741,14 +917,58 @@ struct Flight {
     priority: RangePriority,
 }
 
-#[derive(Clone)]
+struct FlightLeader<'a> {
+    flights: &'a Mutex<HashMap<RangeKey, Arc<Flight>>>,
+    key: Option<RangeKey>,
+    flight: Arc<Flight>,
+}
+
+impl FlightLeader<'_> {
+    fn complete(mut self, result: Result<Vec<u8>, ()>) -> Result<(), Errno> {
+        {
+            let mut shared = self.flight.result.lock().map_err(|_| Errno::EIO)?;
+            *shared = Some(result);
+            self.flight.ready.notify_all();
+        }
+        self.retire()
+    }
+
+    fn retire(&mut self) -> Result<(), Errno> {
+        let mut flights = self.flights.lock().map_err(|_| Errno::EIO)?;
+        if let Some(key) = self.key.take()
+            && flights
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            flights.remove(&key);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FlightLeader<'_> {
+    fn drop(&mut self) {
+        if self.key.is_none() {
+            return;
+        }
+        if let Ok(mut shared) = self.flight.result.lock()
+            && shared.is_none()
+        {
+            *shared = Some(Err(()));
+        }
+        self.flight.ready.notify_all();
+        let _ = self.retire();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct CachedRange {
-    version: FileVersion,
+    version: SharedVersion,
     offset: u64,
     bytes: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct CachedDirectory {
     ino: u64,
     started: Instant,
@@ -760,6 +980,14 @@ struct CachedDirectory {
 
 #[derive(Clone)]
 struct DirectoryView(DirectorySnapshot);
+
+impl PartialEq for DirectoryView {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(other)
+    }
+}
+
+impl Eq for DirectoryView {}
 
 impl DirectoryView {
     fn find(&self, name: &str) -> Result<Option<(u64, FileType, String)>, Errno> {
@@ -804,30 +1032,26 @@ impl DirectoryView {
         self.0.same_observation(&expected.0)
     }
 
-    fn valid(&self, state: &State, ino: u64) -> bool {
+    fn inode_names(&self) -> Option<Vec<(u64, String)>> {
+        let mut names = Vec::new();
         let mut after = 0;
         loop {
-            let Ok(page) = self.page(after) else {
-                return false;
-            };
+            let page = self.page(after).ok()?;
             if page.is_empty() {
-                return true;
+                return Some(names);
             }
             for (cookie, id, _, name) in page {
-                if !state.nodes.get(&id).is_some_and(|node| {
-                    node.parent == ino
-                        && node.path.last() == Some(&name)
-                        && state.paths.get(&node.path) == Some(&id)
-                }) {
-                    return false;
+                if names.len() >= MAX_NODES {
+                    return None;
                 }
+                names.push((id, name));
                 after = cookie;
             }
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct OpenDirectory {
     ino: u64,
     parent: u64,
@@ -850,25 +1074,34 @@ struct LockedRenameInputs<'a> {
     source_file: Option<PreparedRenameFile>,
 }
 
-impl State {
-    #[cfg(feature = "fault-injection")]
-    fn publication_witness(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        let mut nodes: Vec<_> = self.nodes.iter().collect();
-        nodes.sort_unstable_by_key(|(id, _)| **id);
-        nodes.hash(&mut hash);
-        let mut paths: Vec<_> = self.paths.iter().collect();
-        paths.sort_unstable_by_key(|(path, _)| *path);
-        paths.hash(&mut hash);
-        let mut files: Vec<_> = self.files.iter().collect();
-        files.sort_unstable_by_key(|(id, _)| **id);
-        files.hash(&mut hash);
-        self.next_node.hash(&mut hash);
-        self.mutation_epoch.hash(&mut hash);
-        hash.finish()
-    }
+#[cfg(feature = "fault-injection")]
+fn publication_witness(
+    namespace: &Namespace,
+    next_node: u64,
+    detached: &[(u64, Arc<Node>)],
+    files: &[(u64, OpenFile)],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut nodes: Vec<_> = namespace
+        .nodes
+        .iter()
+        .chain(detached.iter().map(|(id, node)| (id, &**node)))
+        .collect();
+    nodes.sort_unstable_by_key(|(id, _)| **id);
+    nodes.hash(&mut hash);
+    let mut paths: Vec<_> = namespace.paths.iter().collect();
+    paths.sort_unstable_by_key(|(path, _)| *path);
+    paths.hash(&mut hash);
+    let mut files: Vec<_> = files.iter().map(|(id, file)| (id, file)).collect();
+    files.sort_unstable_by_key(|(id, _)| **id);
+    files.hash(&mut hash);
+    next_node.hash(&mut hash);
+    namespace.mutation_epoch.hash(&mut hash);
+    hash.finish()
+}
 
+impl Namespace {
     fn parent_identities(
         &self,
         path: &[String],
@@ -893,18 +1126,34 @@ impl State {
         }
         Ok(result)
     }
+}
 
-    fn refresh_cache_generation(&mut self, generation: u64) {
+impl State {
+    fn retire_ranges(
+        &mut self,
+        retired: &mut Vec<Arc<CachedRange>>,
+        remove: impl Fn(&CachedRange) -> bool,
+    ) {
+        let mut index = 0;
+        while index < self.cache.len() {
+            if remove(&self.cache[index]) {
+                retired.push(self.cache.remove(index).expect("present range"));
+            } else {
+                index += 1;
+            }
+        }
+        self.cache_bytes = self.cache.iter().map(|entry| entry.bytes.len()).sum();
+    }
+
+    fn refresh_cache_generation(&mut self, generation: u64, retired: &mut Vec<Arc<CachedRange>>) {
         if self.cache_generation != generation {
-            self.cache.clear();
-            self.cache_bytes = 0;
+            self.retire_ranges(retired, |_| true);
             self.cache_generation = generation;
         }
     }
 
-    fn invalidate_id(&mut self, id: &str) {
-        self.cache.retain(|entry| entry.version.id() != id);
-        self.cache_bytes = self.cache.iter().map(|entry| entry.bytes.len()).sum();
+    fn invalidate_id(&mut self, id: &str, retired: &mut Vec<Arc<CachedRange>>) {
+        self.retire_ranges(retired, |entry| entry.version.id() == id);
         for file in self.files.values_mut() {
             if file.version.id() == id {
                 file.failed = true;
@@ -912,43 +1161,41 @@ impl State {
         }
     }
 
-    fn observe_version(&mut self, version: &FileVersion) {
+    fn observe_version(&mut self, version: &FileVersion, retired: &mut Vec<Arc<CachedRange>>) {
         let changed = self
             .cache
             .iter()
             .any(|entry| entry.version.same_resource(version) && entry.version != *version)
             || self.files.values().any(|file| {
-                file.version.same_resource(version) && file.version != *version && !file.failed
+                file.version.same_resource(version) && *file.version != *version && !file.failed
             });
         if changed {
-            self.invalidate_id(version.id());
+            self.invalidate_id(version.id(), retired);
         }
     }
 
-    fn insert_range(&mut self, version: FileVersion, offset: u64, bytes: Vec<u8>) {
+    fn insert_range(&mut self, entry: Arc<CachedRange>, retired: &mut Vec<Arc<CachedRange>>) {
         while self.cache.len() >= CACHE_MAX_ENTRIES
-            || self.cache_bytes + bytes.len() > CACHE_MAX_BYTES
+            || self.cache_bytes + entry.bytes.len() > CACHE_MAX_BYTES
         {
             if let Some(oldest) = self.cache.pop_front() {
                 self.cache_bytes -= oldest.bytes.len();
+                retired.push(oldest);
             } else {
+                retired.push(entry);
                 return;
             }
         }
-        self.cache_bytes += bytes.len();
-        self.cache.push_back(CachedRange {
-            version,
-            offset,
-            bytes,
-        });
+        self.cache_bytes += entry.bytes.len();
+        self.cache.push_back(entry);
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "fault-injection", derive(Hash))]
 struct OpenFile {
     ino: u64,
-    version: FileVersion,
+    version: SharedVersion,
     failed: bool,
     writable: bool,
     append: bool,
@@ -982,7 +1229,7 @@ impl Drive {
             directory: true,
             size: 0,
             modified: UNIX_EPOCH,
-            resource_id: String::new(),
+            resource_id: String::new().into(),
             etag: None,
             checksums: Vec::new(),
             revision: 0,
@@ -992,30 +1239,36 @@ impl Drive {
             instance,
             space,
             state: Arc::new(Mutex::new(State {
+                namespace: Arc::new(Namespace {
+                    nodes: HashMap::from([(1, root)]),
+                    paths: HashMap::from([(Vec::new(), 1)]),
+                    scans: HashMap::new(),
+                    mutation_epoch: 0,
+                    observed: HashMap::new(),
+                    observations_exhausted: false,
+                }),
                 next_node: 2,
                 next_handle: 1,
-                nodes: HashMap::from([(1, root)]),
-                paths: HashMap::from([(Vec::new(), 1)]),
-                handles: HashMap::new(),
-                files: HashMap::new(),
-                detached: HashSet::new(),
-                cache: VecDeque::new(),
+                handles: HashMap::with_capacity(MAX_HANDLES),
+                files: HashMap::with_capacity(MAX_HANDLES),
+                detached: HashMap::with_capacity(MAX_HANDLES * 2),
+                cache: VecDeque::with_capacity(CACHE_MAX_ENTRIES),
                 cache_bytes: 0,
                 cache_generation,
-                directories: VecDeque::new(),
+                directories: VecDeque::with_capacity(DIRECTORY_CACHE_MAX),
                 next_scan: 1,
-                scans: HashMap::new(),
-                mutation_epoch: 0,
-                observed: HashMap::new(),
-                observations_exhausted: false,
             })),
             flights: Arc::new(Mutex::new(HashMap::new())),
             mutation: Arc::new(Mutex::new(())),
         }
     }
 
+    fn namespace(&self) -> Result<Arc<Namespace>, Errno> {
+        Ok(self.state.lock().map_err(|_| Errno::EIO)?.namespace.clone())
+    }
+
     fn node(&self, ino: INodeNo) -> Result<Node, Errno> {
-        let state = self.state.lock().map_err(|_| Errno::EIO)?;
+        let state = self.namespace()?;
         let id = u64::from(ino);
         let node = state.nodes.get(&id).ok_or(Errno::ENOENT)?;
         if state.paths.get(&node.path) != Some(&id) {
@@ -1366,52 +1619,99 @@ impl Drive {
         }
         let generation = self.accounts.metadata_generation();
         let started = Instant::now();
-        let (ticket, epoch, staged_versions, staged_directories) = {
-            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-            if !refresh
-                && let Some(cached) = state.directories.iter().find(|cached| {
+        let cached = if refresh {
+            None
+        } else {
+            let state = self.state.lock().map_err(|_| Errno::EIO)?;
+            state
+                .directories
+                .iter()
+                .find(|cached| {
                     cached.ino == ino.0
                         && cached.started.elapsed() < DIRECTORY_CACHE_TTL
                         && cached.mutation_epoch == state.mutation_epoch
                         && cached.metadata_generation == generation
-                        && cached.children.valid(&state, ino.0)
+                })
+                .map(|cached| {
+                    (
+                        cached.clone(),
+                        state.scans.get(&ino.0).copied(),
+                        state.namespace.clone(),
+                    )
+                })
+        };
+        // Snapshot pages require SQLite; load only bound identities outside State.
+        if let Some((cached, scan, namespace)) = cached
+            && let Some(names) = cached.children.inode_names()
+            && namespace.paths.get(&parent.path) == Some(&ino.0)
+            && namespace.nodes.get(&ino.0).is_some_and(|current| {
+                current.directory
+                    && current.resource_id == parent.resource_id
+                    && current.revision == parent.revision
+            })
+            && names.iter().all(|(id, name)| {
+                namespace.nodes.get(id).is_some_and(|node| {
+                    node.parent == ino.0
+                        && node.path.last() == Some(name)
+                        && namespace.paths.get(&node.path) == Some(id)
+                })
+            })
+        {
+            let state = self.state.lock().map_err(|_| Errno::EIO)?;
+            if Arc::ptr_eq(&state.namespace, &namespace)
+                && state.mutation_epoch == cached.mutation_epoch
+                && self.accounts.metadata_generation() == generation
+                && state.scans.get(&ino.0).copied() == scan
+                && state.directories.iter().any(|current| {
+                    current.ino == ino.0
+                        && current.started.elapsed() < DIRECTORY_CACHE_TTL
+                        && current.mutation_epoch == cached.mutation_epoch
+                        && current.metadata_generation == generation
+                        && current.children.matches(&cached.children)
                 })
             {
-                return Ok(cached.children.clone());
+                return Ok(cached.children);
             }
+        }
+        let mut staged_files = Vec::with_capacity(MAX_HANDLES);
+        let (ticket, namespace) = {
+            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
             let ticket = state.next_scan;
             state.next_scan = ticket.checked_add(1).ok_or(Errno::EIO)?;
-            let staged_versions: Vec<_> = state
-                .files
-                .values()
-                .filter(|file| {
-                    !file.failed
-                        && file.version.id().starts_with("cirrus-staged:")
-                        && state
-                            .nodes
-                            .get(&file.ino)
-                            .is_some_and(|node| node.parent == ino.0)
-                })
-                .map(|file| file.version.clone())
-                .collect();
-            let staged_directories: Vec<_> = state
-                .nodes
-                .iter()
-                .filter(|(id, node)| {
-                    node.directory
-                        && node.parent == ino.0
-                        && node.resource_id.starts_with("cirrus-dir:")
-                        && state.paths.get(&node.path) == Some(*id)
-                })
-                .map(|(_, node)| (node.path.clone(), node.resource_id.clone()))
-                .collect();
-            (
-                ticket,
-                state.mutation_epoch,
-                staged_versions,
-                staged_directories,
-            )
+            staged_files.extend(
+                state
+                    .files
+                    .values()
+                    .filter(|file| {
+                        !file.failed
+                            && file.version.id().starts_with("cirrus-staged:")
+                            && state
+                                .nodes
+                                .get(&file.ino)
+                                .is_some_and(|node| node.parent == ino.0)
+                    })
+                    .map(|file| file.version.clone()),
+            );
+            (ticket, state.namespace.clone())
         };
+        let epoch = namespace.mutation_epoch;
+        let staged_versions: Vec<_> = staged_files
+            .iter()
+            .map(|version| (**version).clone())
+            .collect();
+        let staged_directories: Vec<_> = namespace
+            .nodes
+            .iter()
+            .filter(|(id, node)| {
+                node.directory
+                    && node.parent == ino.0
+                    && node.resource_id.starts_with("cirrus-dir:")
+                    && namespace.paths.get(&node.path) == Some(*id)
+            })
+            .map(|(_, node)| (node.path.clone(), node.resource_id.to_string()))
+            .collect();
+        drop(namespace);
+        drop(staged_files);
         let (mut entries, confirmed, confirmed_directories) = if let Some(alive) = background {
             let refreshed = self
                 .accounts
@@ -1472,270 +1772,487 @@ impl Drive {
         }) {
             return Err(Errno::EAGAIN);
         }
-        let mut live = self.state.lock().map_err(|_| Errno::EIO)?;
-        if live.mutation_epoch != epoch
+        let mut files = Vec::with_capacity(MAX_HANDLES);
+        let mut detached = Vec::with_capacity(MAX_HANDLES * 2);
+        let mut ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+        let (baseline, baseline_next_node) = {
+            let live = self.state.lock().map_err(|_| Errno::EIO)?;
+            files.extend(
+                live.files
+                    .iter()
+                    .map(|(handle, file)| (*handle, file.clone())),
+            );
+            detached.extend(live.detached.iter().map(|(id, node)| (*id, node.clone())));
+            ranges.extend(live.cache.iter().cloned());
+            (live.namespace.clone(), live.next_node)
+        };
+        if baseline.mutation_epoch != epoch
             || self.accounts.metadata_generation() != generation
-            || live.paths.get(&parent.path) != Some(&u64::from(ino))
-            || live
+            || baseline.paths.get(&parent.path) != Some(&ino.0)
+            || baseline.nodes.get(&ino.0) != Some(&parent)
+            || baseline
                 .scans
-                .get(&u64::from(ino))
+                .get(&ino.0)
                 .is_some_and(|previous| *previous > ticket)
         {
             return Err(Errno::EAGAIN);
         }
-        // Prepare against an isolated copy of the capped live mount state, not
-        // a complete decoded listing. Snapshot owners remain shared/immutable;
-        // the bounded range cache is copied too. No handles, inode mappings or
-        // confirmation transitions become live until the final infallible swap.
+        let mut groups: Vec<(usize, u64, Vec<u64>)> = Vec::new();
+        for (index, (staged, _)) in confirmed.iter().enumerate() {
+            for (handle, file) in &files {
+                if !file.failed
+                    && *file.version == *staged
+                    && baseline.nodes.get(&file.ino).is_some_and(|node| {
+                        node.parent == ino.0
+                            && node.resource_id == staged.id()
+                            && node.etag.as_deref() == Some(staged.etag())
+                            && node.size == staged.size()
+                            && baseline.paths.get(&node.path) == Some(&file.ino)
+                    })
+                {
+                    if let Some((_, _, handles)) = groups
+                        .iter_mut()
+                        .find(|(pair, id, _)| confirmed[*pair].0 == *staged && *id == file.ino)
+                    {
+                        if !handles.contains(handle) {
+                            handles.push(*handle);
+                        }
+                    } else {
+                        groups.push((index, file.ino, vec![*handle]));
+                    }
+                }
+            }
+        }
+        let remote_versions: Vec<_> = confirmed
+            .iter()
+            .map(|(_, remote)| SharedVersion::new(remote.clone()))
+            .collect();
         #[cfg(feature = "fault-injection")]
         let original_namespace = std::env::var_os("CIRRUS_TEST_PUBLICATION_READ_FAULT")
-            .map(|_| live.publication_witness());
-        let mut state = live.clone();
-        for (path, resource, remote) in confirmed_directories {
-            let Some(id) = state.paths.get(&path).copied() else {
-                continue;
-            };
-            let Some(node) = state.nodes.get_mut(&id) else {
-                continue;
-            };
-            if node.parent != ino.0 || !node.directory || node.resource_id != resource {
-                continue;
-            }
-            node.resource_id = remote.id().to_owned();
-            node.etag = remote.etag().map(str::to_owned);
-            node.modified = remote.modified();
-            node.revision = node.revision.wrapping_add(1);
-            state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
-        }
-        for (staged, remote) in confirmed {
-            let ids: HashSet<_> = state
-                .files
-                .values()
-                .filter(|file| !file.failed && file.version == staged)
-                .map(|file| file.ino)
-                .collect();
-            for id in ids {
-                let Some(node) = state.nodes.get(&id) else {
+            .map(|_| publication_witness(&baseline, baseline_next_node, &detached, &files));
+        let prepare = |mut state: Namespace,
+                       mut next_node: u64,
+                       groups: &[(usize, u64, Vec<u64>)],
+                       detached: &[(u64, Arc<Node>)],
+                       entries: &mut DirectorySnapshot|
+         -> Result<PreparedListing, Errno> {
+            let mut promotions = Vec::with_capacity(MAX_HANDLES);
+            for (path, resource, remote) in &confirmed_directories {
+                let Some(id) = state.paths.get(path).copied() else {
                     continue;
                 };
-                if node.parent != ino.0
-                    || node.resource_id != staged.id()
-                    || node.etag.as_deref() != Some(staged.etag())
-                    || node.size != staged.size()
-                    || state.paths.get(&node.path) != Some(&id)
+                let Some(node) = state.nodes.get_mut(&id) else {
+                    continue;
+                };
+                if node.parent != ino.0 || !node.directory || node.resource_id != resource.as_str()
                 {
                     continue;
                 }
-                let node = state.nodes.get_mut(&id).ok_or(Errno::EIO)?;
-                node.resource_id = remote.id().to_owned();
-                node.etag = Some(remote.etag().to_owned());
-                node.checksums = remote.checksums().to_vec();
+                node.resource_id = remote.id().to_owned().into();
+                node.etag = remote.etag().map(|tag| tag.to_owned().into());
+                node.modified = remote.modified();
                 node.revision = node.revision.wrapping_add(1);
-                for file in state
-                    .files
-                    .values_mut()
-                    .filter(|file| file.ino == id && file.version == staged && !file.failed)
-                {
-                    file.version = remote.clone();
-                    file.last_read = None;
-                }
-                state.cache.retain(|entry| entry.version != staged);
-                state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
                 state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
             }
-        }
-        let epoch = state.mutation_epoch;
-        state.scans.insert(u64::from(ino), ticket);
-        let mut replaced = std::collections::HashSet::new();
-        let mut invalidated = Vec::new();
-        for (path, id) in &state.paths {
-            if path.len() == parent.path.len() + 1 && path.starts_with(&parent.path) {
-                let current = entries
-                    .get(path[parent.path.len()].as_str())
-                    .map_err(|_| Errno::EIO)?;
-                if !current.as_ref().is_some_and(|entry| {
-                    state.nodes.get(id).is_some_and(|node| {
-                        node.directory == entry.is_directory() && node.resource_id == entry.id()
-                    })
-                }) {
-                    replaced.insert(path[parent.path.len()].clone());
-                }
-                if let Some(node) = state.nodes.get(id)
-                    && !node.directory
-                    && !current.as_ref().is_some_and(|entry| {
-                        !entry.is_directory()
-                            && node.resource_id == entry.id()
-                            && entry.size() == Some(node.size)
-                            && node.etag.as_deref() == entry.etag()
-                            && node.checksums == entry.checksums()
-                    })
-                {
-                    invalidated.push(node.resource_id.clone());
+            for (index, (staged, remote)) in confirmed.iter().enumerate() {
+                for (_, id, _) in groups.iter().filter(|(pair, _, _)| *pair == index) {
+                    let id = *id;
+                    let Some(node) = state.nodes.get(&id) else {
+                        continue;
+                    };
+                    if node.parent != ino.0
+                        || node.resource_id != staged.id()
+                        || node.etag.as_deref() != Some(staged.etag())
+                        || node.size != staged.size()
+                        || state.paths.get(&node.path) != Some(&id)
+                    {
+                        continue;
+                    }
+                    let node = state.nodes.get_mut(&id).ok_or(Errno::EIO)?;
+                    node.resource_id = remote.id().to_owned().into();
+                    node.etag = Some(remote.etag().to_owned().into());
+                    node.checksums = remote.checksums().to_vec();
+                    node.revision = node.revision.wrapping_add(1);
+                    promotions.push((index, id));
+                    state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
                 }
             }
-        }
-        // Reserve inode identities and finish all scratch writes before removing
-        // any old paths. Capacity/write failures must not publish half a scan.
-        let retained: HashSet<u64> = state
-            .paths
-            .iter()
-            .filter(|(path, _)| {
+            state.scans.insert(u64::from(ino), ticket);
+            let mut replaced = std::collections::HashSet::new();
+            let mut invalidated = Vec::new();
+            for (path, id) in &state.paths {
+                if path.len() == parent.path.len() + 1 && path.starts_with(&parent.path) {
+                    let current = entries
+                        .get(path[parent.path.len()].as_str())
+                        .map_err(|_| Errno::EIO)?;
+                    if !current.as_ref().is_some_and(|entry| {
+                        state.nodes.get(id).is_some_and(|node| {
+                            node.directory == entry.is_directory() && node.resource_id == entry.id()
+                        })
+                    }) {
+                        replaced.insert(path[parent.path.len()].clone());
+                    }
+                    if let Some(node) = state.nodes.get(id)
+                        && !node.directory
+                        && !current.as_ref().is_some_and(|entry| {
+                            !entry.is_directory()
+                                && node.resource_id == entry.id()
+                                && entry.size() == Some(node.size)
+                                && node.etag.as_deref() == entry.etag()
+                                && node.checksums == entry.checksums()
+                        })
+                    {
+                        invalidated.push(node.resource_id.to_string());
+                    }
+                }
+            }
+            // Reserve inode identities and finish all scratch writes before removing
+            // any old paths. Capacity/write failures must not publish half a scan.
+            let retained: HashSet<u64> = state
+                .paths
+                .iter()
+                .filter(|(path, _)| {
+                    path.len() <= parent.path.len()
+                        || !path.starts_with(&parent.path)
+                        || !replaced.contains(&path[parent.path.len()])
+                })
+                .map(|(_, id)| *id)
+                .chain(detached.iter().map(|(id, _)| *id))
+                .collect();
+            let mut new_nodes = 0;
+            let mut after = 0;
+            loop {
+                let page = entries.page(after).map_err(|_| Errno::EIO)?;
+                if page.is_empty() {
+                    break;
+                }
+                for (cookie, entry) in page {
+                    after = cookie;
+                    if !entry.is_directory() && entry.size().is_none() {
+                        return Err(Errno::EIO);
+                    }
+                    let mut path = parent.path.clone();
+                    path.push(entry.name().to_owned());
+                    let existing = state.paths.get(&path).copied().filter(|id| {
+                        retained.contains(id)
+                            && state.nodes.get(id).is_some_and(|node| {
+                                node.directory == entry.is_directory()
+                                    && node.resource_id == entry.id()
+                            })
+                    });
+                    let id = if let Some(id) = existing {
+                        id
+                    } else {
+                        new_nodes += 1;
+                        if retained.len() + new_nodes > MAX_NODES {
+                            return Err(Errno::ENOSPC);
+                        }
+                        let id = next_node;
+                        next_node = next_node.checked_add(1).ok_or(Errno::ENOSPC)?;
+                        id
+                    };
+                    entries
+                        .bind_inode(entry.name(), id)
+                        .map_err(|_| Errno::EIO)?;
+                }
+            }
+            #[cfg(feature = "fault-injection")]
+            for id in &invalidated {
+                if std::env::var_os("CIRRUS_TEST_STAGE_WINDOW").is_some()
+                    && id.starts_with("cirrus-staged:")
+                {
+                    eprintln!("injected race: scan invalidated a staged inode");
+                }
+            }
+            state.paths.retain(|path, _| {
                 path.len() <= parent.path.len()
                     || !path.starts_with(&parent.path)
                     || !replaced.contains(&path[parent.path.len()])
-            })
-            .map(|(_, id)| *id)
-            .chain(state.detached.iter().copied())
-            .collect();
-        let mut next_node = state.next_node;
-        let mut new_nodes = 0;
-        let mut after = 0;
-        loop {
-            let page = entries.page(after).map_err(|_| Errno::EIO)?;
-            if page.is_empty() {
-                break;
-            }
-            for (cookie, entry) in page {
-                after = cookie;
-                if !entry.is_directory() && entry.size().is_none() {
-                    return Err(Errno::EIO);
+            });
+            // Removed or replaced paths already fail node() validation. Reclaim their
+            // inode records without reusing inode numbers, including descendants.
+            let live_nodes: HashSet<u64> = state.paths.values().copied().collect();
+            state.nodes.retain(|id, _| live_nodes.contains(id));
+            state.scans.retain(|id, _| {
+                live_nodes.contains(id) || detached.iter().any(|(detached, _)| detached == id)
+            });
+            #[cfg(feature = "fault-injection")]
+            entries
+                .inject_publication_read_fault()
+                .map_err(|_| Errno::EIO)?;
+            let mut after = 0;
+            loop {
+                let page = entries.page(after).map_err(|_| Errno::EIO)?;
+                if page.is_empty() {
+                    break;
                 }
-                let mut path = parent.path.clone();
-                path.push(entry.name().to_owned());
-                let existing = state.paths.get(&path).copied().filter(|id| {
-                    retained.contains(id)
-                        && state.nodes.get(id).is_some_and(|node| {
+                for (cookie, entry) in page {
+                    after = cookie;
+                    let mut path = parent.path.clone();
+                    path.push(entry.name().to_owned());
+                    let existing = state.paths.get(&path).copied().filter(|id| {
+                        state.nodes.get(id).is_some_and(|node| {
                             node.directory == entry.is_directory() && node.resource_id == entry.id()
                         })
-                });
-                let id = if let Some(id) = existing {
-                    id
-                } else {
-                    new_nodes += 1;
-                    if retained.len() + new_nodes > MAX_NODES {
-                        return Err(Errno::ENOSPC);
-                    }
-                    let id = next_node;
-                    next_node = next_node.checked_add(1).ok_or(Errno::ENOSPC)?;
-                    id
-                };
-                entries
-                    .bind_inode(entry.name(), id)
-                    .map_err(|_| Errno::EIO)?;
-            }
-        }
-        state.next_node = next_node;
-        for id in invalidated {
-            #[cfg(feature = "fault-injection")]
-            if std::env::var_os("CIRRUS_TEST_STAGE_WINDOW").is_some()
-                && id.starts_with("cirrus-staged:")
-            {
-                eprintln!("injected race: scan invalidated a staged inode");
-            }
-            state.invalidate_id(&id);
-        }
-        state.paths.retain(|path, _| {
-            path.len() <= parent.path.len()
-                || !path.starts_with(&parent.path)
-                || !replaced.contains(&path[parent.path.len()])
-        });
-        // Removed or replaced paths already fail node() validation. Reclaim their
-        // inode records without reusing inode numbers, including descendants.
-        let live_nodes: HashSet<u64> = state
-            .paths
-            .values()
-            .copied()
-            .chain(state.detached.iter().copied())
-            .collect();
-        state.nodes.retain(|id, _| live_nodes.contains(id));
-        state.scans.retain(|id, _| live_nodes.contains(id));
-        state
-            .directories
-            .retain(|entry| live_nodes.contains(&entry.ino));
-        #[cfg(feature = "fault-injection")]
-        entries
-            .inject_publication_read_fault()
-            .map_err(|_| Errno::EIO)?;
-        let mut after = 0;
-        loop {
-            let page = entries.page(after).map_err(|_| {
-                #[cfg(feature = "fault-injection")]
-                if let Some(original) = original_namespace {
-                    eprintln!(
-                        "cirrus lab publication failure live namespace unchanged={}",
-                        original == live.publication_witness()
-                    );
-                }
-                Errno::EIO
-            })?;
-            if page.is_empty() {
-                break;
-            }
-            for (cookie, entry) in page {
-                after = cookie;
-                let mut path = parent.path.clone();
-                path.push(entry.name().to_owned());
-                let existing = state.paths.get(&path).copied().filter(|id| {
-                    state.nodes.get(id).is_some_and(|node| {
-                        node.directory == entry.is_directory() && node.resource_id == entry.id()
-                    })
-                });
-                let id = if let Some(id) = existing {
-                    id
-                } else {
-                    // A replacement directory must not inherit the old directory's children.
-                    state.paths.retain(|candidate, _| {
-                        candidate.len() <= path.len() || !candidate.starts_with(&path)
                     });
-                    let id = entries
-                        .child(entry.name())
-                        .map_err(|_| Errno::EIO)?
-                        .ok_or(Errno::EIO)?
-                        .inode;
-                    state.paths.insert(path.clone(), id);
-                    id
-                };
-                let size = if entry.is_directory() {
-                    0
-                } else {
-                    entry.size().ok_or(Errno::EIO)?
-                };
-                let revision = state.nodes.get(&id).map_or(0, |old| {
-                    old.revision.wrapping_add(u64::from(
-                        old.size != size
-                            || old.etag.as_deref() != entry.etag()
-                            || old.checksums != entry.checksums(),
-                    ))
-                });
-                let node = Node {
-                    path,
-                    parent: u64::from(ino),
-                    directory: entry.is_directory(),
-                    size,
-                    modified: entry.modified(),
-                    resource_id: entry.id().to_owned(),
-                    etag: entry.etag().map(str::to_owned),
-                    checksums: entry.checksums().to_vec(),
-                    revision,
-                };
-                state.nodes.insert(id, node);
+                    let id = if let Some(id) = existing {
+                        id
+                    } else {
+                        // A replacement directory must not inherit the old directory's children.
+                        state.paths.retain(|candidate, _| {
+                            candidate.len() <= path.len() || !candidate.starts_with(&path)
+                        });
+                        let id = entries
+                            .child(entry.name())
+                            .map_err(|_| Errno::EIO)?
+                            .ok_or(Errno::EIO)?
+                            .inode;
+                        state.paths.insert(path.clone(), id);
+                        id
+                    };
+                    let size = if entry.is_directory() {
+                        0
+                    } else {
+                        entry.size().ok_or(Errno::EIO)?
+                    };
+                    let revision = state.nodes.get(&id).map_or(0, |old| {
+                        old.revision.wrapping_add(u64::from(
+                            old.size != size
+                                || old.etag.as_deref() != entry.etag()
+                                || old.checksums != entry.checksums(),
+                        ))
+                    });
+                    let node = Node {
+                        path,
+                        parent: u64::from(ino),
+                        directory: entry.is_directory(),
+                        size,
+                        modified: entry.modified(),
+                        resource_id: entry.id().to_owned().into(),
+                        etag: entry.etag().map(|tag| tag.to_owned().into()),
+                        checksums: entry.checksums().to_vec(),
+                        revision,
+                    };
+                    state.nodes.insert(id, node);
+                }
             }
+            let children = DirectoryView(entries.clone());
+            Ok(PreparedListing {
+                namespace: state,
+                next_node,
+                children,
+                promotions,
+                invalidated,
+            })
+        };
+        loop {
+            let PreparedListing {
+                namespace,
+                next_node,
+                children,
+                promotions,
+                invalidated,
+            } = match prepare(
+                (*baseline).clone(),
+                baseline_next_node,
+                &groups,
+                &detached,
+                &mut entries,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    #[cfg(feature = "fault-injection")]
+                    if let Some(original) = original_namespace {
+                        let mut current_files = Vec::with_capacity(MAX_HANDLES);
+                        let mut current_detached = Vec::with_capacity(MAX_HANDLES * 2);
+                        let (current, next_node) = {
+                            let live = self.state.lock().map_err(|_| Errno::EIO)?;
+                            current_files
+                                .extend(live.files.iter().map(|(id, file)| (*id, file.clone())));
+                            current_detached
+                                .extend(live.detached.iter().map(|(id, node)| (*id, node.clone())));
+                            (live.namespace.clone(), live.next_node)
+                        };
+                        eprintln!(
+                            "cirrus lab publication failure live namespace unchanged={}",
+                            original
+                                == publication_witness(
+                                    &current,
+                                    next_node,
+                                    &current_detached,
+                                    &current_files
+                                )
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let mut namespace = Arc::new(namespace);
+            let file_promotions: Vec<_> = promotions
+                .iter()
+                .flat_map(|(pair, id)| {
+                    groups
+                        .iter()
+                        .filter(move |(index, ino, _)| index == pair && ino == id)
+                        .flat_map(move |(_, _, handles)| {
+                            handles.iter().map(move |handle| (*handle, *pair))
+                        })
+                })
+                .collect();
+            let invalidated_handles: Vec<_> = files
+                .iter()
+                .filter_map(|(handle, file)| {
+                    let version = file_promotions
+                        .iter()
+                        .find(|(promoted, _)| promoted == handle)
+                        .map_or(&file.version, |(_, pair)| &remote_versions[*pair]);
+                    invalidated
+                        .iter()
+                        .any(|id| version.id() == id)
+                        .then_some(*handle)
+                })
+                .collect();
+            let removed_range_versions: Vec<_> = ranges
+                .iter()
+                .map(|range| &range.version)
+                .chain(files.iter().map(|(_, file)| &file.version))
+                .filter(|version| {
+                    invalidated.iter().any(|id| version.id() == id)
+                        || promotions
+                            .iter()
+                            .any(|(pair, _)| ***version == confirmed[*pair].0)
+                })
+                .cloned()
+                .collect();
+            let effects = ListingEffects {
+                promotions: file_promotions
+                    .into_iter()
+                    .map(|(handle, pair)| FilePromotion {
+                        handle,
+                        expected: files
+                            .iter()
+                            .find(|(id, _)| *id == handle)
+                            .expect("captured handle")
+                            .1
+                            .version
+                            .clone(),
+                        replacement: remote_versions[pair].clone(),
+                    })
+                    .collect(),
+                invalidated_handles,
+                removed_range_versions,
+            };
+            let cached = CachedDirectory {
+                ino: ino.0,
+                started,
+                attempted: started,
+                mutation_epoch: namespace.mutation_epoch,
+                metadata_generation: generation,
+                children: children.clone(),
+            };
+            let mut remaining = Vec::with_capacity(groups.len());
+            let mut current_detached = Vec::with_capacity(MAX_HANDLES * 2);
+            let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+            let mut retired_directories = Vec::with_capacity(DIRECTORY_CACHE_MAX);
+            let mut retired_versions = Vec::with_capacity(MAX_HANDLES);
+            let retired_namespace;
+            let mut live = self.state.lock().map_err(|_| Errno::EIO)?;
+            if !Arc::ptr_eq(&live.namespace, &baseline)
+                || live.next_node != baseline_next_node
+                || self.accounts.metadata_generation() != generation
+                || background.is_some_and(|alive| {
+                    !alive.load(Ordering::Acquire) || self.accounts.background_yield_requested()
+                })
+            {
+                return Err(Errno::EAGAIN);
+            }
+            for (index, (_, _, handles)) in groups.iter().enumerate() {
+                if handles
+                    .iter()
+                    .any(|handle| live.files.get(handle).is_some_and(|file| !file.failed))
+                {
+                    remaining.push(index);
+                }
+            }
+            if remaining.len() != groups.len() {
+                // Mutation excludes new anchors; each retry loses a nonempty
+                // group of the at most MAX_HANDLES captured file handles.
+                current_detached.extend(live.detached.iter().map(|(id, node)| (*id, node.clone())));
+                drop(live);
+                drop(namespace);
+                drop(children);
+                drop(cached);
+                let mut index = 0;
+                groups.retain(|_| {
+                    let keep = remaining.binary_search(&index).is_ok();
+                    index += 1;
+                    keep
+                });
+                detached = current_detached;
+                continue;
+            }
+            let prepared_namespace =
+                Arc::get_mut(&mut namespace).expect("private listing namespace");
+            for (id, _) in &detached {
+                if !live.detached.contains_key(id) {
+                    prepared_namespace.scans.remove(id);
+                }
+            }
+            for promotion in &effects.promotions {
+                if let Some(file) = live
+                    .files
+                    .get_mut(&promotion.handle)
+                    .filter(|file| !file.failed && file.version.same_owner(&promotion.expected))
+                {
+                    retired_versions.push(std::mem::replace(
+                        &mut file.version,
+                        promotion.replacement.clone(),
+                    ));
+                    file.last_read = None;
+                }
+            }
+            for handle in &effects.invalidated_handles {
+                if let Some(file) = live.files.get_mut(handle) {
+                    file.failed = true;
+                }
+            }
+            let mut index = 0;
+            while index < live.cache.len() {
+                let range = &live.cache[index];
+                if effects
+                    .removed_range_versions
+                    .iter()
+                    .any(|version| range.version.same_owner(version))
+                {
+                    retired_ranges.push(live.cache.remove(index).expect("present range"));
+                } else {
+                    index += 1;
+                }
+            }
+            live.cache_bytes = live.cache.iter().map(|entry| entry.bytes.len()).sum();
+            let mut index = 0;
+            while index < live.directories.len() {
+                let id = live.directories[index].ino;
+                if id == ino.0
+                    || (!namespace.nodes.contains_key(&id) && !live.detached.contains_key(&id))
+                {
+                    retired_directories
+                        .push(live.directories.remove(index).expect("present directory"));
+                } else {
+                    index += 1;
+                }
+            }
+            if live.directories.len() == DIRECTORY_CACHE_MAX {
+                retired_directories
+                    .push(live.directories.pop_front().expect("full directory cache"));
+            }
+            live.directories.push_back(cached);
+            live.next_node = next_node;
+            retired_namespace = std::mem::replace(&mut live.namespace, namespace);
+            drop(live);
+            drop(retired_namespace);
+            return Ok(children);
         }
-        let children = DirectoryView(entries);
-        state.directories.retain(|entry| entry.ino != ino.0);
-        while state.directories.len() >= DIRECTORY_CACHE_MAX {
-            state.directories.pop_front();
-        }
-        state.directories.push_back(CachedDirectory {
-            ino: ino.0,
-            started,
-            attempted: started,
-            mutation_epoch: epoch,
-            metadata_generation: generation,
-            children: children.clone(),
-        });
-        *live = state;
-        Ok(children)
     }
 
     fn fetch_range(
@@ -1847,14 +2364,24 @@ impl Drive {
             }
         };
         if leader {
-            let result = accounts
-                .read_range(binding, version, offset, length)
-                .map_err(|_| ());
-            let mut shared = flight.result.lock().map_err(|_| Errno::EIO)?;
-            *shared = Some(result);
-            flight.ready.notify_all();
-            drop(shared);
-            flights.lock().map_err(|_| Errno::EIO)?.remove(&key);
+            let owner = FlightLeader {
+                flights,
+                key: Some(key),
+                flight: Arc::clone(&flight),
+            };
+            let result = accounts.read_range(binding, version, offset, length);
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
+                && let Err(error) = &result
+            {
+                eprintln!(
+                    "cirrus lab owner read: pid={} thread={:?} boundary=fuse-range-leader staged={} offset={offset} length={length} error={error}",
+                    std::process::id(),
+                    std::thread::current().id(),
+                    version.id().starts_with("cirrus-staged:")
+                );
+            }
+            owner.complete(result.map_err(|_| ()))?;
         }
         let mut shared = flight.result.lock().map_err(|_| Errno::EIO)?;
         while shared.is_none() {
@@ -1931,29 +2458,38 @@ impl Drive {
         if std::env::var_os("CIRRUS_TEST_STAGE_WINDOW").is_some() {
             std::thread::sleep(Duration::from_millis(500));
         }
-        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-        if state.paths.get(&old.path) != Some(&ino.0) {
+        let current = self.namespace()?;
+        let mut namespace = (*current).clone();
+        if namespace.paths.get(&old.path) != Some(&ino.0) {
             return Err(Errno::EIO);
         }
-        state.cache.retain(|entry| {
-            entry.version.id() != old.resource_id && entry.version.id() != version.id()
-        });
-        state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
-        let node = state.nodes.get_mut(&ino.0).ok_or(Errno::EIO)?;
-        node.resource_id = version.id().to_owned();
-        node.etag = Some(version.etag().to_owned());
+        let node = namespace.nodes.get_mut(&ino.0).ok_or(Errno::EIO)?;
+        node.resource_id = version.id().to_owned().into();
+        node.etag = Some(version.etag().to_owned().into());
         node.size = version.size();
         node.checksums.clear();
         node.revision = node.revision.wrapping_add(1);
+        namespace.mutation_epoch = namespace.mutation_epoch.wrapping_add(1);
+        let namespace = Arc::new(namespace);
+        let version = SharedVersion::new(version.clone());
+        let mut retired_versions = Vec::with_capacity(MAX_HANDLES);
+        let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+        let retired_namespace;
+        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+        state.retire_ranges(&mut retired_ranges, |entry| {
+            entry.version.id() == old.resource_id || entry.version.id() == version.id()
+        });
         for file in state
             .files
             .values_mut()
             .filter(|file| file.ino == ino.0 && !file.failed)
         {
-            file.version = version.clone();
+            retired_versions.push(std::mem::replace(&mut file.version, version.clone()));
             file.last_read = None;
         }
-        state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+        retired_namespace = std::mem::replace(&mut state.namespace, namespace);
+        drop(state);
+        drop(retired_namespace);
         Ok(())
     }
 
@@ -2019,11 +2555,7 @@ impl Drive {
         let Some(data) = data else {
             return Ok(version);
         };
-        let parents = self
-            .state
-            .lock()
-            .map_err(|_| Errno::EIO)?
-            .parent_identities(&node.path)?;
+        let parents = self.namespace()?.parent_identities(&node.path)?;
         let staged = self
             .accounts
             .stage_mount_mutation(
@@ -2096,11 +2628,7 @@ impl Drive {
             return Err(Errno::EFBIG);
         }
         let node = self.node(ino)?;
-        let parents = self
-            .state
-            .lock()
-            .map_err(|_| Errno::EIO)?
-            .parent_identities(&node.path)?;
+        let parents = self.namespace()?.parent_identities(&node.path)?;
         let staged = self
             .accounts
             .stage_mount_mutation(
@@ -2117,27 +2645,41 @@ impl Drive {
     }
 
     fn publish_detached(&self, ino: INodeNo, version: &FileVersion) -> Result<Node, Errno> {
-        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-        if !state.detached.contains(&ino.0) {
-            return Err(Errno::EIO);
-        }
-        state
-            .cache
-            .retain(|entry| entry.version.id() != version.id());
-        state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
-        let node = state.nodes.get_mut(&ino.0).ok_or(Errno::EIO)?;
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| Errno::EIO)?
+            .detached
+            .get(&ino.0)
+            .cloned()
+            .ok_or(Errno::EIO)?;
+        let mut node = (*current).clone();
         node.size = version.size();
-        node.etag = Some(version.etag().to_owned());
+        node.etag = Some(version.etag().to_owned().into());
         node.revision = node.revision.wrapping_add(1);
-        let node = node.clone();
+        let owner = Arc::new(node.clone());
+        let version = SharedVersion::new(version.clone());
+        let mut retired_versions = Vec::with_capacity(MAX_HANDLES);
+        let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+        let retired_node;
+        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+        let Some(slot) = state.detached.get_mut(&ino.0) else {
+            return Err(Errno::EIO);
+        };
+        retired_node = std::mem::replace(slot, owner);
+        state.retire_ranges(&mut retired_ranges, |entry| {
+            entry.version.id() == version.id()
+        });
         for file in state
             .files
             .values_mut()
             .filter(|file| file.ino == ino.0 && !file.failed)
         {
-            file.version = version.clone();
+            retired_versions.push(std::mem::replace(&mut file.version, version.clone()));
             file.last_read = None;
         }
+        drop(state);
+        drop(retired_node);
         Ok(node)
     }
 
@@ -2150,7 +2692,7 @@ impl Drive {
         let _guard = self.mutation.lock().map_err(|_| Errno::EIO)?;
         let version = {
             let state = self.state.lock().map_err(|_| Errno::EIO)?;
-            if !state.detached.contains(&ino.0) {
+            if !state.detached.contains_key(&ino.0) {
                 return Ok(None);
             }
             let file = state
@@ -2170,8 +2712,15 @@ impl Drive {
                 .map_err(|error| stage_error(&error))?;
             return self.publish_detached(ino, &staged).map(Some);
         }
-        let state = self.state.lock().map_err(|_| Errno::EIO)?;
-        Ok(Some(state.nodes.get(&ino.0).cloned().ok_or(Errno::EIO)?))
+        let node = self
+            .state
+            .lock()
+            .map_err(|_| Errno::EIO)?
+            .detached
+            .get(&ino.0)
+            .cloned()
+            .ok_or(Errno::EIO)?;
+        Ok(Some((*node).clone()))
     }
 
     fn remove_namespace(
@@ -2306,12 +2855,17 @@ impl Drive {
             self.stage_write_source(INodeNo(id), &node, version, data)?;
             node = self.node(INodeNo(id))?;
         }
+        let current = self.namespace()?;
+        let mut namespace = (*current).clone();
+        namespace.paths.remove(&node.path);
+        namespace.observed.remove(&node.path);
+        let detached_node = Arc::new(namespace.nodes.remove(&id).ok_or(Errno::EIO)?);
+        namespace.mutation_epoch = namespace.mutation_epoch.wrapping_add(1);
+        let namespace = Arc::new(namespace);
+        let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+        let retired_namespace;
         if self.space.is_offline() && directory {
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&node.path)?;
+            let parents = self.namespace()?.parent_identities(&node.path)?;
             self.accounts
                 .stage_namespace(
                     &self.instance,
@@ -2330,22 +2884,14 @@ impl Drive {
             if !node.matches_version(&version) {
                 return Err(Errno::EIO);
             }
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&node.path)?;
+            let parents = self.namespace()?.parent_identities(&node.path)?;
             self.accounts
                 .remove_offline_file(&self.space, &version, open_files, &parents)
                 .map_err(|error| stage_error(&error))?;
         } else if node.resource_id.starts_with("cirrus-staged:")
             || node.resource_id.starts_with("cirrus-dir:")
         {
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&node.path)?;
+            let parents = self.namespace()?.parent_identities(&node.path)?;
             self.accounts
                 .remove_staged(
                     &self.instance,
@@ -2358,11 +2904,7 @@ impl Drive {
                 .map_err(|error| stage_error(&error))?;
         } else {
             let etag = node.etag.as_deref().ok_or(Errno::EOPNOTSUPP)?;
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&node.path)?;
+            let parents = self.namespace()?.parent_identities(&node.path)?;
             self.accounts
                 .stage_namespace(
                     &self.instance,
@@ -2375,18 +2917,15 @@ impl Drive {
                 .map_err(|error| stage_error(&error))?;
         }
         let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-        state.paths.remove(&node.path);
-        state.observed.remove(&node.path);
         if open_files && state.files.values().any(|file| file.ino == id) {
-            state.detached.insert(id);
-        } else {
-            state.nodes.remove(&id);
+            state.detached.insert(id, detached_node);
         }
-        state
-            .cache
-            .retain(|entry| entry.version.id() != node.resource_id);
-        state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
-        state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+        state.retire_ranges(&mut retired_ranges, |entry| {
+            entry.version.id() == node.resource_id
+        });
+        retired_namespace = std::mem::replace(&mut state.namespace, namespace);
+        drop(state);
+        drop(retired_namespace);
         Ok(())
     }
 }
@@ -2453,11 +2992,15 @@ impl Filesystem for Drive {
     fn getattr(&self, _: &Request, ino: INodeNo, handle: Option<FileHandle>, reply: ReplyAttr) {
         {
             let result = self.state.lock().map_err(|_| Errno::EIO).and_then(|state| {
-                if !state.detached.contains(&ino.0) {
+                if !state.detached.contains_key(&ino.0) {
                     return Ok(None);
                 }
                 if let Some(handle) = handle {
-                    if state.nodes.get(&ino.0).is_some_and(|node| node.directory) {
+                    if state
+                        .detached
+                        .get(&ino.0)
+                        .is_some_and(|node| node.directory)
+                    {
                         if !state
                             .handles
                             .get(&handle.0)
@@ -2465,7 +3008,7 @@ impl Filesystem for Drive {
                         {
                             return Err(Errno::EBADF);
                         }
-                        return Ok(Some(state.nodes.get(&ino.0).cloned().ok_or(Errno::EIO)?));
+                        return Ok(Some(state.detached.get(&ino.0).cloned().ok_or(Errno::EIO)?));
                     }
                     let file = state
                         .files
@@ -2476,7 +3019,7 @@ impl Filesystem for Drive {
                         return Err(Errno::EIO);
                     }
                 }
-                Ok(Some(state.nodes.get(&ino.0).cloned().ok_or(Errno::EIO)?))
+                Ok(Some(state.detached.get(&ino.0).cloned().ok_or(Errno::EIO)?))
             });
             match result {
                 Ok(Some(node)) => {
@@ -2554,13 +3097,17 @@ impl Filesystem for Drive {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Ok(state) = self.state.lock() else {
-            reply.error(Errno::EIO);
-            return;
-        };
-        let Some(directory) = state.handles.get(&handle.0) else {
-            reply.error(Errno::EBADF);
-            return;
+        let directory = self
+            .state
+            .lock()
+            .map_err(|_| Errno::EIO)
+            .and_then(|state| state.handles.get(&handle.0).cloned().ok_or(Errno::EBADF));
+        let directory = match directory {
+            Ok(directory) => directory,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         if offset == 0 && reply.add(INodeNo(directory.ino), 1, FileType::Directory, ".") {
             reply.ok();
@@ -2593,21 +3140,26 @@ impl Filesystem for Drive {
         _: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        match self.state.lock() {
-            Ok(mut state) => {
-                state.handles.remove(&handle.0);
-                if state.detached.contains(&ino.0)
-                    && !state
-                        .handles
-                        .values()
-                        .any(|directory| directory.ino == ino.0)
-                {
-                    state.detached.remove(&ino.0);
-                    state.nodes.remove(&ino.0);
-                }
+        let directory = self.state.lock().map_err(|_| Errno::EIO).map(|mut state| {
+            let directory = state.handles.remove(&handle.0);
+            let detached = if state.detached.contains_key(&ino.0)
+                && !state
+                    .handles
+                    .values()
+                    .any(|directory| directory.ino == ino.0)
+            {
+                state.detached.remove(&ino.0)
+            } else {
+                None
+            };
+            (directory, detached)
+        });
+        match directory {
+            Ok(directory) => {
+                drop(directory);
                 reply.ok();
             }
-            Err(_) => reply.error(Errno::EIO),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -2646,6 +3198,40 @@ impl Filesystem for Drive {
                 Some(guard) => guard,
                 None => self.mutation.lock().map_err(|_| Errno::EIO)?,
             };
+            let namespace = self.namespace()?;
+            let mut draft = (*namespace).clone();
+            if let Ok(version) = &version {
+                let current = draft
+                    .nodes
+                    .get_mut(&ino.0)
+                    .filter(|current| {
+                        current.path == node.path && current.resource_id == node.resource_id
+                    })
+                    .ok_or(Errno::EIO)?;
+                let changed = current.size != version.size()
+                    || current.etag.as_deref() != Some(version.etag())
+                    || current.checksums != version.checksums();
+                current.size = version.size();
+                current.etag = Some(version.etag().to_owned().into());
+                current.checksums = version.checksums().to_vec();
+                current.revision = current.revision.wrapping_add(u64::from(changed));
+                if !version.id().starts_with("cirrus-staged:")
+                    && !draft.observed.contains_key(&node.path)
+                {
+                    if draft.observed.len() >= MAX_NODES {
+                        draft.observations_exhausted = true;
+                    } else {
+                        draft.observed.insert(
+                            node.path.clone(),
+                            (version.id().to_owned(), version.etag().to_owned()),
+                        );
+                    }
+                }
+            }
+            let draft = Arc::new(draft);
+            let version = version.map(SharedVersion::new);
+            let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+            let retired_namespace;
             let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
             let Some(current) = state.nodes.get(&u64::from(ino)) else {
                 return Err(Errno::EIO);
@@ -2659,10 +3245,10 @@ impl Filesystem for Drive {
             if current.revision != node.revision && !matches_published_version {
                 return Err(Errno::EIO);
             }
-            let version = match version {
-                Ok(version) => version,
+            let version = match &version {
+                Ok(version) => version.clone(),
                 Err(_) => {
-                    state.invalidate_id(&node.resource_id);
+                    state.invalidate_id(&node.resource_id, &mut retired_ranges);
                     return Err(Errno::EIO);
                 }
             };
@@ -2672,33 +3258,8 @@ impl Filesystem for Drive {
             if state.paths.get(&node.path) != Some(&u64::from(ino)) {
                 return Err(Errno::EIO);
             }
-            state.observe_version(&version);
-            let current = state
-                .nodes
-                .get_mut(&u64::from(ino))
-                .filter(|current| {
-                    current.path == node.path && current.resource_id == node.resource_id
-                })
-                .ok_or(Errno::EIO)?;
-            let changed = current.size != version.size()
-                || current.etag.as_deref() != Some(version.etag())
-                || current.checksums != version.checksums();
-            current.size = version.size();
-            current.etag = Some(version.etag().to_owned());
-            current.checksums = version.checksums().to_vec();
-            current.revision = current.revision.wrapping_add(u64::from(changed));
-            if !version.id().starts_with("cirrus-staged:")
-                && !state.observed.contains_key(&node.path)
-            {
-                if state.observed.len() >= MAX_NODES {
-                    state.observations_exhausted = true;
-                } else {
-                    state.observed.insert(
-                        node.path.clone(),
-                        (version.id().to_owned(), version.etag().to_owned()),
-                    );
-                }
-            }
+            state.observe_version(&version, &mut retired_ranges);
+            retired_namespace = std::mem::replace(&mut state.namespace, draft);
             let handle = state.next_handle;
             state.next_handle = handle.checked_add(1).ok_or(Errno::EMFILE)?;
             state.files.insert(
@@ -2712,6 +3273,8 @@ impl Filesystem for Drive {
                     last_read: None,
                 },
             );
+            drop(state);
+            drop(retired_namespace);
             Ok(handle)
         })();
         match result {
@@ -2743,22 +3306,19 @@ impl Filesystem for Drive {
             #[cfg(feature = "fault-injection")]
             wait_test_window("CIRRUS_TEST_CREATE_WINDOW")?;
             let (_guard, parent_node) = self.lock_vacant_parent(parent, name)?;
-            {
+            let id = {
                 let state = self.state.lock().map_err(|_| Errno::EIO)?;
                 if state.files.len() >= MAX_HANDLES {
                     return Err(Errno::EMFILE);
                 }
-                if state.nodes.len() >= MAX_NODES {
+                if state.nodes.len() + state.detached.len() >= MAX_NODES {
                     return Err(Errno::ENOSPC);
                 }
-            }
+                state.next_node
+            };
             let mut path = parent_node.path.clone();
             path.push(name.to_owned());
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&path)?;
+            let parents = self.namespace()?.parent_identities(&path)?;
             let version = self
                 .accounts
                 .stage_mount_mutation(
@@ -2773,24 +3333,30 @@ impl Filesystem for Drive {
                     eprintln!("staged create failed: {error}");
                     stage_error(&error)
                 })?;
-            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-            let id = state.next_node;
-            state.next_node = id.checked_add(1).ok_or(Errno::ENOSPC)?;
-            let handle = state.next_handle;
-            state.next_handle = handle.checked_add(1).ok_or(Errno::EMFILE)?;
+            let current = self.namespace()?;
+            let mut namespace = (*current).clone();
+            let next_node = id.checked_add(1).ok_or(Errno::ENOSPC)?;
             let node = Node {
                 path: path.clone(),
                 parent: parent.0,
                 directory: false,
                 size: 0,
                 modified: SystemTime::now(),
-                resource_id: version.id().to_owned(),
-                etag: Some(version.etag().to_owned()),
+                resource_id: version.id().to_owned().into(),
+                etag: Some(version.etag().to_owned().into()),
                 checksums: Vec::new(),
                 revision: 0,
             };
-            state.paths.insert(path, id);
-            state.nodes.insert(id, node.clone());
+            namespace.paths.insert(path, id);
+            namespace.nodes.insert(id, node.clone());
+            namespace.mutation_epoch = namespace.mutation_epoch.wrapping_add(1);
+            let namespace = Arc::new(namespace);
+            let version = SharedVersion::new(version);
+            let retired_namespace;
+            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+            state.next_node = next_node;
+            let handle = state.next_handle;
+            state.next_handle = handle.checked_add(1).ok_or(Errno::EMFILE)?;
             state.files.insert(
                 handle,
                 OpenFile {
@@ -2802,7 +3368,9 @@ impl Filesystem for Drive {
                     last_read: None,
                 },
             );
-            state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+            retired_namespace = std::mem::replace(&mut state.namespace, namespace);
+            drop(state);
+            drop(retired_namespace);
             Ok((id, handle, node))
         })();
         match result {
@@ -2843,7 +3411,7 @@ impl Filesystem for Drive {
                 (
                     file.version.clone(),
                     file.append,
-                    state.detached.contains(&ino.0),
+                    state.detached.contains_key(&ino.0),
                 )
             };
             let start = if append { version.size() } else { offset };
@@ -2866,11 +3434,7 @@ impl Filesystem for Drive {
                 self.publish_detached(ino, &staged)?;
             } else {
                 let node = self.node(ino)?;
-                let parents = self
-                    .state
-                    .lock()
-                    .map_err(|_| Errno::EIO)?
-                    .parent_identities(&node.path)?;
+                let parents = self.namespace()?.parent_identities(&node.path)?;
                 let staged = self
                     .accounts
                     .stage_mount_mutation(
@@ -3033,38 +3597,43 @@ impl Filesystem for Drive {
             let (_guard, parent_node) = self.lock_vacant_parent(parent, name)?;
             let id = {
                 let state = self.state.lock().map_err(|_| Errno::EIO)?;
-                if state.nodes.len() >= MAX_NODES || state.next_node.checked_add(1).is_none() {
+                if state.nodes.len() + state.detached.len() >= MAX_NODES
+                    || state.next_node.checked_add(1).is_none()
+                {
                     return Err(Errno::ENOSPC);
                 }
                 state.next_node
             };
             let mut path = parent_node.path;
             path.push(name.to_owned());
-            let parents = self
-                .state
-                .lock()
-                .map_err(|_| Errno::EIO)?
-                .parent_identities(&path)?;
+            let parents = self.namespace()?.parent_identities(&path)?;
             let operation = self
                 .accounts
                 .stage_namespace(&self.instance, &self.space, &path, "mkdir", None, &parents)
                 .map_err(|error| stage_error(&error))?;
-            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
-            state.next_node = id + 1;
+            let current = self.namespace()?;
+            let mut namespace = (*current).clone();
             let node = Node {
                 path: path.clone(),
                 parent: parent.0,
                 directory: true,
                 size: 0,
                 modified: UNIX_EPOCH,
-                resource_id: format!("cirrus-dir:{operation}"),
+                resource_id: format!("cirrus-dir:{operation}").into(),
                 etag: None,
                 checksums: Vec::new(),
                 revision: 0,
             };
-            state.paths.insert(path, id);
-            state.nodes.insert(id, node.clone());
-            state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+            namespace.paths.insert(path, id);
+            namespace.nodes.insert(id, node.clone());
+            namespace.mutation_epoch = namespace.mutation_epoch.wrapping_add(1);
+            let namespace = Arc::new(namespace);
+            let retired_namespace;
+            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+            state.next_node = id + 1;
+            retired_namespace = std::mem::replace(&mut state.namespace, namespace);
+            drop(state);
+            drop(retired_namespace);
             Ok((id, node))
         })();
         match result {
@@ -3151,7 +3720,7 @@ impl Filesystem for Drive {
                     let mut destination = new_parent.path.clone();
                     destination.push(newname.to_owned());
                     let (source_parents, destination_parents) = {
-                        let state = self.state.lock().map_err(|_| Errno::EIO)?;
+                        let state = self.namespace()?;
                         (
                             state.parent_identities(&source.path)?,
                             state.parent_identities(&destination)?,
@@ -3169,7 +3738,7 @@ impl Filesystem for Drive {
                             .has_unresolved_subtree(&self.instance, &self.space, &source.path)
                             .map_err(|error| stage_error(&error))?
                     {
-                        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                        let state = self.state.lock().map_err(|_| Errno::EIO)?;
                         let in_tree = |id: u64| {
                             state
                                 .nodes
@@ -3208,21 +3777,42 @@ impl Filesystem for Drive {
                                 Err(error) => return Err(stage_error(&error)),
                             };
                             let _guard = self.mutation.lock().map_err(|_| Errno::EIO)?;
-                            state = self.state.lock().map_err(|_| Errno::EIO)?;
-                            if state.mutation_epoch != epoch
-                                || self.accounts.metadata_generation() != generation
-                                || state.paths.get(&source.path) != Some(&source_id)
-                                || state.paths.contains_key(&destination)
-                                || state.nodes.get(&source_id).is_none_or(|current| {
+                            let current = self.namespace()?;
+                            if current.mutation_epoch != epoch
+                                || current.paths.get(&source.path) != Some(&source_id)
+                                || current.paths.contains_key(&destination)
+                                || current.nodes.get(&source_id).is_none_or(|current| {
                                     current.revision != source.revision
                                         || current.resource_id != source.resource_id
                                         || current.etag != source.etag
                                 })
-                                || state.parent_identities(&source.path)? != source_parents
-                                || state.parent_identities(&destination)? != destination_parents
+                                || current.parent_identities(&source.path)? != source_parents
+                                || current.parent_identities(&destination)? != destination_parents
                             {
-                                drop(state);
                                 drop(prepared);
+                                continue 'retry;
+                            }
+                            let mut draft = (*current).clone();
+                            draft.paths.remove(&source.path);
+                            draft.paths.insert(destination.clone(), source_id);
+                            draft.observed.retain(|path, _| {
+                                !path.starts_with(&source.path) && !path.starts_with(&destination)
+                            });
+                            let node = draft.nodes.get_mut(&source_id).ok_or(Errno::EIO)?;
+                            node.path = destination.clone();
+                            node.parent = newparent.0;
+                            let mut identity = String::with_capacity(32);
+                            identity.push_str("cirrus-dir:");
+                            node.resource_id = identity.into();
+                            node.etag = None;
+                            node.revision = node.revision.wrapping_add(1);
+                            draft.mutation_epoch = draft.mutation_epoch.wrapping_add(1);
+                            let mut draft = Arc::new(draft);
+                            let retired_namespace;
+                            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                            if !Arc::ptr_eq(&state.namespace, &current)
+                                || self.accounts.metadata_generation() != generation
+                            {
                                 continue 'retry;
                             }
                             let in_tree = |id: u64| {
@@ -3239,19 +3829,19 @@ impl Filesystem for Drive {
                             {
                                 return Err(Errno::EBUSY);
                             }
+                            let node = Arc::get_mut(&mut draft)
+                                .expect("private namespace")
+                                .nodes
+                                .get_mut(&source_id)
+                                .expect("prepared directory");
+                            let ResourceText::Literal(identity) = &mut node.resource_id else {
+                                unreachable!("prepared directory identity");
+                            };
                             let id = prepared.commit().map_err(|error| stage_error(&error))?;
-                            state.paths.remove(&source.path);
-                            state.paths.insert(destination.clone(), source_id);
-                            state.observed.retain(|path, _| {
-                                !path.starts_with(&source.path) && !path.starts_with(&destination)
-                            });
-                            let node = state.nodes.get_mut(&source_id).ok_or(Errno::EIO)?;
-                            node.path = destination;
-                            node.parent = newparent.0;
-                            node.resource_id = format!("cirrus-dir:{id}");
-                            node.etag = None;
-                            node.revision = node.revision.wrapping_add(1);
-                            state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+                            ResourceText::bind_directory_id(identity, id);
+                            retired_namespace = std::mem::replace(&mut state.namespace, draft);
+                            drop(state);
+                            drop(retired_namespace);
                             return Ok(());
                         }
                     }
@@ -3278,9 +3868,8 @@ impl Filesystem for Drive {
                         && target_node
                             .as_ref()
                             .is_some_and(|node| !node.resource_id.starts_with("cirrus-dir:"));
-                    // Keep readers from observing journal paths between the transaction
-                    // and the corresponding inode/handle updates.
-                    let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                    let mut open = Vec::with_capacity(MAX_HANDLES);
+                    let state = self.state.lock().map_err(|_| Errno::EIO)?;
                     if !detach_target
                         && target.is_some_and(|id| {
                             state.handles.values().any(|directory| directory.ino == id)
@@ -3288,54 +3877,46 @@ impl Filesystem for Drive {
                     {
                         return Err(Errno::EBUSY);
                     }
-                    let open: Vec<_> = state
-                        .files
-                        .iter()
-                        .filter(|(_, file)| {
-                            !file.failed
-                                && !state.detached.contains(&file.ino)
-                                && state
-                                    .nodes
-                                    .get(&file.ino)
-                                    .is_some_and(|node| node.path.starts_with(&source.path))
-                        })
-                        .map(|(handle, file)| (*handle, file.version.clone()))
-                        .collect();
+                    open.extend(
+                        state
+                            .files
+                            .iter()
+                            .filter(|(_, file)| {
+                                !file.failed
+                                    && !state.detached.contains_key(&file.ino)
+                                    && state
+                                        .nodes
+                                        .get(&file.ino)
+                                        .is_some_and(|node| node.path.starts_with(&source.path))
+                            })
+                            .map(|(handle, file)| (*handle, file.version.clone())),
+                    );
+                    let epoch = state.mutation_epoch;
+                    let generation = self.accounts.metadata_generation();
+                    let initial = state.namespace.clone();
+                    drop(state);
                     let versions = open
                         .iter()
-                        .map(|(_, version)| version.clone())
+                        .map(|(_, version)| (**version).clone())
                         .collect::<Vec<_>>();
-                    let open_directories: Vec<_> = state
+                    let open_directories: Vec<_> = initial
                         .nodes
                         .iter()
                         .filter(|(id, node)| {
                             node.directory
                                 && node.path.starts_with(&source.path)
                                 && node.resource_id.starts_with("cirrus-dir:")
-                                && state.paths.get(&node.path) == Some(*id)
+                                && initial.paths.get(&node.path) == Some(*id)
                         })
-                        .map(|(_, node)| (node.path.clone(), node.resource_id.clone()))
+                        .map(|(_, node)| (node.path.clone(), node.resource_id.to_string()))
                         .collect();
+                    drop(initial);
                     let local_target = target_node
                         .as_ref()
                         .filter(|node| node.resource_id.starts_with("cirrus-dir:"))
                         .map(|node| node.resource_id.as_str());
-                    let relocated = if source.resource_id.starts_with("cirrus-dir:") {
-                        self.accounts.rename_local_directory(
-                            &self.instance,
-                            &self.space,
-                            &source.path,
-                            &destination,
-                            &source.resource_id,
-                            target_node
-                                .as_ref()
-                                .map(|node| (node.resource_id.as_str(), node.etag.as_deref())),
-                            &versions,
-                            cirrus_account::RenameParents {
-                                source: &source_parents,
-                                destination: &destination_parents,
-                            },
-                        )
+                    let prepared = if source.resource_id.starts_with("cirrus-dir:") {
+                        None
                     } else {
                         let etag = source.etag.as_deref().ok_or(Errno::EOPNOTSUPP)?;
                         let expected = target_node
@@ -3351,9 +3932,6 @@ impl Filesystem for Drive {
                         if foreground.is_none() {
                             foreground = Some(self.accounts.request_foreground());
                         }
-                        let epoch = state.mutation_epoch;
-                        let generation = self.accounts.metadata_generation();
-                        drop(state);
                         drop(_guard);
                         let prepared = match self.accounts.prepare_remote_tree(
                             &self.instance,
@@ -3374,28 +3952,79 @@ impl Filesystem for Drive {
                             Err(error) => return Err(stage_error(&error)),
                         };
                         _guard = self.mutation.lock().map_err(|_| Errno::EIO)?;
-                        state = self.state.lock().map_err(|_| Errno::EIO)?;
+                        Some(prepared)
+                    };
+                    let current = self.namespace()?;
+                    if prepared.is_some() {
                         let same_node = |id: u64, node: &Node| {
-                            state.paths.get(&node.path) == Some(&id)
-                                && state.nodes.get(&id).is_some_and(|current| {
+                            current.paths.get(&node.path) == Some(&id)
+                                && current.nodes.get(&id).is_some_and(|current| {
                                     current.revision == node.revision
                                         && current.resource_id == node.resource_id
                                         && current.etag == node.etag
                                 })
                         };
+                        if current.mutation_epoch != epoch
+                            || self.accounts.metadata_generation() != generation
+                            || !same_node(source_id, &source)
+                            || current.paths.get(&destination).copied() != target
+                            || target
+                                .zip(target_node.as_ref())
+                                .is_some_and(|(id, node)| !same_node(id, node))
+                            || current.parent_identities(&source.path)? != source_parents
+                            || current.parent_identities(&destination)? != destination_parents
+                        {
+                            drop(prepared);
+                            continue 'retry;
+                        }
+                    }
+                    let mut draft = (*current).clone();
+                    let detached_target = target.and_then(|id| {
+                        draft.paths.remove(&destination);
+                        draft.scans.remove(&id);
+                        draft.nodes.remove(&id).map(Arc::new)
+                    });
+                    let paths: Vec<_> = draft
+                        .paths
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&source.path))
+                        .map(|(path, id)| (path.clone(), *id))
+                        .collect();
+                    for (path, id) in paths {
+                        draft.paths.remove(&path);
+                        let mut next = destination.clone();
+                        next.extend_from_slice(&path[source.path.len()..]);
+                        draft.paths.insert(next.clone(), id);
+                        if let Some(node) = draft.nodes.get_mut(&id) {
+                            node.path = next;
+                            if id == source_id {
+                                node.parent = newparent.0;
+                            }
+                            node.revision = node.revision.wrapping_add(1);
+                        }
+                    }
+                    draft.observed.retain(|path, _| {
+                        !path.starts_with(&source.path) && !path.starts_with(&destination)
+                    });
+                    draft.mutation_epoch = draft.mutation_epoch.wrapping_add(1);
+                    let draft = Arc::new(draft);
+                    let owners: Vec<_> = open.iter().map(|_| SharedVersion::unbound()).collect();
+                    let mut retired_versions = Vec::with_capacity(MAX_HANDLES);
+                    let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+                    let retired_namespace;
+                    let mut relocated;
+                    let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                    if !Arc::ptr_eq(&state.namespace, &current) {
+                        continue 'retry;
+                    }
+                    if prepared.is_some() {
                         let same_listing = |id: u64, view: &DirectoryView| {
                             state
                                 .directories
                                 .iter()
                                 .any(|cached| cached.ino == id && cached.children.matches(view))
                         };
-                        if state.mutation_epoch != epoch
-                            || self.accounts.metadata_generation() != generation
-                            || !same_node(source_id, &source)
-                            || state.paths.get(&destination).copied() != target
-                            || target
-                                .zip(target_node.as_ref())
-                                .is_some_and(|(id, node)| !same_node(id, node))
+                        if self.accounts.metadata_generation() != generation
                             || !same_listing(parent.0, &source_listing)
                             || !same_listing(newparent.0, &destination_listing)
                             || source_children
@@ -3404,35 +4033,35 @@ impl Filesystem for Drive {
                             || target
                                 .zip(destination_children.as_ref())
                                 .is_some_and(|(id, view)| !same_listing(id, view))
-                            || state.parent_identities(&source.path)? != source_parents
-                            || state.parent_identities(&destination)? != destination_parents
                         {
-                            drop(state);
-                            drop(prepared);
                             continue 'retry;
                         }
-                        if !detach_target
-                            && target.is_some_and(|id| {
-                                state.handles.values().any(|directory| directory.ino == id)
-                            })
-                        {
-                            return Err(Errno::EBUSY);
-                        }
-                        if open.iter().any(|(handle, version)| {
+                    }
+                    if !detach_target
+                        && target.is_some_and(|id| {
+                            state.handles.values().any(|directory| directory.ino == id)
+                        })
+                    {
+                        return Err(Errno::EBUSY);
+                    }
+                    if prepared.is_some()
+                        && open.iter().any(|(handle, version)| {
                             state.files.get(handle).is_some_and(|file| {
                                 file.failed
                                     || file.version != *version
-                                    || state.detached.contains(&file.ino)
+                                    || state.detached.contains_key(&file.ino)
                             })
-                        }) {
-                            return Err(Errno::EIO);
-                        }
-                        // Opens need not advance the namespace epoch. Include
-                        // every new live source handle in the next preparation;
-                        // never leave it at the old path after tree publication.
-                        if state.files.iter().any(|(handle, file)| {
+                        })
+                    {
+                        return Err(Errno::EIO);
+                    }
+                    // Opens need not advance the namespace epoch. Include
+                    // every new live source handle in the next preparation;
+                    // never leave it at the old path after tree publication.
+                    if prepared.is_some()
+                        && state.files.iter().any(|(handle, file)| {
                             !file.failed
-                                && !state.detached.contains(&file.ino)
+                                && !state.detached.contains_key(&file.ino)
                                 && state
                                     .nodes
                                     .get(&file.ino)
@@ -3440,67 +4069,66 @@ impl Filesystem for Drive {
                                 && !open.iter().any(|(known, version)| {
                                     known == handle && *version == file.version
                                 })
-                        }) {
-                            drop(state);
-                            drop(prepared);
-                            continue 'retry;
-                        }
-                        prepared.commit()
+                        })
+                    {
+                        continue 'retry;
                     }
-                    .map_err(|error| stage_error(&error))?;
-                    let ids: HashSet<_> = relocated
-                        .iter()
-                        .map(|version| version.id().to_owned())
-                        .collect();
-                    state
-                        .cache
-                        .retain(|entry| !ids.contains(entry.version.id()));
-                    state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
-                    for ((handle, _), version) in open.into_iter().zip(relocated) {
+                    relocated = VecDeque::from(
+                        if let Some(prepared) = prepared {
+                            prepared.commit()
+                        } else {
+                            self.accounts.rename_local_directory(
+                                &self.instance,
+                                &self.space,
+                                &source.path,
+                                &destination,
+                                &source.resource_id,
+                                target_node
+                                    .as_ref()
+                                    .map(|node| (node.resource_id.as_str(), node.etag.as_deref())),
+                                &versions,
+                                cirrus_account::RenameParents {
+                                    source: &source_parents,
+                                    destination: &destination_parents,
+                                },
+                            )
+                        }
+                        .map_err(|error| stage_error(&error))?,
+                    );
+                    for ((handle, _), owner) in open.iter().zip(&owners) {
+                        let Some(version) = relocated.pop_front() else {
+                            break;
+                        };
+                        owner.bind(version);
                         if let Some(file) = state.files.get_mut(&handle) {
-                            file.version = version;
+                            retired_versions
+                                .push(std::mem::replace(&mut file.version, owner.clone()));
                             file.last_read = None;
                         }
                     }
+                    state.retire_ranges(&mut retired_ranges, |entry| {
+                        owners
+                            .iter()
+                            .filter(|owner| owner.0.get().is_some())
+                            .any(|owner| owner.id() == entry.version.id())
+                    });
                     for directory in state.handles.values_mut() {
                         if directory.ino == source_id {
                             directory.parent = newparent.0;
                         }
                     }
                     if let Some(id) = target {
-                        state.paths.remove(&destination);
                         if detach_target
                             && state.handles.values().any(|directory| directory.ino == id)
                         {
-                            state.detached.insert(id);
-                        } else {
-                            state.nodes.remove(&id);
-                        }
-                        state.scans.remove(&id);
-                    }
-                    let paths: Vec<_> = state
-                        .paths
-                        .iter()
-                        .filter(|(path, _)| path.starts_with(&source.path))
-                        .map(|(path, id)| (path.clone(), *id))
-                        .collect();
-                    for (path, id) in paths {
-                        state.paths.remove(&path);
-                        let mut next = destination.clone();
-                        next.extend_from_slice(&path[source.path.len()..]);
-                        state.paths.insert(next.clone(), id);
-                        if let Some(node) = state.nodes.get_mut(&id) {
-                            node.path = next;
-                            if id == source_id {
-                                node.parent = newparent.0;
+                            if let Some(node) = &detached_target {
+                                state.detached.insert(id, node.clone());
                             }
-                            node.revision = node.revision.wrapping_add(1);
                         }
                     }
-                    state.observed.retain(|path, _| {
-                        !path.starts_with(&source.path) && !path.starts_with(&destination)
-                    });
-                    state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+                    retired_namespace = std::mem::replace(&mut state.namespace, draft);
+                    drop(state);
+                    drop(retired_namespace);
                     return Ok(());
                 }
                 let mut target_node = target.map(|id| self.node(INodeNo(id))).transpose()?;
@@ -3553,7 +4181,7 @@ impl Filesystem for Drive {
                 let mut destination = new_parent.path.clone();
                 destination.push(newname.to_owned());
                 let observed = {
-                    let state = self.state.lock().map_err(|_| Errno::EIO)?;
+                    let state = self.namespace()?;
                     let observed = state.observed.get(&destination).cloned();
                     if state.observations_exhausted
                         && observed.is_none()
@@ -3592,7 +4220,7 @@ impl Filesystem for Drive {
                         .map(|etag| (node.resource_id.as_str(), etag))
                 });
                 let (source_parents, destination_parents) = {
-                    let state = self.state.lock().map_err(|_| Errno::EIO)?;
+                    let state = self.namespace()?;
                     (
                         state.parent_identities(&source.path)?,
                         state.parent_identities(&destination)?,
@@ -3623,12 +4251,53 @@ impl Filesystem for Drive {
                     }
                 };
                 let _guard = self.mutation.lock().map_err(|_| Errno::EIO)?;
+                let current = self.namespace()?;
+                if current.observed.get(&destination) != observed.as_ref()
+                    || (current.observations_exhausted
+                        && observed.is_none()
+                        && pending_target.is_none())
+                    || !current
+                        .parent_identities(&source.path)
+                        .is_ok_and(|parents| parents == source_parents)
+                    || !current
+                        .parent_identities(&destination)
+                        .is_ok_and(|parents| parents == destination_parents)
+                {
+                    continue 'retry;
+                }
+                let renamed_owner = SharedVersion::unbound();
+                let detached_owner = SharedVersion::unbound();
+                let mut draft = (*current).clone();
+                draft.paths.remove(&source.path);
+                draft.observed.remove(&source.path);
+                draft.observed.remove(&destination);
+                let detached_node =
+                    target
+                        .and_then(|id| draft.nodes.remove(&id))
+                        .map(|mut node| {
+                            node.resource_id = ResourceText::VersionId(detached_owner.clone());
+                            node.etag = Some(ResourceText::VersionTag(detached_owner.clone()));
+                            Arc::new(node)
+                        });
+                let mut node = source.clone();
+                node.path = destination.clone();
+                node.parent = newparent.0;
+                node.resource_id = ResourceText::VersionId(renamed_owner.clone());
+                node.etag = Some(ResourceText::VersionTag(renamed_owner.clone()));
+                node.revision = node.revision.wrapping_add(1);
+                draft.paths.insert(destination.clone(), source_id);
+                draft.nodes.insert(source_id, node);
+                draft.mutation_epoch = draft.mutation_epoch.wrapping_add(1);
+                let mut draft = Arc::new(draft);
+                let mut retired_versions = Vec::with_capacity(MAX_HANDLES);
+                let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES);
+                let retired_namespace;
                 let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
                 let source_stable = state.paths.get(&source.path) == Some(&source_id)
                     && state.nodes.get(&source_id).is_some_and(|node| {
                         node.resource_id == source.resource_id && node.revision == source.revision
                     })
-                    && !state.detached.contains(&source_id)
+                    && !state.detached.contains_key(&source_id)
                     && state.files.values().all(|file| {
                         file.ino != source_id || file.failed || file.version == version
                     });
@@ -3654,74 +4323,63 @@ impl Filesystem for Drive {
                 };
                 if !source_stable
                     || !target_stable
+                    || !Arc::ptr_eq(&state.namespace, &current)
                     || self.accounts.metadata_generation() != generation
-                    || state.observed.get(&destination).cloned() != observed
-                    || (state.observations_exhausted
-                        && observed.is_none()
-                        && pending_target.is_none())
-                    || !state
-                        .parent_identities(&source.path)
-                        .is_ok_and(|parents| parents == source_parents)
-                    || !state
-                        .parent_identities(&destination)
-                        .is_ok_and(|parents| parents == destination_parents)
                 {
                     continue 'retry;
                 }
+                let source_node = Arc::get_mut(&mut draft)
+                    .expect("private namespace")
+                    .nodes
+                    .get_mut(&source_id)
+                    .expect("prepared source");
                 let (renamed, detached_target) = prepared.commit().map_err(|error| {
                     eprintln!("staged rename failed: {error}");
                     stage_error(&error)
                 })?;
-                state.paths.remove(&source.path);
-                state.observed.remove(&source.path);
-                state.observed.remove(&destination);
+                source_node.size = renamed.size();
+                renamed_owner.bind(renamed);
                 if let Some(id) = target {
                     if let Some(version) = detached_target {
+                        detached_owner.bind(version);
                         if state.files.values().any(|file| file.ino == id) {
-                            state.detached.insert(id);
-                            let node = state.nodes.get_mut(&id).ok_or(Errno::EIO)?;
-                            node.resource_id = version.id().to_owned();
-                            node.etag = Some(version.etag().to_owned());
+                            if let Some(node) = &detached_node {
+                                state.detached.insert(id, node.clone());
+                            }
                             for file in state
                                 .files
                                 .values_mut()
                                 .filter(|file| file.ino == id && !file.failed)
                             {
-                                file.version = version.clone();
+                                retired_versions.push(std::mem::replace(
+                                    &mut file.version,
+                                    detached_owner.clone(),
+                                ));
                                 file.last_read = None;
                             }
-                        } else {
-                            state.nodes.remove(&id);
                         }
-                    } else {
-                        state.nodes.remove(&id);
                     }
+                } else if let Some(version) = detached_target {
+                    detached_owner.bind(version);
                 }
-                state.paths.insert(destination.clone(), source_id);
-                state.cache.retain(|entry| {
-                    entry.version.id() != source.resource_id
-                        && !target_node
+                state.retire_ranges(&mut retired_ranges, |entry| {
+                    entry.version.id() == source.resource_id
+                        || target_node
                             .as_ref()
                             .is_some_and(|node| node.resource_id == entry.version.id())
                 });
-                state.cache_bytes = state.cache.iter().map(|entry| entry.bytes.len()).sum();
-                let mut node = source;
-                node.path = destination;
-                node.parent = newparent.0;
-                node.resource_id = renamed.id().to_owned();
-                node.etag = Some(renamed.etag().to_owned());
-                node.size = renamed.size();
-                node.revision = node.revision.wrapping_add(1);
-                state.nodes.insert(source_id, node);
                 for file in state
                     .files
                     .values_mut()
                     .filter(|file| file.ino == source_id && !file.failed)
                 {
-                    file.version = renamed.clone();
+                    retired_versions
+                        .push(std::mem::replace(&mut file.version, renamed_owner.clone()));
                     file.last_read = None;
                 }
-                state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+                retired_namespace = std::mem::replace(&mut state.namespace, draft);
+                drop(state);
+                drop(retired_namespace);
                 return Ok(());
             }
             Err(Errno::EIO)
@@ -3757,10 +4415,11 @@ impl Filesystem for Drive {
             } else {
                 None
             };
+            let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES * 2 + 1);
             let (version, cached, cache_generation) = {
                 let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
                 let cache_generation = self.accounts.clean_cache_generation();
-                state.refresh_cache_generation(cache_generation);
+                state.refresh_cache_generation(cache_generation, &mut retired_ranges);
                 let file = state.files.get(&handle.0).ok_or(Errno::EBADF)?;
                 if file.ino != u64::from(ino) {
                     return Err(Errno::EBADF);
@@ -3782,6 +4441,17 @@ impl Filesystem for Drive {
                 return Ok(Vec::new());
             }
             let length = u64::from(size.min(MAX_RANGE)).min(version.size() - offset) as u32;
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
+                && version.id().starts_with("cirrus-staged:")
+            {
+                eprintln!(
+                    "cirrus lab owner read: pid={} thread={:?} boundary=fuse-read-dispatch handle={} cached={cached} offset={offset} length={length}",
+                    std::process::id(),
+                    std::thread::current().id(),
+                    handle.0
+                );
+            }
             let fetched = if cached {
                 self.accounts
                     .verify_file(&self.space, &version)
@@ -3790,21 +4460,43 @@ impl Filesystem for Drive {
             } else {
                 self.fetch_range(&version, offset, length).map(Some)
             };
+            let mut prepared_range =
+                fetched
+                    .as_ref()
+                    .ok()
+                    .and_then(|bytes| bytes.as_ref())
+                    .map(|bytes| {
+                        Arc::new(CachedRange {
+                            version: version.clone(),
+                            offset,
+                            bytes: bytes.clone(),
+                        })
+                    });
+            let mut cached_range = None;
             let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
             let current_cache_generation = self.accounts.clean_cache_generation();
-            state.refresh_cache_generation(current_cache_generation);
+            state.refresh_cache_generation(current_cache_generation, &mut retired_ranges);
             let still_current = state.files.get(&handle.0).is_some_and(|file| {
                 !file.failed && file.ino == u64::from(ino) && file.version == version
             });
             if !still_current {
                 return Err(Errno::EIO);
             }
-            let bytes = match fetched {
-                Ok(Some(bytes)) => {
+            match &fetched {
+                Ok(Some(_)) => {
                     if cache_generation == current_cache_generation {
-                        state.insert_range(version.clone(), offset, bytes.clone());
+                        if let Some(entry) = &mut prepared_range {
+                            // Canonicalize even an equal version captured before
+                            // a rebind, so publication can match current owners.
+                            Arc::get_mut(entry).expect("private range").version = state
+                                .files
+                                .get(&handle.0)
+                                .expect("validated handle")
+                                .version
+                                .clone();
+                            state.insert_range(entry.clone(), &mut retired_ranges);
+                        }
                     }
-                    bytes
                 }
                 Ok(None) => {
                     let position = state
@@ -3817,15 +4509,14 @@ impl Filesystem for Drive {
                         })
                         .ok_or(Errno::EIO)?;
                     let entry = state.cache.remove(position).ok_or(Errno::EIO)?;
-                    let bytes = entry.bytes.clone();
+                    cached_range = Some(entry.clone());
                     state.cache.push_back(entry);
-                    bytes
                 }
                 Err(_) => {
                     // Missing original-base ranges can become available again;
                     // a transient offline read must not poison a durable handle.
                     if !version.id().starts_with("cirrus-staged:") {
-                        state.invalidate_id(version.id());
+                        state.invalidate_id(version.id(), &mut retired_ranges);
                     }
                     return Err(Errno::EIO);
                 }
@@ -3839,6 +4530,11 @@ impl Filesystem for Drive {
             });
             file.last_read = Some((next, length));
             drop(state);
+            let bytes = match fetched {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => cached_range.expect("validated cache hit").bytes.clone(),
+                Err(error) => return Err(error),
+            };
             if sequential {
                 self.read_ahead(&version, next);
             }
@@ -3860,18 +4556,24 @@ impl Filesystem for Drive {
         _: bool,
         reply: ReplyEmpty,
     ) {
-        match self.state.lock() {
-            Ok(mut state) => {
-                state.files.remove(&handle.0);
-                let id = u64::from(ino);
-                if state.detached.contains(&id) && !state.files.values().any(|file| file.ino == id)
-                {
-                    state.detached.remove(&id);
-                    state.nodes.remove(&id);
-                }
+        let file = self.state.lock().map_err(|_| Errno::EIO).map(|mut state| {
+            let file = state.files.remove(&handle.0);
+            let id = u64::from(ino);
+            let detached = if state.detached.contains_key(&id)
+                && !state.files.values().any(|file| file.ino == id)
+            {
+                state.detached.remove(&id)
+            } else {
+                None
+            };
+            (file, detached)
+        });
+        match file {
+            Ok(file) => {
+                drop(file);
                 reply.ok();
             }
-            Err(_) => reply.error(Errno::EIO),
+            Err(error) => reply.error(error),
         }
     }
 }

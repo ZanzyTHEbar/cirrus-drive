@@ -7,19 +7,25 @@ use std::time::Duration;
 
 use md5::Md5;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 use rustix::{
-    fs::{self, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, Dir, FileType, Mode, OFlags},
     process,
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::account_storage::StorageRoot;
 use crate::{
     AccountError, DirectoryIdentity, Entry, FileVersion, JournalEntry, JournalPage, JournalState,
     JournalSummary, PinTree, ownership,
 };
 
+pub(crate) mod namespace_receipt;
 pub(crate) mod overlay;
+mod pin_move;
+pub(crate) mod provider;
 pub(crate) mod publication;
 mod upload;
 pub(crate) use upload::{
@@ -27,6 +33,7 @@ pub(crate) use upload::{
 };
 
 const APP_ID: i64 = 0x4344_5231;
+pub(crate) const STATE_SCHEMA_VERSION: i64 = 19;
 const CHUNK: u64 = 128 * 1024;
 const MAX_PIN_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_STAGING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -35,8 +42,12 @@ const MAX_PENDING_NAMESPACE_OPERATIONS: i64 = 4096;
 const DETACHED_MESSAGE: &str = "unlinked open file; staged copies retained";
 const REUSE_DIRECTORY_TARGET: &str = "reuse exact empty remote directory";
 pub(crate) const PARENT_WRITE_CONFLICT: &str = "parent identity changed; local copy retained";
-static OPEN_LOCK: Mutex<()> = Mutex::new(());
-static STAGING_LOCK: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+struct StagingHold {
+    root: StorageRoot,
+    name: String,
+    bytes: u64,
+}
+static STAGING_LOCK: Mutex<Vec<StagingHold>> = Mutex::new(Vec::new());
 
 #[cfg(feature = "fault-injection")]
 fn pin_move_stop(stage: &str) {
@@ -68,11 +79,13 @@ pub(crate) struct Pin {
     pub metadata_matches: bool,
 }
 
-pub(crate) fn database() -> Result<Connection, AccountError> {
-    let _lock = OPEN_LOCK
-        .lock()
+pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError> {
+    let database = crate::sqlite_open::Database::State;
+    let _lock = database
+        .opening_gate()
         .map_err(|_| AccountError::new("offline state is unavailable"))?;
-    let dir = ownership::state_dir()?;
+    let dir = root.directory();
+    #[cfg(target_os = "linux")]
     let (stat, created) = match fs::openat2(
         &dir,
         "state.db",
@@ -91,6 +104,11 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
         ),
         Err(_) => return Err(AccountError::new("cannot create offline state")),
     };
+    #[cfg(target_os = "macos")]
+    let (stat, created) = database
+        .prepare_darwin(root, true)
+        .map_err(|_| AccountError::new("cannot admit offline state"))?
+        .ok_or_else(|| AccountError::new("offline state is unavailable"))?;
     // Closing an extra descriptor for an existing SQLite file would release
     // this process's POSIX locks, including locks held by other connections.
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
@@ -102,6 +120,7 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
             "offline state has unsafe ownership or permissions",
         ));
     }
+    #[cfg(target_os = "linux")]
     let proc = fs::openat2(
         fs::CWD,
         "/proc",
@@ -110,6 +129,7 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
         ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|_| AccountError::new("trusted procfs is required for offline state"))?;
+    #[cfg(target_os = "linux")]
     if fs::fstatfs(&proc)
         .map_err(|_| AccountError::new("cannot inspect procfs"))?
         .f_type
@@ -121,9 +141,26 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
     }
     // SQLite resolves the held-directory procfs link before opening; NOFOLLOW would
     // reject that link. The private directory and the final inode are checked here.
+    #[cfg(target_os = "linux")]
     let path = format!("/proc/self/fd/{}/state.db", dir.as_raw_fd());
+    #[cfg(target_os = "linux")]
+    database
+        .check_auxiliaries(&dir)
+        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
+    #[cfg(target_os = "linux")]
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|_| AccountError::new("cannot open offline state"))?;
+    #[cfg(target_os = "macos")]
+    let conn = {
+        database
+            .check_darwin(root, &stat)
+            .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
+        database
+            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|_| AccountError::new("cannot open offline state"))?
+    };
+    crate::sqlite_open::check_unmoved(&conn)
+        .map_err(|_| AccountError::new("offline state changed"))?;
     conn.busy_timeout(Duration::from_secs(15))
         .map_err(|_| AccountError::new("cannot configure offline state"))?;
     // EXTRA also syncs the containing directory after deleting a rollback journal.
@@ -167,7 +204,47 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline state"))?;
-    if version != 17 {
+    if matches!(version, 17 | 18) {
+        let reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+            root,
+            crate::storage::sql_reservation::Store::State,
+            Some(&conn),
+            0,
+            64 * 1024,
+            false,
+        )?;
+        if let Some(reservation) = &reservation {
+            reservation.bound_pages(&conn)?;
+        }
+        // Exact additive migration, shared by fresh product DDL and retained
+        // developer databases. No row reset or unsupported-version adoption.
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
+        // Recheck under the writer lock: another process may have upgraded while
+        // this admitted opener waited. Never run CREATE twice or reset its data.
+        let locked_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|_| AccountError::new("cannot inspect offline state"))?;
+        if locked_version == 17 {
+            conn.execute_batch(crate::provider_catalog::DDL)
+                .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
+            conn.execute_batch("PRAGMA user_version=18")
+                .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
+        } else if !matches!(locked_version, 18 | 19) {
+            return Err(AccountError::new("unsupported offline state version"));
+        }
+        if matches!(locked_version, 17 | 18) {
+            conn.execute_batch(crate::provider_mutation::DDL)
+                .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
+            conn.execute_batch("PRAGMA user_version=19")
+                .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
+        }
+        if let Some(reservation) = &reservation {
+            reservation.validate(&conn)?;
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|_| AccountError::new("cannot persist offline state upgrade"))?;
+    } else if version != STATE_SCHEMA_VERSION {
         return Err(AccountError::new("unsupported offline state version"));
     }
     let current = fs::statat(&dir, "state.db", AtFlags::SYMLINK_NOFOLLOW)
@@ -180,6 +257,16 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
     {
         return Err(AccountError::new("offline state changed"));
     }
+    #[cfg(target_os = "linux")]
+    database
+        .check_auxiliaries(&dir)
+        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
+    #[cfg(target_os = "macos")]
+    database
+        .check_darwin(root, &stat)
+        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
+    crate::sqlite_open::check_unmoved(&conn)
+        .map_err(|_| AccountError::new("offline state changed"))?;
     #[cfg(feature = "fault-injection")]
     if let Some(marker) = std::env::var_os("CIRRUS_TEST_SQLITE_OPEN_MARKER") {
         let marker = Path::new(&marker);
@@ -192,12 +279,13 @@ pub(crate) fn database() -> Result<Connection, AccountError> {
 }
 
 /// Bind offline state to the first verified identity for an instance.
-pub(crate) fn bind_identity(
+pub(crate) fn bind_identity_in(
+    root: &StorageRoot,
     instance: &str,
     issuer: &str,
     subject: &str,
 ) -> Result<(), AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(root)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| sqlite_storage_error(error, "cannot inspect offline account identity"))?;
@@ -241,12 +329,13 @@ pub(crate) fn bind_identity(
         .map_err(|error| sqlite_storage_error(error, "cannot commit offline account identity"))
 }
 
-pub(crate) fn verify_identity(
+pub(crate) fn verify_identity_in(
+    root: &StorageRoot,
     instance: &str,
     issuer: &str,
     subject: &str,
 ) -> Result<(), AccountError> {
-    let existing: Option<(String, String)> = database()?
+    let existing: Option<(String, String)> = database_in(root)?
         .query_row(
             "SELECT issuer,subject FROM account_identities WHERE instance=?1",
             [instance],
@@ -286,13 +375,14 @@ pub(crate) fn sqlite_storage_error(error: rusqlite::Error, fallback: &'static st
 }
 
 pub(crate) fn stage_file(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
     source: &Path,
     base: Option<&Entry>,
     parents: &[DirectoryIdentity],
-) -> Result<i64, AccountError> {
+) -> Result<crate::OperationHandle, AccountError> {
     if !source.is_absolute()
         || source
             .components()
@@ -302,14 +392,20 @@ pub(crate) fn stage_file(
             "staging source must be an absolute safe path",
         ));
     }
+    #[cfg(target_os = "linux")]
     let input = fs::openat2(
         fs::CWD,
         source,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| AccountError::new("cannot safely open staging source"))?;
+    );
+    #[cfg(target_os = "macos")]
+    let input = ownership::file_ops::open_absolute(
+        source,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+    );
+    let input = input.map_err(|_| AccountError::new("cannot safely open staging source"))?;
     let mut input = std::fs::File::from(input);
     let before = input
         .metadata()
@@ -319,7 +415,7 @@ pub(crate) fn stage_file(
             "staging source must be a regular file of at most 1 TiB",
         ));
     }
-    let root = overlay::Overlay::import(&mut input, before.len())?;
+    let root = overlay::Overlay::import_in(storage, &mut input, before.len())?;
     let count = root.len();
     let after = input.metadata().map_err(|_| {
         AccountError::new("cannot inspect staging source; inspect staging directory")
@@ -343,13 +439,13 @@ pub(crate) fn stage_file(
     // Keep the State allowance through rollback/close; exact marker recovery
     // below still opens its own uncapped connection.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let encoded = path_key(path)?;
     let base = base.filter(|entry| !entry.is_directory() && entry.etag().is_some());
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect import publication plan"))?;
-    let planned = if crate::storage::limits::view()?.limits.is_some() {
+    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
         let operation = PendingWrite {
             id: i64::MAX,
             space: space.to_owned(),
@@ -393,7 +489,8 @@ pub(crate) fn stage_file(
     };
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_IMPORT_PUBLICATION_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -431,11 +528,12 @@ pub(crate) fn stage_file(
     let id = tx.last_insert_rowid();
     save_operation_parents(&tx, id, path, parents, None)?;
     let publication = publication::fence(&tx, id)?;
+    let operation = crate::OperationHandle::capture(&tx, instance, space, id)?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_IMPORT_PUBLICATION_COMMIT_WINDOW")?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     let committed = tx.commit();
@@ -455,7 +553,8 @@ pub(crate) fn stage_file(
     conn.close().map_err(|_| {
         AccountError::new("cannot close publication database; local copies retained")
     })?;
-    if !publication::recover(
+    if !publication::recover_in(
+        storage,
         instance,
         space,
         path,
@@ -468,7 +567,7 @@ pub(crate) fn stage_file(
             "local publication head changed; local copies retained",
         ));
     }
-    Ok(id)
+    Ok(operation)
 }
 
 fn reject_fenced_ancestor(
@@ -548,7 +647,7 @@ pub(crate) struct NamespaceOperation {
     pub base_etag: Option<String>,
     pub dependency: Option<i64>,
     pub parents: Vec<DirectoryIdentity>,
-    token: String,
+    pub(crate) token: String,
     pending_message: Option<String>,
 }
 
@@ -584,13 +683,14 @@ pub(crate) struct TreeMove {
     pub offline: bool,
 }
 
-pub(crate) fn tree_move_page(
+pub(crate) fn tree_move_page_in(
+    root: &StorageRoot,
     instance: &str,
     space: Option<&str>,
     after: i64,
     through: i64,
 ) -> Result<Vec<TreeMove>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(root)?;
     tree_moves_scoped_in(&conn, instance, space, (Some(after), through))
 }
 
@@ -667,6 +767,7 @@ fn tree_move_records_in(
 // Immutable content interpretation, not a namespace open or DAV locator. Only
 // admitted offline proofs can alias a moved leaf to its original FileVersion.
 fn tree_content_base_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     version: &FileVersion,
     pending: bool,
@@ -706,6 +807,7 @@ fn tree_content_base_in(
                 // destination-parent chain too. Retained content reads below
                 // do not treat current namespace replacement as byte authority.
                 offline_tree_copy_in(
+                    storage_root,
                     conn,
                     (&version.instance, &version.space),
                     &operation.destination,
@@ -780,17 +882,22 @@ fn tree_content_base_in(
 }
 
 pub(crate) fn tree_content_base(
+    storage_root: &StorageRoot,
     version: &FileVersion,
 ) -> Result<Option<FileVersion>, AccountError> {
-    content_base(version, false)
+    content_base(storage_root, version, false)
 }
 
-fn content_base(version: &FileVersion, pending: bool) -> Result<Option<FileVersion>, AccountError> {
-    let mut conn = database()?;
+fn content_base(
+    storage_root: &StorageRoot,
+    version: &FileVersion,
+    pending: bool,
+) -> Result<Option<FileVersion>, AccountError> {
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect content MOVE"))?;
-    let original = tree_content_base_in(&tx, version, pending)?;
+    let original = tree_content_base_in(storage_root, &tx, version, pending)?;
     tx.commit()
         .map_err(|_| AccountError::new("cannot finish content MOVE inspection"))?;
     Ok(original)
@@ -798,11 +905,12 @@ fn content_base(version: &FileVersion, pending: bool) -> Result<Option<FileVersi
 
 /// Returns the remote path and whether remote access is fenced by the MOVE state.
 pub(crate) fn tree_remote_path(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<(Vec<String>, bool), AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect directory moves"))?;
@@ -833,10 +941,11 @@ pub(crate) fn tree_remote_path(
 }
 
 pub(crate) fn tree_blocked_spaces(
+    storage: &StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<std::collections::HashSet<String>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut statement = conn.prepare("SELECT DISTINCT j.space FROM operation_journal j JOIN directory_moves m ON m.operation_id=j.id WHERE j.instance=?1 AND (?2 IS NULL OR j.space=?2) AND j.op_type='move-tree' AND j.state IN ('conflict','uncertain')")
         .map_err(|_| AccountError::new("cannot inspect directory moves"))?;
     let rows = statement
@@ -847,10 +956,11 @@ pub(crate) fn tree_blocked_spaces(
 }
 
 pub(crate) fn invalid_journal_spaces(
+    storage: &StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<std::collections::HashSet<String>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut statement = conn
         .prepare("SELECT DISTINCT space FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND (state IS NULL OR state NOT IN ('pending','conflict','uncertain','synced','resolved') OR (id<=0 AND state NOT IN ('synced','resolved')))")
         .map_err(|_| AccountError::new("cannot inspect journal entries"))?;
@@ -862,12 +972,13 @@ pub(crate) fn invalid_journal_spaces(
 }
 
 pub(crate) fn tree_destination_contains(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
     through: i64,
 ) -> Result<bool, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut statement = conn.prepare("SELECT m.destination FROM operation_journal j JOIN directory_moves m ON m.operation_id=j.id WHERE j.instance=?1 AND j.space=?2 AND j.id<=?3 AND j.op_type='move-tree' AND j.state IN ('pending','conflict','uncertain') ORDER BY j.id")
         .map_err(|_| AccountError::new("cannot inspect directory moves"))?;
     let rows = statement
@@ -890,63 +1001,189 @@ pub(crate) fn tree_destination_contains(
 // Ordinary rename keeps its split/displacement refusal. Explicit offline
 // replacement additionally admits the bounded capture/extraction below.
 fn relocate_pins(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
     source: &[String],
     destination: &[String],
 ) -> Result<(), AccountError> {
-    relocate_pins_in(conn, instance, space, source, destination, None, false)
+    relocate_pins_in(
+        storage_root,
+        conn,
+        instance,
+        space,
+        source,
+        destination,
+        None,
+        None,
+    )
 }
 
-// A destination-only ancestor may absorb only one complete, clean source pin.
+// A destination ancestor may absorb one complete pinned source subtree.
 // Compare its entire captured tree with the admitted observations and verify
 // every stored byte in this same writer transaction, never hydrate over DAV.
 fn complete_incoming_pin(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
+    owner: &[String],
     source: &[String],
     destination: &[String],
 ) -> Result<crate::PinTree, AccountError> {
     let refused = || AccountError::new("rename would displace or split a pin");
-    let root = path_key(source)?;
+    let root = path_key(owner)?;
+    let source_key = path_key(source)?;
+    let prefix = format!("{},", source_key.trim_end_matches(']'));
     let (is_dir, directories, manifest): (bool, String, String) = conn.query_row(
         "SELECT is_dir,CASE WHEN length(directories)<=16777216 THEN directories END,CASE WHEN length(manifest)<=16777216 THEN manifest END FROM pins WHERE instance=?1 AND space=?2 AND root=?3",
         params![instance,space,root], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
         .optional().map_err(|_|refused())?.ok_or_else(refused)?;
-    let directories: Vec<(Vec<String>, String)> =
+    let mut directories: Vec<(Vec<String>, String)> =
         serde_json::from_str(&directories).map_err(|_| refused())?;
-    let files: Vec<FileVersion> = serde_json::from_str(&manifest).map_err(|_| refused())?;
-    if !is_dir
-        || directories.len() + files.len() > 4097
-        || directories.first().map(|(p, _)| p.as_slice()) != Some(source)
+    let mut files: Vec<FileVersion> = serde_json::from_str(&manifest).map_err(|_| refused())?;
+    if !source.starts_with(owner) {
+        return Err(refused());
+    }
+    if directories.len() + files.len() > 4097
+        || (is_dir && directories.first().map(|(path, _)| path.as_slice()) != Some(owner))
+        || (!is_dir
+            && (!directories.is_empty()
+                || owner != source
+                || files.len() != 1
+                || files[0].path != owner))
+        || directories.windows(2).any(|w| w[0].0 >= w[1].0)
+        || files.windows(2).any(|w| w[0].path >= w[1].path)
+        || directories.iter().any(|(path, _)| !path.starts_with(owner))
+        || files.iter().any(|file| {
+            !file.path.starts_with(owner) || file.instance != instance || file.space != space
+        })
+    {
+        return Err(refused());
+    }
+    directories.retain(|(path, _)| path.starts_with(source));
+    files.retain(|file| file.path.starts_with(source));
+    if directories.len() + files.len() > 4097
+        || (is_dir && directories.first().map(|(p, _)| p.as_slice()) != Some(source))
         || directories.windows(2).any(|w| w[0].0 >= w[1].0)
         || files.windows(2).any(|w| w[0].path >= w[1].path)
     {
         return Err(refused());
     }
-    let mut pending = conn.prepare("SELECT path FROM operation_journal WHERE instance=?1 AND space=?2 AND state IN ('pending','conflict','uncertain')")
+    let mut pending = conn.prepare("SELECT id,path,op_type,state,base_file_id,base_etag,staged_file FROM operation_journal WHERE instance=?1 AND space=?2 AND state IN ('pending','conflict','uncertain')")
         .map_err(|_|refused())?;
     for row in pending
-        .query_map(params![instance, space], |row| row.get::<_, String>(0))
+        .query_map(params![instance, space], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
         .map_err(|_| refused())?
     {
-        let path: Vec<String> =
-            serde_json::from_str(&row.map_err(|_| refused())?).map_err(|_| refused())?;
+        let (id, encoded, kind, state, base_id, base_etag, token) = row.map_err(|_| refused())?;
+        let path: Vec<String> = serde_json::from_str(&encoded).map_err(|_| refused())?;
         // Relocated operations may already have destination coordinates.
         if path.starts_with(source) || path.starts_with(destination) {
-            return Err(refused());
+            if !matches!(kind.as_str(), "write" | "mkdir") || state != "pending" {
+                return Err(refused());
+            }
+            let original = if path.starts_with(source) {
+                path
+            } else {
+                let mut original = source.to_vec();
+                original.extend_from_slice(&path[destination.len()..]);
+                original
+            };
+            let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE j.id=?1 AND j.confirmed_file_id IS NULL AND j.confirmed_etag IS NULL AND j.error_msg IS NULL AND NOT EXISTS(SELECT 1 FROM sync_reads WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM upload_verifications WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM write_dependencies WHERE operation_id=j.id OR predecessor_id=j.id) AND NOT EXISTS(SELECT 1 FROM operation_journal c WHERE c.error_msg='destination-operation:'||j.id AND c.state IN ('pending','conflict','uncertain')) AND NOT EXISTS(SELECT 1 FROM operation_journal other WHERE other.instance=j.instance AND other.space=j.space AND other.path=j.path AND other.id<>j.id AND other.state IN ('pending','conflict','uncertain')))",[id],|row|row.get(0)).map_err(|_|refused())?;
+            if !eligible {
+                return Err(refused());
+            }
+            let index = files.binary_search_by(|file| file.path.cmp(&original));
+            if index.is_err() && base_id.is_none() && base_etag.is_none() {
+                // Captures exclude later local children.
+                // The caller validates relocation/parents and, for synthesis,
+                // pristine eligibility after verifying all remote coverage.
+                // Retain separate journal/dirty ownership, never pin rows.
+                if kind == "write" {
+                    let base: Option<String> = conn
+                        .query_row(
+                            "SELECT base FROM dirty_roots WHERE root=?1",
+                            [&token],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| refused())?;
+                    if base.is_some() {
+                        return Err(refused());
+                    }
+                }
+                continue;
+            }
+            let version = &files[index.map_err(|_| refused())?];
+            if kind != "write"
+                || base_id.as_deref() != Some(version.id.as_str())
+                || base_etag.as_deref() != Some(version.etag.as_str())
+            {
+                return Err(refused());
+            }
+            let base: Option<String> = conn
+                .query_row(
+                    "SELECT base FROM dirty_roots WHERE root=?1",
+                    [token],
+                    |row| row.get(0),
+                )
+                .map_err(|_| refused())?;
+            if let Some(base) = base {
+                let base: FileVersion = serde_json::from_str(&base).map_err(|_| refused())?;
+                if base != *version {
+                    return Err(refused());
+                }
+            }
         }
     }
     let mut observed_files = 0usize;
-    let mut observed_dirs = 1usize;
+    let mut observed_dirs = usize::from(is_dir);
+    if !is_dir {
+        let (name, parent) = source.split_last().ok_or_else(refused)?;
+        let entries = directory_snapshot_in_root(storage_root, conn, instance, space, parent)?
+            .ok_or_else(refused)?;
+        let version = &files[0];
+        let mut after = 0;
+        loop {
+            let page = entries.page(after)?;
+            if page.is_empty() {
+                break;
+            }
+            for (cookie, entry) in page {
+                after = cookie;
+                if entry.name() == name {
+                    if entry.is_directory()
+                        || version.id != entry.id()
+                        || Some(version.etag.as_str()) != entry.etag()
+                        || !crate::dav::strong_etag(&version.etag)
+                        || Some(version.size) != entry.size()
+                        || version.checksums != entry.checksums()
+                    {
+                        return Err(refused());
+                    }
+                    observed_files += 1;
+                }
+            }
+        }
+    }
     for (path, id) in &directories {
         path_key(path)?;
         if !path.starts_with(source) || !crate::dav::valid_remote_id(id) {
             return Err(refused());
         }
-        let entries = directory_snapshot_in(conn, instance, space, path)?.ok_or_else(refused)?;
+        let entries = directory_snapshot_in_root(storage_root, conn, instance, space, path)?
+            .ok_or_else(refused)?;
         if entries.remote_parent()?.0 != *id {
             return Err(refused());
         }
@@ -993,15 +1230,15 @@ fn complete_incoming_pin(
     }
     let count: usize = conn
         .query_row(
-            "SELECT count(*) FROM files WHERE instance=?1 AND space=?2 AND root=?3",
-            params![instance, space, root],
+            "SELECT count(*) FROM files WHERE instance=?1 AND space=?2 AND root=?3 AND (?6 OR path=?4 OR substr(path,1,length(?5))=?5)",
+            params![instance, space, root, source_key, prefix, owner == source],
             |row| row.get(0),
         )
         .map_err(|_| refused())?;
     if count != files.len() {
         return Err(refused());
     }
-    let orphans:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM chunks c WHERE c.instance=?1 AND c.space=?2 AND c.root=?3 AND NOT EXISTS(SELECT 1 FROM files f WHERE f.instance=c.instance AND f.space=c.space AND f.root=c.root AND f.path=c.path))",params![instance,space,root],|row|row.get(0)).map_err(|_|refused())?;
+    let orphans:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM chunks c WHERE c.instance=?1 AND c.space=?2 AND c.root=?3 AND (?6 OR c.path=?4 OR substr(c.path,1,length(?5))=?5) AND NOT EXISTS(SELECT 1 FROM files f WHERE f.instance=c.instance AND f.space=c.space AND f.root=c.root AND f.path=c.path))",params![instance,space,root,source_key,prefix,owner==source],|row|row.get(0)).map_err(|_|refused())?;
     if orphans {
         return Err(refused());
     }
@@ -1025,17 +1262,54 @@ fn complete_incoming_pin(
     })
 }
 
+// Call only after both covered views have passed full content verification in
+// this connection's transaction. Pin chunks have one canonical 128 KiB layout;
+// equal verified digests/lengths at every path+offset prove shared agreement
+// even when the server supplies no supported whole-file checksum.
+fn overlapping_pin_chunks_match(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    owner: &str,
+    root: &[String],
+) -> Result<bool, AccountError> {
+    let key = path_key(root)?;
+    let prefix = format!("{},", key.trim_end_matches(']'));
+    let different:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM chunks a LEFT JOIN chunks b ON b.instance=a.instance AND b.space=a.space AND b.root=?4 AND b.path=a.path AND b.offset=a.offset WHERE a.instance=?1 AND a.space=?2 AND a.root=?3 AND (a.path=?4 OR substr(a.path,1,length(?5))=?5) AND (b.digest IS NULL OR a.digest<>b.digest OR length(a.body)<>length(b.body))) OR (SELECT count(*) FROM chunks WHERE instance=?1 AND space=?2 AND root=?3 AND (path=?4 OR substr(path,1,length(?5))=?5))<>(SELECT count(*) FROM chunks WHERE instance=?1 AND space=?2 AND root=?4)",params![instance,space,owner,key,prefix],|row|row.get(0))
+        .map_err(|_|AccountError::new("cannot compare overlapping pinned contents"))?;
+    Ok(!different)
+}
+
 // Replacement captures are immutable and independently addressed. This runs
 // under the SAME admitted writer transaction as every pin/namespace update.
 fn relocate_pins_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
     source: &[String],
     destination: &[String],
     replacement: Option<(&str, &str)>,
-    allow_source_split: bool,
+    binding: Option<&crate::MountBinding>,
 ) -> Result<(), AccountError> {
+    // Every caller, including source recreation and online file renames,
+    // must pass the same durable-original fence before changing ownership.
+    let paths = serde_json::to_string(&[path_key(source)?, path_key(destination)?])
+        .map_err(|_| AccountError::new("invalid pin transformation paths"))?;
+    check_originals_in(
+        storage_root,
+        conn,
+        instance,
+        space,
+        PinOriginalScope::Moving(&paths),
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    if let (Some(binding), Some(target)) = (binding, replacement) {
+        if binding.instance != instance || binding.space != space {
+            return Err(AccountError::new("offline pin binding changed"));
+        }
+        return pin_move::replace(conn, binding, source, destination, target);
+    }
     let rebase = |path: &[String]| -> Result<Vec<String>, AccountError> {
         if !path.starts_with(source) {
             return Ok(path.to_vec());
@@ -1047,74 +1321,14 @@ fn relocate_pins_in(
         }
         Ok(next)
     };
-    // One containing source pin can become two accurate active roots. Multiple
-    // overlapping source owners need a separate policy; never guess which one
-    // owns the extracted destination. Freeze traversal before inserting a root.
+    // Ordinary/local rename retains its conservative split policy. Offline
+    // remote replacement above uses the complete bounded ownership planner.
     let through: i64 = conn
         .query_row("SELECT coalesce(max(rowid),0) FROM pins", [], |row| {
             row.get(0)
         })
         .map_err(|_| AccountError::new("cannot inspect pin high water"))?;
-    let mut destination_merge = None;
-    let source_split_root = if allow_source_split && replacement.is_some() {
-        let mut statement = conn
-            .prepare("SELECT root FROM pins WHERE instance=?1 AND space=?2 AND rowid<=?3")
-            .map_err(|_| AccountError::new("cannot inspect source pin owners"))?;
-        let rows = statement
-            .query_map(params![instance, space, through], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|_| AccountError::new("cannot inspect source pin owners"))?;
-        let mut ancestors = Vec::new();
-        let mut overlapping = false;
-        let mut roots = Vec::new();
-        for row in rows {
-            let root = row.map_err(|_| AccountError::new("invalid source pin owner"))?;
-            let path: Vec<String> = serde_json::from_str(&root)
-                .map_err(|_| AccountError::new("invalid pinned path"))?;
-            overlapping |= path.starts_with(source);
-            if source.starts_with(&path) && !destination.starts_with(&path) {
-                ancestors.push(root.clone());
-            }
-            roots.push((root, path));
-        }
-        let destination_ancestors: Vec<_> = roots
-            .iter()
-            .filter(|(_, path)| {
-                destination.starts_with(path)
-                    && !source.starts_with(path)
-                    && path.as_slice() != destination
-            })
-            .collect();
-        if destination_ancestors.len() == 1 {
-            let (root, path) = destination_ancestors[0];
-            // Exactly these two owners, no containing/common/source-subtree or
-            // target-subtree owners whose policy would be ambiguous.
-            let ambiguous = roots.iter().any(|(_, p)| {
-                p != path
-                    && p.as_slice() != source
-                    && (source.starts_with(p)
-                        || p.starts_with(source)
-                        || destination.starts_with(p)
-                        || p.starts_with(destination))
-            });
-            if !ambiguous && roots.iter().any(|(_, p)| p.as_slice() == source) {
-                destination_merge = Some((
-                    root.clone(),
-                    complete_incoming_pin(conn, instance, space, source, destination)?,
-                ));
-            }
-        }
-        if !overlapping && ancestors.len() == 1 {
-            ancestors.pop()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
     let mut pins = Vec::new();
-    let mut extracted = None;
     {
         let mut stmt = conn
             .prepare(
@@ -1143,26 +1357,12 @@ fn relocate_pins_in(
             let moving_root = path.starts_with(source);
             let contains_source = source.starts_with(&path);
             let contains_destination = destination.starts_with(&path);
-            let source_split = source_split_root.as_ref() == Some(&root);
-            let destination_split = destination_merge
-                .as_ref()
-                .is_some_and(|(ancestor, _)| ancestor == &root);
-            if moving_root
-                && path == source
-                && let Some((ancestor, _)) = &destination_merge
-            {
-                pins.push((rowid, root, ancestor.clone(), Vec::new(), Vec::new(), true));
-                continue;
-            }
             let mut retained_displacement = false;
             if let Some((target_id, target_etag)) = replacement {
-                // A containing pin either covers both sides or is the single
-                // source-only owner eligible for capture and extraction.
+                // Local replacement cannot synthesize remote pinned content.
                 if !moving_root
                     && contains_source != contains_destination
                     && !path.starts_with(destination)
-                    && !source_split
-                    && !destination_split
                 {
                     return Err(AccountError::new("rename would displace or split a pin"));
                 }
@@ -1171,18 +1371,7 @@ fn relocate_pins_in(
                         && !moving_root
                         && (dirs.iter().any(|(p, _)| p.starts_with(destination))
                             || files.iter().any(|file| file.path.starts_with(destination))));
-                if displaced || source_split || destination_split {
-                    if destination_split
-                        && (!dirs
-                            .iter()
-                            .any(|(p, id)| p == destination && id == target_id)
-                            || dirs
-                                .iter()
-                                .any(|(p, _)| p.starts_with(destination) && p != destination)
-                            || files.iter().any(|file| file.path.starts_with(destination)))
-                    {
-                        return Err(AccountError::new("rename would displace or split a pin"));
-                    }
+                if displaced {
                     let captured=conn.execute("INSERT INTO pin_copies(instance,space,root,is_dir,directories,manifest,issuer,subject,displaced_path,target_id,target_etag) SELECT p.instance,p.space,p.root,p.is_dir,p.directories,p.manifest,a.issuer,a.subject,?2,?3,?4 FROM pins p JOIN account_identities a ON a.instance=p.instance WHERE p.rowid=?1",params![rowid,path_key(destination)?,target_id,target_etag])
                         .map_err(|error|sqlite_storage_error(error,"cannot retain displaced pin"))?;
                     if captured != 1 {
@@ -1194,38 +1383,6 @@ fn relocate_pins_in(
                         .map_err(|error|sqlite_storage_error(error,"cannot retain displaced pin versions"))?;
                     conn.execute("INSERT INTO pin_copy_chunks SELECT instance,space,?4,path,offset,body,digest FROM chunks WHERE instance=?1 AND space=?2 AND root=?3",params![instance,space,root,copy])
                         .map_err(|error|sqlite_storage_error(error,"cannot retain displaced pin chunks"))?;
-                    if source_split {
-                        if !dirs.iter().any(|(p, _)| p == source) {
-                            return Err(AccountError::new("rename would displace or split a pin"));
-                        }
-                        let mut moving_dirs: Vec<_> = dirs
-                            .iter()
-                            .filter(|(p, _)| p.starts_with(source))
-                            .cloned()
-                            .collect();
-                        let mut moving_files: Vec<_> = files
-                            .iter()
-                            .filter(|file| file.path.starts_with(source))
-                            .cloned()
-                            .collect();
-                        let source_key = path_key(source)?;
-                        let prefix = format!("{},", source_key.trim_end_matches(']'));
-                        for table in ["chunks", "files"] {
-                            conn.execute(&format!("UPDATE {table} SET root=?4 WHERE instance=?1 AND space=?2 AND root=?3 AND (path=?4 OR substr(path,1,length(?5))=?5)"), params![instance,space,root,source_key,prefix])
-                                .map_err(|error|sqlite_storage_error(error,"cannot extract source pin contents"))?;
-                        }
-                        dirs.retain(|(p, _)| !p.starts_with(source));
-                        files.retain(|file| !file.path.starts_with(source));
-                        for (p, _) in &mut moving_dirs {
-                            *p = rebase(p)?;
-                        }
-                        for file in &mut moving_files {
-                            file.path = rebase(&file.path)?;
-                        }
-                        moving_dirs.sort();
-                        moving_files.sort_by(|a, b| a.path.cmp(&b.path));
-                        extracted = Some((source_key, moving_dirs, moving_files));
-                    }
                     if path.starts_with(destination) {
                         for table in ["chunks", "files", "pins"] {
                             conn.execute(
@@ -1248,43 +1405,9 @@ fn relocate_pins_in(
                         conn.execute(&format!("DELETE FROM {table} WHERE instance=?1 AND space=?2 AND root=?3 AND (path=?4 OR substr(path,1,length(?5))=?5)"),params![instance,space,root,key,prefix])
                             .map_err(|error|sqlite_storage_error(error,"cannot update containing active pin"))?;
                     }
-                    if destination_split {
-                        let (_, incoming) = destination_merge.as_ref().ok_or_else(|| {
-                            AccountError::new("rename would displace or split a pin")
-                        })?;
-                        for (p, id) in &incoming.directories {
-                            dirs.push((rebase(p)?, id.clone()));
-                        }
-                        for file in &incoming.files {
-                            let mut file = file.clone();
-                            file.path = rebase(&file.path)?;
-                            files.push(file);
-                        }
-                        if dirs.len() + files.len() > 4097
-                            || files
-                                .iter()
-                                .try_fold(0u64, |total, file| {
-                                    total.checked_add(file.size).filter(|n| *n <= MAX_PIN_BYTES)
-                                })
-                                .is_none()
-                            || serde_json::to_string(&dirs)
-                                .map_err(|_| AccountError::new("invalid pinned directories"))?
-                                .len()
-                                > 16777216
-                            || serde_json::to_string(&files)
-                                .map_err(|_| AccountError::new("invalid pin manifest"))?
-                                .len()
-                                > 16777216
-                        {
-                            return Err(AccountError::new("rename would displace or split a pin"));
-                        }
-                    }
                 }
             }
-            if (!moving_root
-                && contains_source != contains_destination
-                && !source_split
-                && !destination_split)
+            if (!moving_root && contains_source != contains_destination)
                 || (!moving_root && path.starts_with(destination))
             {
                 return Err(AccountError::new("rename would displace or split a pin"));
@@ -1297,7 +1420,7 @@ fn relocate_pins_in(
             {
                 return Err(AccountError::new("rename would displace or split a pin"));
             }
-            if !moving_root && !contains_source && !destination_split {
+            if !moving_root && !contains_source {
                 continue;
             }
             let mut changed = moving_root || retained_displacement;
@@ -1314,25 +1437,10 @@ fn relocate_pins_in(
             }
             dirs.sort();
             files.sort_by(|a, b| a.path.cmp(&b.path));
-            pins.push((rowid, root, path_key(&rebase(&path)?)?, dirs, files, false));
+            pins.push((rowid, root, path_key(&rebase(&path)?)?, dirs, files));
         }
     }
-    if let Some((source_key, dirs, files)) = extracted {
-        // Insert only after closing the original pin scan: deleted target
-        // rowids may be reused, so a rowid high water alone cannot exclude a
-        // newly inserted pin from that traversal.
-        conn.execute("INSERT INTO pins(instance,space,root,is_dir,directories,manifest) VALUES(?1,?2,?3,1,?4,?5)", params![instance,space,source_key,serde_json::to_string(&dirs).map_err(|_|AccountError::new("invalid pinned directories"))?,serde_json::to_string(&files).map_err(|_|AccountError::new("invalid pin manifest"))?])
-            .map_err(|error|sqlite_storage_error(error,"cannot extract source pin"))?;
-        pins.push((
-            conn.last_insert_rowid(),
-            source_key,
-            path_key(destination)?,
-            dirs,
-            files,
-            false,
-        ));
-    }
-    for (rowid, old_root, new_root, dirs, files, retire) in pins {
+    for (rowid, old_root, new_root, dirs, files) in pins {
         let mut file_rows = Vec::new();
         {
             let mut stmt = conn.prepare("SELECT rowid,path,version FROM files WHERE instance=?1 AND space=?2 AND root=?3").map_err(|_| AccountError::new("cannot inspect pinned versions"))?;
@@ -1402,11 +1510,6 @@ fn relocate_pins_in(
             )
             .map_err(|error| sqlite_storage_error(error, "cannot relocate pinned versions"))?;
         }
-        if retire {
-            conn.execute("DELETE FROM pins WHERE rowid=?1", [rowid])
-                .map_err(|error| sqlite_storage_error(error, "cannot retire merged source pin"))?;
-            continue;
-        }
         conn.execute(
             "UPDATE pins SET root=?1,directories=?2,manifest=?3 WHERE rowid=?4",
             params![
@@ -1437,14 +1540,30 @@ pub(crate) struct TreeMoveRequest<'a> {
     pub offline: Option<&'a crate::MountBinding>,
 }
 
-fn pin_copy_allowance(conn: &Connection, instance: &str, space: &str) -> Result<u64, AccountError> {
+fn pin_copy_allowance(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    destination: &[String],
+    path_growth: u64,
+) -> Result<u64, AccountError> {
     // Replacement/extraction preserves whole containing pins, not merely a
     // target subtree. Charge all Space pin rows conservatively, including BLOB
-    // copies and new root/index/identity metadata. The relocation allowance
-    // separately pays for destination path growth; the writer rechecks its plan.
+    // copies and new root/index/identity metadata. New destination path bytes
+    // must also be paid per receiver, not only for the original moving owner.
     let bytes:u64=conn.query_row("SELECT coalesce(sum(bytes),0) FROM (SELECT sum(length(CAST(root AS BLOB))+length(CAST(directories AS BLOB))+length(CAST(manifest AS BLOB))+4096) AS bytes FROM pins WHERE instance=?1 AND space=?2 UNION ALL SELECT sum(length(CAST(root AS BLOB))+length(CAST(path AS BLOB))+length(CAST(version AS BLOB))+1024) FROM files WHERE instance=?1 AND space=?2 UNION ALL SELECT sum(length(CAST(root AS BLOB))+length(CAST(path AS BLOB))+length(body)+1024) FROM chunks WHERE instance=?1 AND space=?2)",params![instance,space],|r|r.get(0)).map_err(|_|AccountError::new("cannot size retained pin copies"))?;
+    // Each destination ancestor can gain a separate physical incoming copy.
+    // Charge all Space payload/metadata per receiver, never just one donor.
+    let ancestors = (0..destination.len())
+        .map(|n| path_key(&destination[..n]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let receivers:u64=conn.query_row("SELECT count(*) FROM pins WHERE instance=?1 AND space=?2 AND root IN (SELECT value FROM json_each(?3))",params![instance,space,serde_json::to_string(&ancestors).map_err(|_|AccountError::new("cannot size pin ancestors"))?],|row|row.get(0)).map_err(|_|AccountError::new("cannot size pin receivers"))?;
+    let factor = receivers
+        .checked_add(3)
+        .ok_or_else(|| AccountError::new("retained pin storage estimate overflow"))?;
     bytes
-        .checked_mul(2)
+        .checked_add(path_growth)
+        .and_then(|bytes| bytes.checked_mul(factor))
         .and_then(|n| n.checked_add(65536))
         .ok_or_else(|| AccountError::new("retained pin storage estimate overflow"))
 }
@@ -1532,6 +1651,7 @@ fn tree_chain_in(
 // Only the source need move: an outside create-only destination stays fixed.
 // The source's durable tree-destination ancestry separately gates its DELETE.
 fn validate_chain_file_rename(
+    storage_root: &StorageRoot,
     conn: &Connection,
     previous: &TreeMove,
     context: RelocationContext<'_>,
@@ -1589,6 +1709,7 @@ fn validate_chain_file_rename(
                 return Err(refused());
             };
             let observed = offline_directory_in(
+                storage_root,
                 conn,
                 context.instance,
                 context.space,
@@ -1603,7 +1724,14 @@ fn validate_chain_file_rename(
             }
         }
         let (name, parent) = destination.split_last().ok_or_else(refused)?;
-        let visible = offline_directory_in(conn, context.instance, context.space, parent, None)?;
+        let visible = offline_directory_in(
+            storage_root,
+            conn,
+            context.instance,
+            context.space,
+            parent,
+            None,
+        )?;
         if !visible.get(name)?.is_some_and(|entry| {
             entry.id() == format!("cirrus-staged:{destination_id}")
                 && entry.etag() == Some(format!("\"cirrus-staged-{root}\"").as_str())
@@ -1612,7 +1740,7 @@ fn validate_chain_file_rename(
         }
         // The raw authenticated observation, unlike its staged projection, must
         // still prove absence. Reconnect rechecks parents and If-None-Match:*.
-        if directory_snapshot_in(conn, context.instance, context.space, parent)?
+        if directory_snapshot_in_root(storage_root, conn, context.instance, context.space, parent)?
             .ok_or_else(refused)?
             .get(name)?
             .is_some()
@@ -1645,7 +1773,7 @@ fn validate_chain_file_rename(
         return Err(refused());
     }
     let original: FileVersion = serde_json::from_str(
-        &overlay::Overlay::load_in(conn, &root)?
+        &overlay::Overlay::load_in_root(storage_root, conn, &root)?
             .original_base_json()?
             .ok_or_else(refused)?,
     )
@@ -1662,7 +1790,7 @@ fn validate_chain_file_rename(
     }
     let mut visible = original.clone();
     visible.path = change.old_path.clone();
-    if tree_content_base_in(conn, &visible, false)?.as_ref() != Some(&original) {
+    if tree_content_base_in(storage_root, conn, &visible, false)?.as_ref() != Some(&original) {
         return Err(refused());
     }
     Ok(())
@@ -1676,6 +1804,7 @@ fn validate_chain_incoming_file(
     change: &RelocatedOperation,
     source_id: i64,
 ) -> Result<(), AccountError> {
+    let storage_root = &binding.root;
     let refused = || AccountError::new("path has unresolved operations");
     let root:String=conn.query_row("SELECT staged_file FROM operation_journal j WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state='pending' AND staged_file=?5 AND base_file_id IS NULL AND base_etag IS NULL AND confirmed_file_id IS NULL AND confirmed_etag IS NULL AND error_msg IS NULL AND NOT EXISTS(SELECT 1 FROM operation_journal other WHERE other.instance=j.instance AND other.space=j.space AND other.path=j.path AND other.id<>j.id)",params![change.id,binding.instance,binding.space,path_key(&change.old_path)?,change.token],|row|row.get(0)).map_err(|_|refused())?;
     let (source,id,etag,token):(String,String,String,String)=conn.query_row("SELECT path,base_file_id,base_etag,staged_file FROM operation_journal j WHERE id=?1 AND instance=?2 AND space=?3 AND op_type='move-source' AND state='pending' AND error_msg=?4 AND confirmed_file_id IS NULL AND confirmed_etag IS NULL AND NOT EXISTS(SELECT 1 FROM operation_journal other WHERE other.instance=j.instance AND other.space=j.space AND other.path=j.path AND other.id<>j.id) AND NOT EXISTS(SELECT 1 FROM sync_reads WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM upload_verifications WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM write_dependencies WHERE operation_id=j.id OR predecessor_id=j.id)",params![source_id,binding.instance,binding.space,format!("destination-operation:{}",change.id)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|_|refused())?;
@@ -1728,11 +1857,17 @@ fn validate_chain_incoming_file(
     }
     let (name, parent) = source.split_last().ok_or_else(refused)?;
     offline_directory_proof(conn, binding, parent)?;
-    let raw = directory_snapshot_in(conn, &binding.instance, &binding.space, parent)?
-        .ok_or_else(refused)?;
+    let raw = directory_snapshot_in_root(
+        storage_root,
+        conn,
+        &binding.instance,
+        &binding.space,
+        parent,
+    )?
+    .ok_or_else(refused)?;
     let entry = raw.get(name)?.ok_or_else(refused)?;
     let original: FileVersion = serde_json::from_str(
-        &overlay::Overlay::load_in(conn, &root)?
+        &overlay::Overlay::load_in_root(storage_root, conn, &root)?
             .original_base_json()?
             .ok_or_else(refused)?,
     )
@@ -1761,11 +1896,22 @@ fn validate_chain_incoming_file(
     // At the exact B root, ordinary saved-parent lookup intentionally cannot
     // relabel A. Use the existing immutable MOVE-copy proof for that identity.
     let raw = match change.old_parents.last() {
-        Some(DirectoryIdentity::Remote(id)) => {
-            offline_child_snapshot_in(conn, &binding.instance, &binding.space, parent, id)?
-        }
+        Some(DirectoryIdentity::Remote(id)) => offline_child_snapshot_in(
+            storage_root,
+            conn,
+            &binding.instance,
+            &binding.space,
+            parent,
+            id,
+        )?,
         Some(DirectoryIdentity::Pending(_)) => None,
-        None => directory_snapshot_in(conn, &binding.instance, &binding.space, parent)?,
+        None => directory_snapshot_in_root(
+            storage_root,
+            conn,
+            &binding.instance,
+            &binding.space,
+            parent,
+        )?,
     };
     match raw {
         Some(raw) if raw.get(name)?.is_none() => {}
@@ -1778,7 +1924,11 @@ fn validate_chain_incoming_file(
     Ok(())
 }
 
-pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, AccountError> {
+pub(crate) fn queue_tree_move_correlated(
+    storage_root: &StorageRoot,
+    request: TreeMoveRequest<'_>,
+    correlation: Option<&crate::provider_mutation::Record>,
+) -> Result<crate::OperationHandle, AccountError> {
     let TreeMoveRequest {
         instance,
         space,
@@ -1816,7 +1966,7 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
     let token = namespace_token()?;
     // The allowance must outlive rollback and connection close.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let chain = tree_chain_in(&conn, &request)?;
     let source_key = path_key(source)?;
     let destination_key = path_key(destination)?;
@@ -2009,15 +2159,30 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
         )", params![instance,space,source_key,prefix,upper,ancestors], |row| Ok((row.get(0)?,row.get(1)?)))
         .map_err(|_| AccountError::new("cannot size tree pin relocation"))?;
     add(pin_bytes)?;
-    if offline.is_some() && target.is_some() {
-        add(pin_copy_allowance(&conn, instance, space)?)?;
-    }
-    add(pin_paths
+    let path_growth = pin_paths
         .checked_mul(destination_key.len() as u64)
-        .ok_or_else(|| AccountError::new("tree storage estimate overflow"))?)?;
+        .ok_or_else(|| AccountError::new("tree storage estimate overflow"))?;
+    if offline.is_some() && target.is_some() {
+        add(pin_copy_allowance(
+            &conn,
+            instance,
+            space,
+            destination,
+            path_growth,
+        )?)?;
+    } else {
+        add(path_growth)?;
+    }
+    if let Some(record) = correlation {
+        add(serde_json::to_vec(record)
+            .map_err(|_| AccountError::new("cannot size provider correlation"))?
+            .len() as u64
+            + 16384)?;
+    }
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_TREE_MOVE_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -2053,6 +2218,21 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
     }
     reject_fenced_ancestor(&tx, instance, space, source)?;
     reject_fenced_ancestor(&tx, instance, space, destination)?;
+    if !crate::provider_mutation::tree_blockers_in(
+        &tx,
+        instance,
+        space,
+        source,
+        destination,
+        entry.id(),
+        correlation,
+    )?
+    .is_empty()
+    {
+        return Err(AccountError::retryable_read(
+            "earlier provider intent must finish before tree relocation",
+        ));
+    }
     reject_moving_directory_bindings(&tx, instance, space, &[source, destination])?;
     if let Some(binding) = offline {
         validate_offline_tree(
@@ -2249,7 +2429,14 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
                 )
                 .map_err(|_| AccountError::new("cannot inspect tree consumer kind"))?;
             if kind == "move-source" {
-                validate_chain_file_rename(&tx, previous, relocation, change, &included)?;
+                validate_chain_file_rename(
+                    storage_root,
+                    &tx,
+                    previous,
+                    relocation,
+                    change,
+                    &included,
+                )?;
             }
         }
     }
@@ -2260,10 +2447,10 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
     } else {
         None
     };
-    apply_relocated_operations(&tx, instance, space, &changes)?;
     if offline.is_some() && target.is_some() {
         let target = target.ok_or_else(|| AccountError::new("replacement target unavailable"))?;
         relocate_pins_in(
+            storage_root,
             &tx,
             instance,
             space,
@@ -2275,10 +2462,12 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
                     .etag()
                     .ok_or_else(|| AccountError::new("replacement target version unavailable"))?,
             )),
-            true,
+            offline,
         )?;
+        apply_relocated_operations(&tx, instance, space, &changes)?;
     } else {
-        relocate_pins(&tx, instance, space, source, destination)?;
+        apply_relocated_operations(&tx, instance, space, &changes)?;
+        relocate_pins(storage_root, &tx, instance, space, source, destination)?;
     }
     // Source and destination are disjoint. Remove destination snapshots first,
     // then copy only original source rows below a fixed high water. New copies
@@ -2393,23 +2582,34 @@ pub(crate) fn queue_tree_move(request: TreeMoveRequest<'_>) -> Result<i64, Accou
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
+    }
+    let operation = crate::OperationHandle::capture(&tx, instance, space, id)?;
+    if let Some(record) = correlation {
+        provider::attach(&tx, record, vec![operation.clone()])?;
     }
     tx.commit()
         .map_err(|error| sqlite_storage_error(error, "cannot commit directory rename"))?;
     #[cfg(feature = "fault-injection")]
     pin_move_stop("after-commit");
-    Ok(id)
+    Ok(operation)
 }
 
 pub(crate) fn namespace_token() -> Result<String, AccountError> {
     let mut random = [0u8; 16];
     let mut filled = 0;
     while filled < random.len() {
+        #[cfg(target_os = "linux")]
         let count =
             rustix::rand::getrandom(&mut random[filled..], rustix::rand::GetRandomFlags::empty())
                 .map_err(|_| AccountError::new("cannot generate operation token"))?;
+        #[cfg(target_os = "macos")]
+        let count = ownership::file_ops::random(&mut random[filled..])
+            .map_err(|_| AccountError::new("cannot generate operation token"))?;
         if count == 0 {
             return Err(AccountError::new("cannot generate operation token"));
         }
@@ -2467,7 +2667,8 @@ fn reject_moving_directory_bindings(
     Ok(())
 }
 
-pub(crate) fn queue_namespace(
+pub(crate) fn queue_namespace_operation(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
@@ -2475,15 +2676,15 @@ pub(crate) fn queue_namespace(
     base: Option<(&str, &str)>,
     parents: &[DirectoryIdentity],
     offline_binding: Option<&crate::MountBinding>,
-) -> Result<i64, AccountError> {
+) -> Result<crate::OperationHandle, AccountError> {
     if !matches!(kind, "mkdir" | "unlink" | "rmdir") {
         return Err(AccountError::new("invalid namespace operation"));
     }
     let token = namespace_token()?;
-    let _state_phase = crate::ownership::admit_local_state_turn()?;
+    let _state_phase = crate::ownership::admit_local_state_turn_in(storage_root)?;
     // Lifetime order keeps the paid allowance through rollback/SQLite close.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let key = path_key(path)?;
     // Pure byte planning also runs while disabled: enabling policy before
     // lease acquisition must never turn a zero-input plan into admission.
@@ -2539,7 +2740,8 @@ pub(crate) fn queue_namespace(
     };
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_NAMESPACE_JOURNAL_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -2580,13 +2782,17 @@ pub(crate) fn queue_namespace(
                 reject_fenced_ancestor(&tx, instance, space, path)?;
                 if let Some(reservation) = &reservation {
                     reservation.validate(&tx)?;
-                } else if crate::storage::limits::view()?.limits.is_some() {
+                } else if crate::storage::limits::view_in(storage_root)?
+                    .limits
+                    .is_some()
+                {
                     return Err(AccountError::new(crate::storage::limits::PRESSURE));
                 }
+                let operation = crate::OperationHandle::capture(&tx, instance, space, local)?;
                 tx.commit().map_err(|error| {
                     sqlite_storage_error(error, "cannot commit local directory removal")
                 })?;
-                return Ok(local);
+                return Ok(operation);
             }
         } else {
             if base.is_some() {
@@ -2596,6 +2802,7 @@ pub(crate) fn queue_namespace(
                 .split_last()
                 .ok_or_else(|| AccountError::new("invalid offline directory path"))?;
             let entries = offline_directory_in(
+                storage_root,
                 &tx,
                 instance,
                 space,
@@ -2610,6 +2817,7 @@ pub(crate) fn queue_namespace(
             // Absence is local evidence only, from complete identity-bound saved
             // parents or a journaled mkdir. Reconnect must revalidate remotely.
             validate_offline_write(
+                storage_root,
                 &tx,
                 (instance, space),
                 path,
@@ -2651,12 +2859,16 @@ pub(crate) fn queue_namespace(
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
+    let operation = crate::OperationHandle::capture(&tx, instance, space, id)?;
     tx.commit()
         .map_err(|error| sqlite_storage_error(error, "cannot commit namespace operation"))?;
-    Ok(id)
+    Ok(operation)
 }
 
 fn validate_offline_rmdir(
@@ -2666,6 +2878,7 @@ fn validate_offline_rmdir(
     base: (&str, &str),
     parents: &[DirectoryIdentity],
 ) -> Result<(), AccountError> {
+    let storage_root = &binding.root;
     let (name, parent) = path
         .split_last()
         .ok_or_else(|| AccountError::new("invalid directory path"))?;
@@ -2674,6 +2887,7 @@ fn validate_offline_rmdir(
     }
     for (index, expected) in parents.iter().enumerate() {
         let entries = offline_directory_in(
+            storage_root,
             conn,
             &binding.instance,
             &binding.space,
@@ -2689,6 +2903,7 @@ fn validate_offline_rmdir(
         }
     }
     let entries = offline_directory_in(
+        storage_root,
         conn,
         &binding.instance,
         &binding.space,
@@ -2703,6 +2918,7 @@ fn validate_offline_rmdir(
         return Err(AccountError::new("offline directory version changed"));
     }
     let children = offline_directory_in(
+        storage_root,
         conn,
         &binding.instance,
         &binding.space,
@@ -2741,6 +2957,7 @@ fn validate_offline_rmdir(
 
 // The destination mkdir must be confirmed before the empty source may be removed.
 pub(crate) fn queue_empty_directory_move(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     source: &[String],
@@ -2756,7 +2973,7 @@ pub(crate) fn queue_empty_directory_move(
     }
     // Keep the allowance until rollback/connection close, not just commit.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let source_key = path_key(source)?;
     let destination_key = path_key(destination)?;
     let planning_version: i64 = conn
@@ -2847,7 +3064,8 @@ pub(crate) fn queue_empty_directory_move(
         .ok_or_else(|| AccountError::new("directory storage estimate overflow"))?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_EMPTY_MOVE_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -2903,7 +3121,7 @@ pub(crate) fn queue_empty_directory_move(
     if duplicate != 0 {
         return Err(AccountError::new("operation token collision"));
     }
-    relocate_pins(&tx, instance, space, source, destination)?;
+    relocate_pins(storage_root, &tx, instance, space, source, destination)?;
     tx.execute("INSERT INTO operation_journal(instance,space,path,op_type,base_file_id,base_etag,staged_file,state,error_msg,updated_at) VALUES (?1,?2,?3,'mkdir',NULL,NULL,?4,'pending',NULL,strftime('%s','now'))", params![instance,space,destination_key,mkdir_token]).map_err(|error| sqlite_storage_error(error, "cannot journal directory destination"))?;
     let destination_id = tx.last_insert_rowid();
     save_operation_parents(&tx, destination_id, destination, destination_parents, None)?;
@@ -2912,7 +3130,10 @@ pub(crate) fn queue_empty_directory_move(
     write_local_snapshot(&tx, instance, space, destination, destination_id)?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -2921,11 +3142,12 @@ pub(crate) fn queue_empty_directory_move(
 }
 
 pub(crate) fn local_directory(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<bool, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage_root)?;
     let state: Option<(String,String)> = conn.query_row("SELECT op_type,state FROM operation_journal WHERE instance=?1 AND space=?2 AND path=?3 AND op_type IN ('mkdir','rmdir') AND state!='resolved' ORDER BY id DESC LIMIT 1", params![instance, space, path_key(path)?], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|_| AccountError::new("cannot inspect local directory"))?;
     Ok(state.is_some_and(|(kind, state)| {
         kind == "mkdir" && matches!(state.as_str(), "pending" | "conflict" | "uncertain")
@@ -2939,14 +3161,23 @@ fn offline_directory_proof(
     binding: &crate::MountBinding,
     path: &[String],
 ) -> Result<crate::DirectorySnapshot, AccountError> {
+    let storage_root = &binding.root;
     let owner = Some((binding.issuer.as_str(), binding.subject.as_str()));
-    let mut entries = offline_directory_in(conn, &binding.instance, &binding.space, &[], owner)?;
+    let mut entries = offline_directory_in(
+        storage_root,
+        conn,
+        &binding.instance,
+        &binding.space,
+        &[],
+        owner,
+    )?;
     for depth in 0..path.len() {
         let entry = entries
             .get(&path[depth])?
             .filter(Entry::is_directory)
             .ok_or_else(|| AccountError::new("offline tree parent unavailable"))?;
         entries = offline_directory_in(
+            storage_root,
             conn,
             &binding.instance,
             &binding.space,
@@ -2987,6 +3218,7 @@ fn validate_offline_tree(
     versions: &[FileVersion],
     chain: Option<&TreeMove>,
 ) -> Result<(), AccountError> {
+    let storage_root = &binding.root;
     if !binding.offline || !binding.offline_writable {
         return Err(AccountError::new("offline directory rename unavailable"));
     }
@@ -3003,6 +3235,7 @@ fn validate_offline_tree(
         }
         for (index, identity) in expected.iter().enumerate() {
             let ancestors = offline_directory_in(
+                storage_root,
                 conn,
                 &binding.instance,
                 &binding.space,
@@ -3040,11 +3273,16 @@ fn validate_offline_tree(
                         ));
                     }
                     if !id.starts_with("cirrus-dir:") {
-                        let raw =
-                            directory_snapshot_in(conn, &binding.instance, &binding.space, path)?
-                                .ok_or_else(|| {
-                                AccountError::new("offline replacement observation unavailable")
-                            })?;
+                        let raw = directory_snapshot_in_root(
+                            storage_root,
+                            conn,
+                            &binding.instance,
+                            &binding.space,
+                            path,
+                        )?
+                        .ok_or_else(|| {
+                            AccountError::new("offline replacement observation unavailable")
+                        })?;
                         if !raw.is_empty()? {
                             return Err(AccountError::new("directory is not empty"));
                         }
@@ -3114,6 +3352,7 @@ fn validate_offline_tree(
             .split_last()
             .ok_or_else(|| AccountError::new("invalid open tree file"))?;
         let entries = offline_directory_in(
+            storage_root,
             conn,
             &binding.instance,
             &binding.space,
@@ -3176,6 +3415,16 @@ fn walk_tree_proofs(
     source: &[String],
     operation: Option<TreeProofUse<'_>>,
 ) -> Result<(), AccountError> {
+    visit_tree_proofs(conn, binding, source, operation, |_, _| Ok(()))
+}
+
+fn visit_tree_proofs(
+    conn: &Connection,
+    binding: &crate::MountBinding,
+    source: &[String],
+    operation: Option<TreeProofUse<'_>>,
+    mut visit: impl FnMut(&[String], &crate::DirectorySnapshot) -> Result<(), AccountError>,
+) -> Result<(), AccountError> {
     fn walk(
         conn: &Connection,
         binding: &crate::MountBinding,
@@ -3183,13 +3432,21 @@ fn walk_tree_proofs(
         path: &[String],
         operation: Option<TreeProofUse<'_>>,
         count: &mut usize,
+        visit: &mut impl FnMut(&[String], &crate::DirectorySnapshot) -> Result<(), AccountError>,
     ) -> Result<(), AccountError> {
+        let storage_root = &binding.root;
         *count += 1;
         if *count > MAX_OFFLINE_TREE_DIRECTORIES || path.len() > 128 {
             return Err(AccountError::new("offline tree observation bound exceeded"));
         }
-        let entries = directory_snapshot_in(conn, &binding.instance, &binding.space, path)?
-            .ok_or_else(|| AccountError::new("offline tree complete observation unavailable"))?;
+        let entries = directory_snapshot_in_root(
+            storage_root,
+            conn,
+            &binding.instance,
+            &binding.space,
+            path,
+        )?
+        .ok_or_else(|| AccountError::new("offline tree complete observation unavailable"))?;
         let (id, etag) = entries.remote_parent()?;
         let generation: i64=conn.query_row("SELECT updated FROM snapshots WHERE instance=?1 AND space=?2 AND path=?3 AND issuer=?4 AND subject=?5 AND self_id=?6 AND self_etag=?7 AND local_operation IS NULL",params![binding.instance,binding.space,path_key(path)?,binding.issuer,binding.subject,id,etag],|row|row.get(0)).map_err(|_|AccountError::new("offline tree observation owner changed"))?;
         if let Some(proof_use) = operation {
@@ -3228,6 +3485,7 @@ fn walk_tree_proofs(
                 }
             }
         }
+        visit(path, &entries)?;
         let mut after = 0;
         loop {
             let page = entries.page(after)?;
@@ -3241,11 +3499,14 @@ fn walk_tree_proofs(
                 }
                 let mut child = path.to_vec();
                 child.push(entry.name().to_owned());
-                let observed =
-                    directory_snapshot_in(conn, &binding.instance, &binding.space, &child)?
-                        .ok_or_else(|| {
-                            AccountError::new("offline tree child observation unavailable")
-                        })?;
+                let observed = directory_snapshot_in_root(
+                    storage_root,
+                    conn,
+                    &binding.instance,
+                    &binding.space,
+                    &child,
+                )?
+                .ok_or_else(|| AccountError::new("offline tree child observation unavailable"))?;
                 if observed.remote_parent()?
                     != (
                         entry.id().to_owned(),
@@ -3261,12 +3522,12 @@ fn walk_tree_proofs(
                     return Err(AccountError::new("offline tree child observation changed"));
                 }
                 drop(observed);
-                walk(conn, binding, root, &child, operation, count)?;
+                walk(conn, binding, root, &child, operation, count, visit)?;
             }
         }
         Ok(())
     }
-    walk(conn, binding, source, source, operation, &mut 0)
+    walk(conn, binding, source, source, operation, &mut 0, &mut visit)
 }
 
 fn copy_local_tree_snapshots(
@@ -3327,11 +3588,12 @@ pub(crate) struct TreeProof {
 }
 
 pub(crate) fn tree_proof_page(
+    storage: &StorageRoot,
     instance: &str,
     operation: &TreeMove,
     after: Option<&str>,
 ) -> Result<Vec<(String, TreeProof)>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let root:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM tree_proofs p JOIN operation_journal j ON j.id=p.operation_id JOIN directory_moves m ON m.operation_id=j.id WHERE j.id=?1 AND j.instance=?2 AND j.space=?3 AND j.path=?4 AND j.op_type='move-tree' AND m.offline=1 AND m.destination=?5 AND p.path='[]' AND p.self_id=?6 AND p.self_etag=?7)",params![operation.id,instance,operation.space,path_key(&operation.source)?,path_key(&operation.destination)?,operation.entry.id(),operation.entry.etag()],|row|row.get(0)).map_err(|_|AccountError::new("cannot verify offline tree proof root"))?;
     if !root {
         return Err(AccountError::new("offline tree proof root unavailable"));
@@ -3417,6 +3679,7 @@ fn local_directory_page(
 
 // Only an entirely local pending tree can be relocated without a remote MOVE.
 pub(crate) fn rename_local_directory(
+    storage_root: &StorageRoot,
     location: (&str, &str),
     source: &[String],
     destination: &[String],
@@ -3461,7 +3724,7 @@ pub(crate) fn rename_local_directory(
     };
     // Keep working room through rollback and SQLite connection close.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect local directory plan"))?;
@@ -3545,12 +3808,13 @@ pub(crate) fn rename_local_directory(
         .ok_or_else(|| AccountError::new("local directory storage estimate overflow"))?;
     if remote_target.is_some() {
         planned = planned
-            .checked_add(pin_copy_allowance(&conn, instance, space)?)
+            .checked_add(pin_copy_allowance(&conn, instance, space, destination, 0)?)
             .ok_or_else(|| AccountError::new("retained pin storage estimate overflow"))?;
     }
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_LOCAL_DIRECTORY_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -3702,6 +3966,7 @@ pub(crate) fn rename_local_directory(
     }
     if let Some((target, etag)) = remote_target {
         relocate_pins_in(
+            storage_root,
             &tx,
             instance,
             space,
@@ -3711,17 +3976,20 @@ pub(crate) fn rename_local_directory(
                 target,
                 etag.ok_or_else(|| AccountError::new("replacement target version unavailable"))?,
             )),
-            false,
+            None,
         )?;
     } else {
-        relocate_pins(&tx, instance, space, source, destination)?;
+        relocate_pins(storage_root, &tx, instance, space, source, destination)?;
     }
     if offline.is_some() {
         copy_local_tree_snapshots(&tx, instance, space, source, destination)?;
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -3729,6 +3997,7 @@ pub(crate) fn rename_local_directory(
 }
 
 pub(crate) fn remove_staged(
+    storage_root: &StorageRoot,
     location: (&str, &str),
     path: &[String],
     resource: &str,
@@ -3752,11 +4021,11 @@ pub(crate) fn remove_staged(
         .map_err(|_| AccountError::new("invalid staged resource"))?;
     let token = namespace_token()?;
     let key = path_key(path)?;
-    let _state_phase = ownership::admit_local_state_turn()?;
+    let _state_phase = ownership::admit_local_state_turn_in(storage_root)?;
     // Even a local-only resolution can enlarge the row's retained-copy message
     // and journal pages. Keep State room through rollback/connection close.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect staged removal plan"))?;
@@ -3811,7 +4080,8 @@ pub(crate) fn remove_staged(
         .ok_or_else(|| AccountError::new("staged removal storage estimate overflow"))?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_REMOVE_STAGED_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -3840,6 +4110,7 @@ pub(crate) fn remove_staged(
             return Err(AccountError::new("offline unlink binding changed"));
         }
         validate_offline_write(
+            storage_root,
             &tx,
             (instance, space),
             path,
@@ -3914,7 +4185,10 @@ pub(crate) fn remove_staged(
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -3924,13 +4198,14 @@ pub(crate) fn remove_staged(
 // Mkdirs must remain ordered by path depth and then journal ID across pages;
 // removals use journal order. Each caller supplies a fixed ID high-water mark.
 pub(crate) fn pending_namespace(
+    storage: &StorageRoot,
     instance: &str,
     space: Option<&str>,
     mkdir: bool,
     after: (usize, i64),
     through: i64,
 ) -> Result<Vec<NamespaceOperation>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut statement = conn.prepare("SELECT id,space,path,op_type,base_file_id,base_etag,error_msg,staged_file FROM operation_journal WHERE instance=?1 AND (?6 IS NULL OR space=?6) AND state='pending' AND ((?2=1 AND op_type='mkdir') OR (?2=0 AND op_type IN ('unlink','rmdir','move-source','move-dir-source'))) AND id<=?5 AND ((CASE WHEN ?2=1 THEN json_array_length(path) ELSE 0 END)>?3 OR ((CASE WHEN ?2=1 THEN json_array_length(path) ELSE 0 END)=?3 AND id>?4)) ORDER BY CASE WHEN ?2=1 THEN json_array_length(path) ELSE 0 END,id LIMIT 32").map_err(|_| AccountError::new("cannot load namespace operations"))?;
     let rows = statement
         .query_map(
@@ -3990,10 +4265,11 @@ pub(crate) struct ConfirmedDirectory {
 }
 
 pub(crate) fn confirmed_directory(
+    storage: &StorageRoot,
     instance: &str,
     id: i64,
 ) -> Result<Option<ConfirmedDirectory>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let row: Option<(String,String,Option<String>)> = conn.query_row("SELECT space,path,error_msg FROM operation_journal WHERE id=?1 AND instance=?2 AND op_type='mkdir' AND state='synced'", params![id,instance], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|_| AccountError::new("cannot inspect directory destination"))?;
     row.map(|(space, path, message)| {
         let remote_id = message
@@ -4045,22 +4321,24 @@ fn local_directory_target_in(
 }
 
 pub(crate) fn local_directory_target(
+    storage_root: &StorageRoot,
     instance: &str,
     operation: &NamespaceOperation,
 ) -> Result<LocalDirectoryTarget, AccountError> {
-    local_directory_target_in(&database()?, instance, operation)
+    local_directory_target_in(&database_in(storage_root)?, instance, operation)
 }
 
 // This is a GET-only authorization checkpoint, not a successful mutation
 // receipt. Pending parent IDs resolve to this confirmed identity atomically;
 // no descendant may upload while the root is still pending/conflicted.
 pub(crate) fn confirm_local_directory_target(
+    storage_root: &StorageRoot,
     instance: &str,
     operation: &NamespaceOperation,
     target: &LocalDirectoryTarget,
 ) -> Result<(), AccountError> {
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect directory binding plan"))?;
@@ -4074,7 +4352,8 @@ pub(crate) fn confirm_local_directory_target(
         &message,
     ))
     .map_err(|_| AccountError::new("cannot size directory target confirmation"))?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         encoded.len() as u64 + 256,
@@ -4121,7 +4400,10 @@ pub(crate) fn confirm_local_directory_target(
     )?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -4134,11 +4416,12 @@ pub(crate) fn confirm_local_directory_target(
 }
 
 pub(crate) fn pending_rmdir_base(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<Option<NamespaceOperation>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     type RemovalRow = (i64, Option<String>, Option<String>, String, Option<String>);
     let row: Option<RemovalRow> = conn.query_row("SELECT id,base_file_id,base_etag,staged_file,error_msg FROM operation_journal WHERE instance=?1 AND space=?2 AND path=?3 AND op_type='rmdir' AND state='pending' AND base_file_id IS NOT NULL AND base_etag IS NOT NULL ORDER BY id DESC LIMIT 1", params![instance,space,path_key(path)?], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional().map_err(|_| AccountError::new("cannot inspect pending parent removal"))?;
     row.map(|(id, base_id, base_etag, token, pending_message)| {
@@ -4158,7 +4441,7 @@ pub(crate) fn pending_rmdir_base(
     .transpose()
 }
 
-fn update_rmdir_base_in(
+pub(crate) fn update_rmdir_base_in(
     conn: &Connection,
     instance: &str,
     operation: &NamespaceOperation,
@@ -4204,10 +4487,11 @@ pub(crate) struct ConfirmedDestination {
 }
 
 pub(crate) fn confirmed_destination(
+    storage: &StorageRoot,
     instance: &str,
     id: i64,
 ) -> Result<Option<ConfirmedDestination>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let row: Option<(String,String,String,String,String)> = conn.query_row("SELECT space,path,staged_file,confirmed_file_id,confirmed_etag FROM operation_journal AS original WHERE instance=?1 AND id=?2 AND op_type='write' AND state='synced' AND confirmed_file_id IS NOT NULL AND confirmed_etag IS NOT NULL AND NOT EXISTS (SELECT 1 FROM operation_journal AS newer WHERE newer.instance=original.instance AND newer.space=original.space AND newer.path=original.path AND newer.id>original.id AND newer.state IN ('pending','conflict','uncertain'))", params![instance,id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_| AccountError::new("cannot inspect rename destination"))?;
     row.map(|(space, path, staged, file_id, etag)| {
         let path: Vec<String> = serde_json::from_str(&path)
@@ -4226,10 +4510,11 @@ pub(crate) fn confirmed_destination(
 }
 
 pub(crate) fn unsettled_mkdir_spaces(
+    storage: &StorageRoot,
     instance: &str,
     requested_space: Option<&str>,
 ) -> Result<std::collections::HashSet<String>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut stmt = conn.prepare("SELECT space,path,state FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND op_type='mkdir' AND (state IN ('conflict','uncertain') OR (state='resolved' AND error_msg='acknowledged locally; remote outcome not asserted'))").map_err(|_| AccountError::new("cannot inspect directory operations"))?;
     let rows = stmt
         .query_map(params![instance, requested_space], |row| {
@@ -4249,7 +4534,7 @@ pub(crate) fn unsettled_mkdir_spaces(
         }
         let path: Vec<String> =
             serde_json::from_str(&path).map_err(|_| AccountError::new("invalid directory path"))?;
-        if state != "resolved" || unresolved_beneath(instance, &space, &path)? {
+        if state != "resolved" || unresolved_beneath(storage, instance, &space, &path)? {
             spaces.insert(space);
         }
     }
@@ -4257,10 +4542,11 @@ pub(crate) fn unsettled_mkdir_spaces(
 }
 
 pub(crate) fn parent_conflict_spaces(
+    storage: &StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<std::collections::HashSet<String>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut stmt = conn
         .prepare("SELECT DISTINCT space FROM operation_journal WHERE instance=?1 AND op_type='write' AND state='conflict' AND error_msg=?2 AND (?3 IS NULL OR space=?3)")
         .map_err(|_| AccountError::new("cannot inspect parent identity conflicts"))?;
@@ -4274,11 +4560,12 @@ pub(crate) fn parent_conflict_spaces(
 }
 
 pub(crate) fn unresolved_beneath(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<bool, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage_root)?;
     let mut stmt = conn.prepare("SELECT path,op_type FROM operation_journal WHERE instance=?1 AND space=?2 AND state IN ('pending','conflict','uncertain')").map_err(|_| AccountError::new("cannot inspect pending descendants"))?;
     let rows = stmt
         .query_map(params![instance, space], |row| {
@@ -4299,11 +4586,12 @@ pub(crate) fn unresolved_beneath(
 }
 
 pub(crate) fn any_unresolved_beneath(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<bool, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage_root)?;
     let mut stmt=conn.prepare("SELECT path FROM operation_journal WHERE instance=?1 AND space=?2 AND state IN ('pending','conflict','uncertain')").map_err(|_| AccountError::new("cannot inspect pending descendants"))?;
     let rows = stmt
         .query_map(params![instance, space], |row| row.get::<_, String>(0))
@@ -4320,6 +4608,7 @@ pub(crate) fn any_unresolved_beneath(
 }
 
 pub(crate) fn staged_source_base(
+    storage: &StorageRoot,
     version: &FileVersion,
 ) -> Result<Option<(String, String)>, AccountError> {
     let id = version
@@ -4332,7 +4621,7 @@ pub(crate) fn staged_source_base(
         .strip_prefix("\"cirrus-staged-")
         .and_then(|value| value.strip_suffix('"'))
         .ok_or_else(|| AccountError::new("invalid staged version"))?;
-    let row: Option<(Option<String>,Option<String>)> = database()?.query_row("SELECT base_file_id,base_etag FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND staged_file=?5 AND op_type='write' AND state='pending'", params![id,version.instance,version.space,path_key(&version.path)?,staged], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| AccountError::new("cannot inspect rename source"))?;
+    let row: Option<(Option<String>,Option<String>)> = database_in(storage)?.query_row("SELECT base_file_id,base_etag FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND staged_file=?5 AND op_type='write' AND state='pending'", params![id,version.instance,version.space,path_key(&version.path)?,staged], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| AccountError::new("cannot inspect rename source"))?;
     match row.ok_or_else(|| AccountError::new("rename source changed"))? {
         (Some(id), Some(etag)) => Ok(Some((id, etag))),
         (None, None) => Ok(None),
@@ -4340,7 +4629,240 @@ pub(crate) fn staged_source_base(
     }
 }
 
+pub(crate) enum LocalRename {
+    Renamed(FileVersion),
+    NeedsExclusive,
+}
+
+// These are observation tokens only, not eligibility decisions. Include the
+// complete raw contents, generation and owner, not a projected local listing.
+fn local_rename_observation_in(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    parent: &[String],
+) -> Result<Option<[String; 2]>, AccountError> {
+    let mut observations = Vec::new();
+    for path in [&[][..], parent] {
+        let row: Option<String> = conn.query_row("SELECT json_array(entries,updated,self_id,self_etag,local_operation,issuer,subject) FROM snapshots WHERE instance=?1 AND space=?2 AND path=?3",params![instance,space,path_key(path)?],|row|row.get(0)).optional()
+            .map_err(|_|AccountError::new("cannot inspect local rename observation"))?;
+        let Some(row) = row else { return Ok(None) };
+        observations.push(row);
+    }
+    Ok(Some([observations.remove(0), observations.remove(0)]))
+}
+
+pub(crate) fn local_rename_observation(
+    storage_root: &StorageRoot,
+    instance: &str,
+    space: &str,
+    parent: &[String],
+) -> Result<Option<[String; 2]>, AccountError> {
+    let mut conn = database_in(storage_root)?;
+    let tx = conn
+        .transaction()
+        .map_err(|_| AccountError::new("cannot inspect local rename observations"))?;
+    let result = local_rename_observation_in(&tx, instance, space, parent)?;
+    tx.commit()
+        .map_err(|_| AccountError::new("cannot finish local rename observations"))?;
+    Ok(result)
+}
+
+fn pristine_local_operation(
+    conn: &Connection,
+    version: &FileVersion,
+    id: i64,
+    path: &[String],
+    kind: &str,
+) -> Result<bool, AccountError> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j JOIN operation_parents p ON p.operation_id=j.id WHERE j.id=?1 AND j.instance=?2 AND j.space=?3 AND j.path=?4 AND j.op_type=?5 AND j.state='pending' AND j.base_file_id IS NULL AND j.base_etag IS NULL AND j.confirmed_file_id IS NULL AND j.confirmed_etag IS NULL AND j.error_msg IS NULL AND p.destination_parents IS NULL AND NOT EXISTS(SELECT 1 FROM sync_reads WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM upload_verifications WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM verified_uploads WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM tree_targets WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM tree_proofs WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM directory_moves WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM removal_versions WHERE operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM write_dependencies WHERE operation_id=j.id OR predecessor_id=j.id) AND NOT EXISTS(SELECT 1 FROM operation_journal c WHERE c.error_msg='destination-operation:'||j.id) AND NOT EXISTS(SELECT 1 FROM operation_journal other WHERE other.id<>j.id AND (other.staged_file=j.staged_file OR (other.instance=j.instance AND other.space=j.space AND other.path=j.path))))",params![id,version.instance,version.space,path_key(path)?,kind],|row|row.get(0))
+        .map_err(|_|AccountError::new("cannot classify pristine local rename"))
+}
+
+// Caller retains its prepared SH principal owner. This deliberately admits
+// only a file under one pristine pending mkdir in a pin-free Space. SH excludes
+// EX pin/namespace transformers; IMMEDIATE serializes journal/upload admission.
+// No immutable owner, content, pin or original interpretation changes here.
+pub(crate) fn rename_pristine_local_write(
+    session: &crate::ReadSession,
+    version: &FileVersion,
+    destination: &[String],
+    parents: crate::RenameParents<'_>,
+    observation: &[String; 2],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<LocalRename, AccountError> {
+    let storage_root = &session.root;
+    let unavailable = || AccountError::new("local rename snapshot changed; local copies retained");
+    check_pin_cancelled(cancelled)?;
+    let [DirectoryIdentity::Pending(parent_id)] = parents.source else {
+        return Ok(LocalRename::NeedsExclusive);
+    };
+    if version.path.len() != 2
+        || destination.len() != 2
+        || version.path[..1] != destination[..1]
+        || version.path == destination
+        || parents.source != parents.destination
+    {
+        return Ok(LocalRename::NeedsExclusive);
+    }
+    // Configured storage admission remains on the full existing reserved EX
+    // route. Never acquire a reservation (or another database) inside this tx.
+    if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
+        return Ok(LocalRename::NeedsExclusive);
+    }
+    let id = version
+        .id
+        .strip_prefix("cirrus-staged:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(unavailable)?;
+    if version.id != format!("cirrus-staged:{id}") {
+        return Err(unavailable());
+    }
+    let token = version
+        .etag
+        .strip_prefix("\"cirrus-staged-")
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(unavailable)?;
+    let source_key = path_key(&version.path)?;
+    let destination_key = path_key(destination)?;
+    let chain = encode_parents(&version.path, parents.source)?;
+    let mut conn = database_in(storage_root)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_storage_error(error, "cannot begin local rename"))?;
+    check_retained_identity(&tx, &version.instance, &version.space)?;
+    let identity: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM account_identities a JOIN sync_spaces s ON s.instance=a.instance AND s.issuer=a.issuer AND s.subject=a.subject WHERE a.instance=?1 AND s.space=?2 AND a.issuer=?3 AND a.subject=?4)",params![version.instance,version.space,session.account.issuer,session.account.subject],|row|row.get(0)).map_err(|_|unavailable())?;
+    if session.base.as_str() != version.instance || !identity {
+        return Err(unavailable());
+    }
+    reject_fenced_ancestor(&tx, &version.instance, &version.space, &version.path)?;
+    reject_fenced_ancestor(&tx, &version.instance, &version.space, destination)?;
+    let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j JOIN operation_parents p ON p.operation_id=j.id WHERE j.id=?1 AND j.instance=?2 AND j.space=?3 AND j.path=?4 AND j.op_type='write' AND j.state='pending' AND j.staged_file=?5 AND p.parents=?6 AND p.destination_parents IS NULL AND j.error_msg IS NULL AND j.id=(SELECT max(id) FROM operation_journal WHERE instance=j.instance AND space=j.space AND path=j.path AND op_type='write' AND state!='resolved'))",params![id,version.instance,version.space,source_key,token,chain],|row|row.get(0)).map_err(|_|unavailable())?;
+    if !exact {
+        return Err(unavailable());
+    }
+    let root = overlay::Overlay::load_in_root(storage_root, &tx, token)?;
+    let (size, base): (u64, Option<String>) = tx
+        .query_row(
+            "SELECT size,base FROM dirty_roots WHERE root=?1",
+            [token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| unavailable())?;
+    if size != version.size || root.len() != version.size || !version.checksums.is_empty() {
+        return Err(unavailable());
+    }
+    if base != root.original_base_json()? {
+        return Err(unavailable());
+    }
+    if base.is_some() {
+        tx.rollback().map_err(|error| {
+            sqlite_storage_error(error, "cannot close local rename classification")
+        })?;
+        return Ok(LocalRename::NeedsExclusive);
+    }
+    if !pristine_local_operation(&tx, version, id, &version.path, "write")?
+        || !pristine_local_operation(&tx, version, *parent_id, &version.path[..1], "mkdir")?
+    {
+        tx.rollback().map_err(|error| {
+            sqlite_storage_error(error, "cannot close local rename classification")
+        })?;
+        return Ok(LocalRename::NeedsExclusive);
+    }
+    let source_prefix = format!("{},", source_key.trim_end_matches(']'));
+    let destination_prefix = format!("{},", destination_key.trim_end_matches(']'));
+    let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND space=?2 AND (path=?3 OR instr(path,?4)=1 OR instr(path,?5)=1))",params![version.instance,version.space,destination_key,source_prefix,destination_prefix],|row|row.get(0)).map_err(|_|unavailable())?;
+    if occupied {
+        return Err(unavailable());
+    }
+    // Include orphan/incomplete pin records; none may disappear from the proof.
+    let protected:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pins WHERE instance=?1 AND space=?2) OR EXISTS(SELECT 1 FROM files WHERE instance=?1 AND space=?2) OR EXISTS(SELECT 1 FROM chunks WHERE instance=?1 AND space=?2) OR EXISTS(SELECT 1 FROM directory_moves m LEFT JOIN operation_journal j ON j.id=m.operation_id WHERE j.id IS NULL OR (j.instance=?1 AND j.space=?2))",params![version.instance,version.space],|row|row.get(0)).map_err(|_|unavailable())?;
+    if protected {
+        tx.rollback().map_err(|error| {
+            sqlite_storage_error(error, "cannot close local rename classification")
+        })?;
+        return Ok(LocalRename::NeedsExclusive);
+    }
+    if local_rename_observation_in(&tx, &version.instance, &version.space, &version.path[..1])?
+        .as_ref()
+        != Some(observation)
+    {
+        return Err(unavailable());
+    }
+    type Observation = (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let raw: Observation = serde_json::from_str(&observation[0]).map_err(|_| unavailable())?;
+    let local: Observation = serde_json::from_str(&observation[1]).map_err(|_| unavailable())?;
+    for row in [&raw, &local] {
+        if row.5 != session.account.issuer || row.6 != session.account.subject {
+            return Err(unavailable());
+        }
+    }
+    if raw
+        .2
+        .as_deref()
+        .is_none_or(|id| !crate::dav::valid_remote_id(id))
+        || raw
+            .3
+            .as_deref()
+            .is_none_or(|etag| !crate::dav::strong_etag(etag))
+        || raw.4.is_some()
+        || local.0 != "[]"
+        || local.2.is_some()
+        || local.3.is_some()
+        || local.4 != Some(*parent_id)
+        || raw.1 < 0
+        || local.1 < 0
+        || !load_operation_parents(&tx, *parent_id, &version.path[..1])?.is_empty()
+    {
+        return Err(unavailable());
+    }
+    let entries: Vec<Entry> = serde_json::from_str(&raw.0).map_err(|_| unavailable())?;
+    let mut names = std::collections::HashSet::new();
+    for entry in &entries {
+        path_key(&[entry.name().to_owned()])?;
+        if !crate::dav::valid_remote_id(entry.id())
+            || !names.insert(entry.name())
+            || entry.name() == version.path[0]
+        {
+            return Err(unavailable());
+        }
+    }
+    // The exact pending mkdir owns an empty raw saved base. Both endpoint
+    // names are therefore remotely absent, not hidden by projected removals.
+    check_pin_cancelled(cancelled)?;
+    let changed=tx.execute("UPDATE operation_journal SET path=?1,updated_at=strftime('%s','now') WHERE id=?2 AND instance=?3 AND space=?4 AND path=?5 AND state='pending' AND staged_file=?6",params![destination_key,id,version.instance,version.space,source_key,token]).map_err(|error|sqlite_storage_error(error,"cannot relocate local write"))?;
+    let changed_parents=tx.execute("UPDATE operation_parents SET parents=?1 WHERE operation_id=?2 AND parents=?3 AND destination_parents IS NULL",params![encode_parents(destination,parents.destination)?,id,chain]).map_err(|error|sqlite_storage_error(error,"cannot relocate local write parents"))?;
+    if changed != 1 || changed_parents != 1 {
+        return Err(unavailable());
+    }
+    if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
+        return Err(AccountError::new(crate::storage::limits::PRESSURE));
+    }
+    check_pin_cancelled(cancelled)?;
+    tx.commit()
+        .map_err(|error| sqlite_storage_error(error, "cannot commit local rename"))?;
+    let mut renamed = version.clone();
+    renamed.path = destination.to_vec();
+    Ok(LocalRename::Renamed(renamed))
+}
+
 pub(crate) fn rename_staged_write(
+    storage_root: &StorageRoot,
     version: &FileVersion,
     destination: &[String],
     target: Option<(&str, &str)>,
@@ -4362,7 +4884,7 @@ pub(crate) fn rename_staged_write(
     let destination_key = path_key(destination)?;
     // Retain State working room through rollback/connection close as well.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect file rename plan"))?;
@@ -4443,7 +4965,8 @@ pub(crate) fn rename_staged_write(
         .ok_or_else(|| AccountError::new("file storage estimate overflow"))?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_FILE_MOVE_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -4560,6 +5083,7 @@ pub(crate) fn rename_staged_write(
     }
     if offline_binding.is_none() {
         relocate_pins(
+            storage_root,
             &tx,
             &version.instance,
             &version.space,
@@ -4569,7 +5093,10 @@ pub(crate) fn rename_staged_write(
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -4580,6 +5107,7 @@ pub(crate) fn rename_staged_write(
 }
 
 pub(crate) fn replace_pending_write(
+    storage_root: &StorageRoot,
     source: &FileVersion,
     target: &FileVersion,
     source_parents: &[DirectoryIdentity],
@@ -4612,7 +5140,7 @@ pub(crate) fn replace_pending_write(
     let target_key = path_key(&target.path)?;
     // The reservation must survive transaction rollback and connection close.
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect replacement plan"))?;
@@ -4720,7 +5248,8 @@ pub(crate) fn replace_pending_write(
         .ok_or_else(|| AccountError::new("replacement storage estimate overflow"))?;
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_PENDING_REPLACE_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -4850,6 +5379,7 @@ pub(crate) fn replace_pending_write(
     }
     if offline_binding.is_none() {
         relocate_pins(
+            storage_root,
             &tx,
             &source.instance,
             &source.space,
@@ -4859,7 +5389,10 @@ pub(crate) fn replace_pending_write(
     }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -4872,19 +5405,30 @@ pub(crate) fn replace_pending_write(
 
 struct StagingReservation {
     name: String,
+    root: StorageRoot,
 }
 
-pub(crate) fn storage_reservations() -> Result<Vec<(String, u64)>, AccountError> {
+pub(crate) fn storage_reservations_in(
+    root: &StorageRoot,
+) -> Result<Vec<(String, u64)>, AccountError> {
     STAGING_LOCK
         .lock()
-        .map(|reservations| reservations.clone())
+        .map(|reservations| {
+            reservations
+                .iter()
+                .filter(|entry| entry.root.identity() == root.identity())
+                .map(|entry| (entry.name.clone(), entry.bytes))
+                .collect()
+        })
         .map_err(|_| AccountError::new("staging state is unavailable"))
 }
 
 impl Drop for StagingReservation {
     fn drop(&mut self) {
         if let Ok(mut reservations) = STAGING_LOCK.lock() {
-            reservations.retain(|(name, _)| name != &self.name);
+            reservations.retain(|entry| {
+                entry.root.identity() != self.root.identity() || entry.name != self.name
+            });
         }
     }
 }
@@ -4936,15 +5480,16 @@ fn check_staging_capacity(
     Ok(())
 }
 
-fn create_staged_file(
+fn create_staged_file_in(
+    root: &StorageRoot,
     bytes: u64,
 ) -> Result<(std::fs::File, OwnedFd, StagingReservation), AccountError> {
-    match allocate_staged_file(bytes) {
+    match allocate_staged_file(root, bytes) {
         Err(error) if crate::storage::limits::is_pressure(&error) => {
             // allocate_staged_file has dropped staging flock + local mutex.
             // Never wait for cache SQLite while holding the allocator lock.
-            if crate::cache::reclaim_for_storage_pressure()? {
-                allocate_staged_file(bytes)
+            if crate::cache::reclaim_for_storage_pressure_in(root)? {
+                allocate_staged_file(root, bytes)
             } else {
                 Err(error)
             }
@@ -4954,35 +5499,39 @@ fn create_staged_file(
 }
 
 fn allocate_staged_file(
+    root: &StorageRoot,
     bytes: u64,
 ) -> Result<(std::fs::File, OwnedFd, StagingReservation), AccountError> {
     // Allocate actual payload/metadata capacity under the cross-process lock.
     // Sparse logical EOF never reaches this allocator.
-    let staging_guard = ownership::acquire_staging()?;
-    let mut reservations = STAGING_LOCK
-        .lock()
-        .map_err(|_| AccountError::new("staging state is unavailable"))?;
-    let dir = ownership::staging_dir()?;
-    check_staging_capacity(&dir, bytes, &reservations)?;
-    crate::storage::limits::check(bytes, &reservations)?;
+    let staging_guard = ownership::acquire_staging_in(root)?;
+    // The per-root flock excludes new reservations for this root. Concurrent
+    // drops can only make this snapshot conservatively overcharge.
+    let local = storage_reservations_in(root)?;
+    let dir = root.staging_dir()?;
+    check_staging_capacity(&dir, bytes, &local)?;
+    crate::storage::limits::check_in(root, bytes, &local)?;
     let mut random = [0u8; 16];
     let mut filled = 0;
     while filled < random.len() {
+        #[cfg(target_os = "linux")]
         let count =
             rustix::rand::getrandom(&mut random[filled..], rustix::rand::GetRandomFlags::empty())
                 .map_err(|_| AccountError::new("cannot generate staging name"))?;
+        #[cfg(target_os = "macos")]
+        let count = ownership::file_ops::random(&mut random[filled..])
+            .map_err(|_| AccountError::new("cannot generate staging name"))?;
         if count == 0 {
             return Err(AccountError::new("cannot generate staging name"));
         }
         filled += count;
     }
     let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let fd = fs::openat2(
+    let fd = ownership::open_private_file(
         &dir,
         name.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|error| {
         if error == rustix::io::Errno::NOSPC {
@@ -4991,8 +5540,13 @@ fn allocate_staged_file(
             AccountError::new("cannot create staged file")
         }
     })?;
+    #[cfg(target_os = "macos")]
+    if let Err(error) = ownership::darwin_acl::check_file(&fd) {
+        ownership::darwin_acl::discard_unwritten_candidate(&dir, &name, &fd);
+        return Err(AccountError::new(error));
+    }
     if bytes != 0 {
-        fs::fallocate(&fd, fs::FallocateFlags::empty(), 0, bytes).map_err(|error| {
+        ownership::file_ops::allocate(&fd, bytes).map_err(|error| {
             if matches!(error, rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT) {
                 AccountError::new("staging capacity exhausted")
             } else {
@@ -5003,7 +5557,7 @@ fn allocate_staged_file(
     // Recheck real file/directory allocation and filesystem availability, not a
     // guessed metadata overhead. A rejection here leaves a charged orphan; do
     // not reclaim/retry and allocate another candidate after materialization.
-    crate::storage::limits::check(0, &reservations).map_err(|error| {
+    crate::storage::limits::check_in(root, 0, &local).map_err(|error| {
         if crate::storage::limits::is_pressure(&error) {
             AccountError::new(
                 "configured storage pressure changed after allocation; candidate retained",
@@ -5012,10 +5566,21 @@ fn allocate_staged_file(
             error
         }
     })?;
-    reservations.push((name.clone(), bytes.div_ceil(4096).saturating_mul(4096)));
-    drop(reservations);
+    {
+        let mut reservations = STAGING_LOCK
+            .lock()
+            .map_err(|_| AccountError::new("staging state is unavailable"))?;
+        reservations.push(StagingHold {
+            root: root.clone(),
+            name: name.clone(),
+            bytes: bytes.div_ceil(4096).saturating_mul(4096),
+        });
+    }
     drop(staging_guard);
-    let reservation = StagingReservation { name };
+    let reservation = StagingReservation {
+        name,
+        root: root.clone(),
+    };
     #[cfg(feature = "fault-injection")]
     if bytes >= 64 * 1024
         && let Some(marker) = std::env::var_os("CIRRUS_TEST_STAGING_RESERVATION_WINDOW")
@@ -5039,6 +5604,7 @@ fn allocate_staged_file(
 }
 
 pub(crate) fn stage_detached_mutation(
+    storage: &StorageRoot,
     version: &FileVersion,
     mutation: crate::DirtyMutation<'_>,
     offline_binding: Option<&crate::MountBinding>,
@@ -5053,20 +5619,20 @@ pub(crate) fn stage_detached_mutation(
         .strip_prefix("\"cirrus-staged-")
         .and_then(|value| value.strip_suffix('"'))
         .ok_or_else(|| AccountError::new("invalid detached version"))?;
-    let root = mutate_root(Some(version), mutation)?;
+    let root = mutate_root(storage, Some(version), mutation)?;
     let name = root.save()?;
     // Candidate durability/registration has finished and released State and
     // allocator ownership. Only this new local-only head publication is gated;
     // retained reads/exports and publication recovery remain uncapped.
     let key = path_key(&version.path)?;
-    let _state_phase = ownership::admit_local_state_turn()?;
+    let _state_phase = ownership::admit_local_state_turn_in(storage)?;
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     publication::ensure_clear(&conn, &version.instance, &version.space)?;
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect detached head plan"))?;
-    let planned = if crate::storage::limits::view()?.limits.is_some() {
+    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
         serde_json::to_vec(&(
             id,
             &version.instance,
@@ -5084,7 +5650,8 @@ pub(crate) fn stage_detached_mutation(
     };
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_DETACHED_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -5127,7 +5694,7 @@ pub(crate) fn stage_detached_mutation(
     crate::wait_test_window("CIRRUS_TEST_DETACHED_COMMIT_WINDOW")?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     let committed = tx.commit();
@@ -5185,14 +5752,14 @@ fn offline_detached_in(
         .map_err(|_| AccountError::new("cannot inspect offline detached head"))?;
     // As for ordinary staged handles, fsync must not bless a missing/corrupt
     // manifest merely because its registry row still exists.
-    Ok(matches && overlay::Overlay::load_in(conn, root)?.len() == version.size)
+    Ok(matches && overlay::Overlay::load_in_root(&binding.root, conn, root)?.len() == version.size)
 }
 
 pub(crate) fn verify_offline_detached(
     binding: &crate::MountBinding,
     version: &FileVersion,
 ) -> Result<bool, AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(&binding.root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect offline detached snapshot"))?;
@@ -5203,20 +5770,22 @@ pub(crate) fn verify_offline_detached(
 }
 
 fn mutate_root(
+    storage: &StorageRoot,
     base: Option<&FileVersion>,
     mutation: crate::DirtyMutation<'_>,
 ) -> Result<overlay::Overlay, AccountError> {
     let mut root = if let Some(base) = base {
         if base.id.starts_with("cirrus-staged:") {
-            let (_, name) = staged_version(&base.instance, &base.space, &base.path, &base.id)?
-                .filter(|(version, _)| version == base)
-                .ok_or_else(|| AccountError::new("staged file changed"))?;
-            overlay::Overlay::load(&name)?
+            let (_, name) =
+                staged_version(storage, &base.instance, &base.space, &base.path, &base.id)?
+                    .filter(|(version, _)| version == base)
+                    .ok_or_else(|| AccountError::new("staged file changed"))?;
+            overlay::Overlay::load_at(storage, &name)?
         } else {
-            overlay::Overlay::original(base)?
+            overlay::Overlay::original_in(storage, base)?
         }
     } else {
-        overlay::Overlay::empty()
+        overlay::Overlay::empty_in(storage)
     };
     match mutation {
         crate::DirtyMutation::Preserve => {}
@@ -5226,17 +5795,18 @@ fn mutate_root(
     Ok(root)
 }
 
-pub(crate) fn stage_mutation(
+pub(crate) fn stage_mutation_operation(
     binding: &crate::MountBinding,
     path: &[String],
     mutation: crate::DirtyMutation<'_>,
     base: Option<&FileVersion>,
     parents: &[DirectoryIdentity],
-) -> Result<FileVersion, AccountError> {
+) -> Result<(FileVersion, crate::OperationHandle), AccountError> {
     let (instance, space) = (binding.instance.as_str(), binding.space.as_str());
-    let root = mutate_root(base, mutation)?;
+    let root = mutate_root(&binding.root, base, mutation)?;
     let name = root.save_checked(|conn| {
         validate_offline_write(
+            &binding.root,
             conn,
             (instance, space),
             path,
@@ -5246,6 +5816,7 @@ pub(crate) fn stage_mutation(
         )
     })?;
     publish_root(
+        &binding.root,
         (instance, space),
         path,
         name,
@@ -5256,24 +5827,25 @@ pub(crate) fn stage_mutation(
     )
 }
 
-pub(crate) fn stage_offline_mutation(
+pub(crate) fn stage_offline_mutation_operation(
     binding: &crate::MountBinding,
     path: &[String],
     mutation: crate::DirtyMutation<'_>,
     base: Option<&FileVersion>,
     parents: &[DirectoryIdentity],
-) -> Result<FileVersion, AccountError> {
+) -> Result<(FileVersion, crate::OperationHandle), AccountError> {
     // The destination PUT precondition remains `base` at the visible path.
     // Choose original source coordinates only when constructing a NEW overlay;
     // never rewrite an existing root's immutable interpretation.
     let original = base
         .filter(|version| !version.id.starts_with("cirrus-staged:"))
-        .map(|version| content_base(version, true))
+        .map(|version| content_base(&binding.root, version, true))
         .transpose()?
         .flatten();
-    let root = mutate_root(original.as_ref().or(base), mutation)?;
+    let root = mutate_root(&binding.root, original.as_ref().or(base), mutation)?;
     let name = root.save_checked(|conn| {
         validate_offline_write(
+            &binding.root,
             conn,
             (&binding.instance, &binding.space),
             path,
@@ -5282,7 +5854,7 @@ pub(crate) fn stage_offline_mutation(
             parents,
         )?;
         if let (Some(base), Some(original)) = (base, original.as_ref())
-            && tree_content_base_in(conn, base, true)?.as_ref() != Some(original)
+            && tree_content_base_in(&binding.root, conn, base, true)?.as_ref() != Some(original)
         {
             return Err(AccountError::new(
                 "original content MOVE changed; local copies retained",
@@ -5291,6 +5863,7 @@ pub(crate) fn stage_offline_mutation(
         Ok(())
     })?;
     publish_root(
+        &binding.root,
         (&binding.instance, &binding.space),
         path,
         name,
@@ -5314,6 +5887,7 @@ fn validate_offline_rename(
     target: (Option<(&str, &str)>, Option<&FileVersion>),
     parents: crate::RenameParents<'_>,
 ) -> Result<(), AccountError> {
+    let storage_root = &binding.root;
     if !binding.offline
         || !binding.offline_writable
         || source.instance != binding.instance
@@ -5329,6 +5903,7 @@ fn validate_offline_rename(
     for path in [&source.path[..], destination] {
         for depth in 1..path.len() {
             let parent = offline_directory_in(
+                storage_root,
                 conn,
                 location.0,
                 location.1,
@@ -5339,8 +5914,14 @@ fn validate_offline_rename(
                 .get(&path[depth - 1])?
                 .filter(Entry::is_directory)
                 .ok_or_else(|| AccountError::new("offline rename parent unavailable"))?;
-            let children =
-                offline_directory_in(conn, location.0, location.1, &path[..depth], Some(owner))?;
+            let children = offline_directory_in(
+                storage_root,
+                conn,
+                location.0,
+                location.1,
+                &path[..depth],
+                Some(owner),
+            )?;
             if let Some(operation) = entry
                 .id()
                 .strip_prefix("cirrus-dir:")
@@ -5370,6 +5951,7 @@ fn validate_offline_rename(
         }
     }
     validate_offline_write(
+        storage_root,
         conn,
         location,
         &source.path,
@@ -5389,30 +5971,51 @@ fn validate_offline_rename(
             .path
             .split_last()
             .ok_or_else(|| AccountError::new("invalid offline rename source"))?;
-        let mut raw = directory_snapshot_in(conn, location.0, location.1, parent)?;
+        let mut raw =
+            directory_snapshot_in_root(storage_root, conn, location.0, location.1, parent)?;
         if raw.is_none()
             && let Some((name, ancestor)) = parent.split_last()
         {
-            let entries =
-                offline_directory_in(conn, location.0, location.1, ancestor, Some(owner))?;
+            let entries = offline_directory_in(
+                storage_root,
+                conn,
+                location.0,
+                location.1,
+                ancestor,
+                Some(owner),
+            )?;
             if let Some(entry) = entries
                 .get(name)?
                 .filter(|entry| entry.is_directory() && crate::dav::valid_remote_id(entry.id()))
             {
-                raw = offline_child_snapshot_in(conn, location.0, location.1, parent, entry.id())?;
+                raw = offline_child_snapshot_in(
+                    storage_root,
+                    conn,
+                    location.0,
+                    location.1,
+                    parent,
+                    entry.id(),
+                )?;
             }
         }
         if let Some(raw) = raw.as_mut() {
             // Filter only confirmed old representations, not the live staged
             // writes whose PUT preconditions are being checked here.
-            visit_staged_entries_in(conn, location.0, location.1, parent, |name, entry| {
-                if let LocalEntry::ConfirmedRemove(removal) = entry
-                    && confirmed_removal_matches(conn, location, &removal, raw)?
-                {
-                    raw.remove_observed(name)?;
-                }
-                Ok(())
-            })?;
+            visit_staged_entries_in(
+                storage_root,
+                conn,
+                location.0,
+                location.1,
+                parent,
+                |name, entry| {
+                    if let LocalEntry::ConfirmedRemove(removal) = entry
+                        && confirmed_removal_matches(conn, location, &removal, raw)?
+                    {
+                        raw.remove_observed(name)?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         let entry = raw.as_ref().map(|raw| raw.get(name)).transpose()?.flatten();
         let matches = match (base, entry) {
@@ -5440,6 +6043,7 @@ fn validate_offline_rename(
             return Err(AccountError::new("offline rename target binding changed"));
         }
         validate_offline_write(
+            storage_root,
             conn,
             location,
             destination,
@@ -5453,10 +6057,18 @@ fn validate_offline_rename(
         let (name, parent) = destination
             .split_last()
             .ok_or_else(|| AccountError::new("invalid offline rename destination"))?;
-        let entries = offline_directory_in(conn, location.0, location.1, parent, Some(owner))?;
+        let entries = offline_directory_in(
+            storage_root,
+            conn,
+            location.0,
+            location.1,
+            parent,
+            Some(owner),
+        )?;
         let current = entries.get(name)?;
         match (current, target.0) {
             (None, None) => validate_offline_write(
+                storage_root,
                 conn,
                 location,
                 destination,
@@ -5483,6 +6095,7 @@ fn validate_offline_rename(
                     checksums: entry.checksums().to_vec(),
                 };
                 validate_offline_write(
+                    storage_root,
                     conn,
                     location,
                     destination,
@@ -5498,6 +6111,7 @@ fn validate_offline_rename(
 }
 
 fn validate_offline_write(
+    storage_root: &StorageRoot,
     conn: &Connection,
     location: (&str, &str),
     path: &[String],
@@ -5513,7 +6127,14 @@ fn validate_offline_write(
         return Err(AccountError::new("offline parent identities changed"));
     }
     for (index, expected) in parents.iter().enumerate() {
-        let directory = offline_directory_in(conn, instance, space, &parent[..index], Some(owner))?;
+        let directory = offline_directory_in(
+            storage_root,
+            conn,
+            instance,
+            space,
+            &parent[..index],
+            Some(owner),
+        )?;
         let entry = directory
             .get(&parent[index])?
             .filter(Entry::is_directory)
@@ -5522,7 +6143,7 @@ fn validate_offline_write(
             return Err(AccountError::new("offline parent identity changed"));
         }
     }
-    let entries = offline_directory_in(conn, instance, space, parent, Some(owner))?;
+    let entries = offline_directory_in(storage_root, conn, instance, space, parent, Some(owner))?;
     let current = entries.get(name)?;
     let matches = match (base, current) {
         (None, None) => true,
@@ -5715,6 +6336,7 @@ fn root_publication_bytes(
 }
 
 fn publish_root(
+    storage: &StorageRoot,
     location: (&str, &str),
     path: &[String],
     name: String,
@@ -5722,7 +6344,7 @@ fn publish_root(
     base: Option<&FileVersion>,
     parents: &[DirectoryIdentity],
     offline_owner: Option<(&str, &str)>,
-) -> Result<FileVersion, AccountError> {
+) -> Result<(FileVersion, crate::OperationHandle), AccountError> {
     let (instance, space) = location;
     // Candidate payload/manifest/dirty_roots registration are already durable
     // and independently charged. Refusal here retains that unacknowledged
@@ -5730,9 +6352,9 @@ fn publish_root(
     // marker recovery below continues on its separate UNCAPPED connection.
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_ROOT_PUBLICATION_ADMISSION_WINDOW")?;
-    let _state_phase = ownership::admit_local_state_turn()?;
+    let _state_phase = ownership::admit_local_state_turn_in(storage)?;
     let reservation;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let encoded = path_key(path)?;
     let existing = base
         .and_then(|v| v.id.strip_prefix("cirrus-staged:"))
@@ -5740,12 +6362,13 @@ fn publish_root(
     let planning_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect staged publication plan"))?;
-    let planned = if crate::storage::limits::view()?.limits.is_some() {
+    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
         root_publication_bytes(&conn, (instance, space), path, &name, base, parents)?
     } else {
         0
     };
-    reservation = crate::storage::sql_reservation::SqlReservation::begin(
+    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage,
         crate::storage::sql_reservation::Store::State,
         Some(&conn),
         planned,
@@ -5761,7 +6384,7 @@ fn publish_root(
     // path or immutable allocator acquires this State lease recursively.
     let check_plan = |conn: &Connection| -> Result<(), AccountError> {
         if let Some(owner) = offline_owner {
-            validate_offline_write(conn, (instance, space), path, owner, base, parents)?;
+            validate_offline_write(storage, conn, (instance, space), path, owner, base, parents)?;
         }
         if reservation.is_some() {
             let current: i64 = conn
@@ -5780,12 +6403,12 @@ fn publish_root(
         crate::wait_test_window("CIRRUS_TEST_ROOT_PUBLICATION_COMMIT_WINDOW")?;
         if let Some(reservation) = &reservation {
             reservation.validate(conn)?;
-        } else if crate::storage::limits::view()?.limits.is_some() {
+        } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
             return Err(AccountError::new(crate::storage::limits::PRESSURE));
         }
         Ok(())
     };
-    let id = if let Some(id) = existing {
+    let (id, operation) = if let Some(id) = existing {
         let expected = base.ok_or_else(|| AccountError::new("missing staged version"))?;
         let old_name = expected
             .etag
@@ -5843,6 +6466,7 @@ fn publish_root(
             }
         };
         let publication = publication::fence(&tx, next_id)?;
+        let operation = crate::OperationHandle::capture(&tx, instance, space, next_id)?;
         #[cfg(feature = "fault-injection")]
         let veto = if count == 1
             && let Some(marker) = std::env::var_os("CIRRUS_TEST_DIRTY_COMMIT_ABORT")
@@ -5906,7 +6530,8 @@ fn publish_root(
         conn.close().map_err(|_| {
             AccountError::new("cannot close publication database; local copies retained")
         })?;
-        let recovered = publication::recover(
+        let recovered = publication::recover_in(
+            storage,
             instance,
             space,
             path,
@@ -5921,7 +6546,7 @@ fn publish_root(
                 "local publication head changed; local copies retained",
             ));
         }
-        next_id
+        (next_id, operation)
     } else {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -5953,7 +6578,7 @@ fn publish_root(
                 .optional().map_err(|_| AccountError::new("cannot inspect rename destination"))?;
             let (backup_path, backup) =
                 backup.ok_or_else(|| AccountError::new("rename destination is unavailable"))?;
-            StagedSnapshot::open(&backup)?;
+            StagedSnapshot::open_at(storage, &backup)?;
             let backup_path: Vec<String> = serde_json::from_str(&backup_path)
                 .map_err(|_| AccountError::new("invalid rename destination"))?;
             if let (Some((name, parent)), Some((backup_name, backup_parent))) =
@@ -5962,7 +6587,7 @@ fn publish_root(
                 && backup_name.strip_suffix('~') == Some(name.as_str())
             {
                 // Vim recreates the original name and removes this temporary backup.
-                relocate_pins(&tx, instance, space, &backup_path, path)?;
+                relocate_pins(storage, &tx, instance, space, &backup_path, path)?;
             }
             // Keep the backup journal-referenced even if its visible name is later removed.
             tx.execute("INSERT INTO operation_journal(instance,space,path,op_type,base_file_id,base_etag,staged_file,state,error_msg,updated_at) SELECT instance,space,path,op_type,base_file_id,base_etag,staged_file,'resolved','backup retained after source recreation',strftime('%s','now') FROM operation_journal WHERE id=?1", [backup_id])
@@ -5988,12 +6613,14 @@ fn publish_root(
         let id = tx.last_insert_rowid();
         save_operation_parents(&tx, id, path, parents, None)?;
         let publication = publication::fence(&tx, id)?;
+        let operation = crate::OperationHandle::capture(&tx, instance, space, id)?;
         validate(&tx)?;
         let committed = tx.commit();
         conn.close().map_err(|_| {
             AccountError::new("cannot close publication database; local copies retained")
         })?;
-        if !publication::recover(
+        if !publication::recover_in(
+            storage,
             instance,
             space,
             path,
@@ -6006,21 +6633,27 @@ fn publish_root(
                 "local publication head changed; local copies retained",
             ));
         }
-        id
+        (id, operation)
     };
-    Ok(FileVersion {
-        instance: instance.to_owned(),
-        space: space.to_owned(),
-        path: path.to_vec(),
-        id: format!("cirrus-staged:{id}"),
-        etag: format!("\"cirrus-staged-{name}\""),
-        size,
-        checksums: Vec::new(),
-    })
+    Ok((
+        FileVersion {
+            instance: instance.to_owned(),
+            space: space.to_owned(),
+            path: path.to_vec(),
+            id: format!("cirrus-staged:{id}"),
+            etag: format!("\"cirrus-staged-{name}\""),
+            size,
+            checksums: Vec::new(),
+        },
+        operation,
+    ))
 }
 
-pub(crate) fn journal_high_water(instance: &str) -> Result<i64, AccountError> {
-    database()?
+pub(crate) fn journal_high_water(
+    storage: &StorageRoot,
+    instance: &str,
+) -> Result<i64, AccountError> {
+    database_in(storage)?
         .query_row(
             "SELECT COALESCE(MAX(id),0) FROM operation_journal WHERE instance=?1",
             [instance],
@@ -6038,17 +6671,19 @@ pub(crate) struct IncomingFileSource {
 // a create-only write inside that destination, based on an outside original,
 // must still name its one pending outside source by the same operation ID.
 pub(crate) fn incoming_file_source(
+    storage: &StorageRoot,
     instance: &str,
     operation: &PendingWrite,
 ) -> Result<Option<IncomingFileSource>, AccountError> {
     if operation.base_id.is_some() || operation.base_etag.is_some() {
         return Ok(None);
     }
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect incoming rename source"))?;
-    let Some(json) = overlay::Overlay::load_in(&tx, &operation.staged)?.original_base_json()?
+    let Some(json) =
+        overlay::Overlay::load_in_root(storage, &tx, &operation.staged)?.original_base_json()?
     else {
         return Ok(None);
     };
@@ -6118,12 +6753,13 @@ pub(crate) fn incoming_file_source(
 }
 
 pub(crate) fn pending_writes(
+    storage: &StorageRoot,
     instance: &str,
     space: Option<&str>,
     after: i64,
     through: i64,
 ) -> Result<Vec<PendingWrite>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     let mut stmt = conn.prepare("SELECT id,space,path,base_file_id,base_etag,staged_file FROM operation_journal AS j WHERE instance=?1 AND (?4 IS NULL OR space=?4) AND state='pending' AND op_type='write' AND id>?2 AND id<=?3 AND NOT EXISTS(SELECT 1 FROM write_dependencies AS d WHERE d.operation_id=j.id) ORDER BY id LIMIT 32")
         .map_err(|_| AccountError::new("cannot load pending operations"))?;
     let rows = stmt
@@ -6158,10 +6794,11 @@ pub(crate) fn pending_writes(
 }
 
 pub(crate) fn preservation_only(
+    storage: &StorageRoot,
     instance: &str,
     operation: &PendingWrite,
 ) -> Result<bool, AccountError> {
-    let root = overlay::Overlay::load(&operation.staged)?;
+    let root = overlay::Overlay::load_at(storage, &operation.staged)?;
     if !root.unchanged_base().is_some_and(|base| {
         base.instance == instance
             && base.space == operation.space
@@ -6173,7 +6810,7 @@ pub(crate) fn preservation_only(
     }
     // An unchanged byte view can still be actionable namespace/dependency
     // work. Never strand a consumer that requires this exact write to confirm.
-    let required: bool = database()?.query_row(
+    let required: bool = database_in(storage)?.query_row(
         "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND space=?2 AND op_type='move-source' AND state IN ('pending','conflict','uncertain') AND error_msg=?3) OR EXISTS(SELECT 1 FROM write_dependencies WHERE predecessor_id=?4)",
         params![instance,operation.space,format!("destination-operation:{}",operation.id),operation.id], |row| row.get(0),
     ).map_err(|_| AccountError::new("cannot inspect preservation dependencies"))?;
@@ -6183,13 +6820,14 @@ pub(crate) fn preservation_only(
 // A write may only transition the exact snapshot that was inspected. This keeps
 // an older upload from claiming or completing a newer local version.
 pub(crate) fn set_write_state(
+    storage: &StorageRoot,
     instance: &str,
     operation: &PendingWrite,
     from: &str,
     to: &str,
     error: Option<&str>,
 ) -> Result<(), AccountError> {
-    let count = database()?.execute(
+    let count = database_in(storage)?.execute(
         "UPDATE operation_journal SET state=?1,error_msg=?2,updated_at=strftime('%s','now') WHERE id=?3 AND instance=?4 AND space=?5 AND path=?6 AND op_type='write' AND state=?7 AND staged_file=?8 AND base_file_id IS ?9 AND base_etag IS ?10 AND EXISTS(SELECT 1 FROM operation_parents WHERE operation_id=?3 AND parents=?11 AND destination_parents IS NULL) AND NOT EXISTS(SELECT 1 FROM operation_journal AS fence WHERE fence.instance=?4 AND fence.space=?5 AND fence.error_msg GLOB 'local publication recovery:*') AND (?7!='pending' OR ?1!='uncertain' OR NOT EXISTS (SELECT 1 FROM operation_journal AS previous WHERE previous.instance=?4 AND previous.space=?5 AND previous.path=?6 AND previous.op_type='write' AND previous.id<?3 AND previous.state IN ('pending','conflict','uncertain')))",
         params![to,error,operation.id,instance,operation.space,path_key(&operation.path)?,from,operation.staged,operation.base_id,operation.base_etag,encode_parents(&operation.path,&operation.parents)?],
     ).map_err(|error| sqlite_storage_error(error, "cannot update staged write"))?;
@@ -6204,10 +6842,11 @@ pub(crate) fn set_write_state(
 }
 
 pub(crate) fn write_needs_attention(
+    storage: &StorageRoot,
     instance: &str,
     operation: &PendingWrite,
 ) -> Result<bool, AccountError> {
-    database()?
+    database_in(storage)?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state IN ('conflict','uncertain') AND staged_file=?5 AND base_file_id IS ?6 AND base_etag IS ?7 AND EXISTS(SELECT 1 FROM operation_parents WHERE operation_id=?1 AND parents=?8 AND destination_parents IS NULL))",
             params![operation.id, instance, operation.space, path_key(&operation.path)?, operation.staged, operation.base_id, operation.base_etag, encode_parents(&operation.path, &operation.parents)?],
@@ -6217,13 +6856,14 @@ pub(crate) fn write_needs_attention(
 }
 
 pub(crate) fn set_namespace_state(
+    storage: &StorageRoot,
     instance: &str,
     operation: &NamespaceOperation,
     from: &str,
     to: &str,
     error: Option<&str>,
 ) -> Result<(), AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| sqlite_storage_error(error, "cannot begin namespace state transition"))?;
@@ -6259,27 +6899,26 @@ fn set_namespace_state_in(
 /// Parent version advancement cannot outlive its child success receipt.
 /// This recovery/confirmation transaction intentionally has no quota gate.
 pub(crate) fn confirm_namespace(
+    storage: &StorageRoot,
     instance: &str,
     operation: &NamespaceOperation,
     confirmation: Option<&str>,
     rebase: Option<(&NamespaceOperation, &str)>,
 ) -> Result<(), AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| AccountError::new("cannot begin namespace confirmation"))?;
-    let snapshot = serde_json::to_string(operation)
-        .map_err(|_| AccountError::new("cannot encode namespace confirmation"))?;
-    let saved: Option<(String,String)> = tx.query_row(
-        "SELECT snapshot,extra FROM mutation_receipts WHERE operation_id=?1 AND kind='namespace'",
-        [operation.id], |row| Ok((row.get(0)?,row.get(1)?)),
-    ).optional().map_err(|_| AccountError::new("cannot inspect namespace receipt"))?;
-    let Some((recorded, extra)) = saved else {
-        return Err(AccountError::new(
-            "namespace receipt unavailable; outcome remains uncertain",
-        ));
-    };
-    if recorded != snapshot {
+    let (issuer, subject) = namespace_receipt::principal(&tx, instance)?;
+    let receipt = namespace_receipt::load(
+        storage,
+        &tx,
+        instance,
+        (&issuer, &subject),
+        operation.id,
+        namespace_receipt::Phase::Pending,
+    )?;
+    if receipt.operation() != operation {
         return Err(AccountError::new(
             "namespace receipt changed; outcome remains uncertain",
         ));
@@ -6289,9 +6928,7 @@ pub(crate) fn confirm_namespace(
             || operation.path.len() < 2
             || parent.path != operation.path[..operation.path.len() - 1]
             || parent.kind != "rmdir"
-            || extra
-                != serde_json::to_string(&Some(parent))
-                    .map_err(|_| AccountError::new("cannot encode parent rebase"))?
+            || receipt.rebase() != Some(parent)
         {
             return Err(AccountError::new(
                 "parent rebase differs from successful receipt",
@@ -6301,6 +6938,7 @@ pub(crate) fn confirm_namespace(
         #[cfg(feature = "fault-injection")]
         crate::wait_test_window("CIRRUS_TEST_NAMESPACE_REBASE_WINDOW")?;
     }
+    receipt.promote(&tx)?;
     set_namespace_state_in(
         &tx,
         instance,
@@ -6313,10 +6951,11 @@ pub(crate) fn confirm_namespace(
 }
 
 pub(crate) fn namespace_needs_attention(
+    storage: &StorageRoot,
     instance: &str,
     operation: &NamespaceOperation,
 ) -> Result<bool, AccountError> {
-    database()?
+    database_in(storage)?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type=?5 AND staged_file=?6 AND state IN ('conflict','uncertain'))",
             params![operation.id, instance, operation.space, path_key(&operation.path)?, operation.kind, operation.token],
@@ -6326,6 +6965,7 @@ pub(crate) fn namespace_needs_attention(
 }
 
 pub(crate) fn set_tree_state(
+    storage: &StorageRoot,
     instance: &str,
     operation: &TreeMove,
     from: &str,
@@ -6334,7 +6974,7 @@ pub(crate) fn set_tree_state(
 ) -> Result<(), AccountError> {
     let entry = serde_json::to_string(&operation.entry)
         .map_err(|_| AccountError::new("invalid directory metadata"))?;
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| sqlite_storage_error(error, "cannot begin tree state transition"))?;
@@ -6349,6 +6989,15 @@ pub(crate) fn set_tree_state(
         return Err(error);
     }
     if to == "synced" {
+        let snapshot = serde_json::to_string(operation)
+            .map_err(|_| AccountError::new("cannot encode tree verification"))?;
+        let retained = tx.execute("UPDATE mutation_receipts SET kind='tree-verified' WHERE operation_id=?1 AND kind='tree' AND snapshot=?2",params![operation.id,snapshot])
+            .map_err(|_|AccountError::new("cannot retain tree verification"))?;
+        if retained != 1 {
+            return Err(AccountError::new(
+                "tree receipt unavailable or changed; outcome remains uncertain",
+            ));
+        }
         finish_sync_records(&tx, instance, &operation.space, operation.id)?;
     }
     tx.commit()
@@ -6368,12 +7017,13 @@ fn finish_sync_records(
     .map_err(|error| sqlite_storage_error(error, "cannot record verified operation time"))?;
     tx.execute("DELETE FROM sync_reads WHERE operation_id=?1", [id])
         .map_err(|error| sqlite_storage_error(error, "cannot retire operation reads"))?;
-    tx.execute("DELETE FROM mutation_receipts WHERE operation_id=?1", [id])
+    tx.execute("DELETE FROM mutation_receipts WHERE operation_id=?1 AND kind NOT IN ('namespace-verified','tree-verified')", [id])
         .map_err(|error| sqlite_storage_error(error, "cannot retire mutation receipt"))?;
     Ok(())
 }
 
 pub(crate) fn confirm_write(
+    storage: &StorageRoot,
     instance: &str,
     operation: &PendingWrite,
     verified: &FileVersion,
@@ -6386,7 +7036,7 @@ pub(crate) fn confirm_write(
             "verified upload does not match staged write",
         ));
     }
-    let mut conn = database()?;
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| sqlite_storage_error(error, "cannot begin upload confirmation"))?;
@@ -6436,6 +7086,7 @@ pub(crate) fn confirm_write(
 }
 
 pub(crate) fn confirmed_write(
+    storage: &StorageRoot,
     version: &FileVersion,
 ) -> Result<Option<(String, String)>, AccountError> {
     let Some(id) = version
@@ -6452,7 +7103,7 @@ pub(crate) fn confirmed_write(
     else {
         return Ok(None);
     };
-    database()?.query_row(
+    database_in(storage)?.query_row(
         "SELECT confirmed_file_id,confirmed_etag FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state='synced' AND staged_file=?5 AND confirmed_file_id IS NOT NULL AND confirmed_etag IS NOT NULL AND NOT EXISTS (SELECT 1 FROM operation_journal AS newer WHERE newer.instance=?2 AND newer.space=?3 AND newer.path=?4 AND newer.id>?1 AND newer.state!='resolved')",
         params![id,version.instance,version.space,path_key(&version.path)?,staged],
         |row| Ok((row.get(0)?,row.get(1)?)),
@@ -6462,32 +7113,38 @@ pub(crate) fn confirmed_write(
 // A verified upload does not discard its immutable local bytes. This is an
 // exact version cache, not a pathname fallback or proof of current remoteness.
 pub(crate) fn confirmed_local_range(
+    storage: &StorageRoot,
     version: &FileVersion,
     offset: u64,
     length: u32,
 ) -> Result<Option<Vec<u8>>, AccountError> {
-    confirmed_range_at(version, &version.path, offset, length)
+    confirmed_range_at(storage, version, &version.path, offset, length)
 }
 
 fn confirmed_range_at(
+    storage: &StorageRoot,
     version: &FileVersion,
     journal_path: &[String],
     offset: u64,
     length: u32,
 ) -> Result<Option<Vec<u8>>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     check_retained_identity(&conn, &version.instance, &version.space)?;
     let root: Option<String> = conn.query_row("SELECT j.staged_file FROM operation_journal j JOIN verified_uploads v ON v.operation_id=j.id JOIN dirty_roots r ON r.root=j.staged_file WHERE j.instance=?1 AND j.space=?2 AND j.path=?3 AND j.op_type='write' AND j.state='synced' AND j.confirmed_file_id=?4 AND j.confirmed_etag=?5 AND v.version=?6 AND r.size=?7 ORDER BY j.id DESC LIMIT 1",params![version.instance,version.space,path_key(journal_path)?,version.id,version.etag,serde_json::to_string(version).map_err(|_|AccountError::new("cannot encode confirmed local version"))?,version.size],|row|row.get(0))
         .optional().map_err(|_|AccountError::new("cannot inspect confirmed local bytes"))?;
-    root.map(|root| StagedSnapshot::open(&root)?.range(offset, length))
+    root.map(|root| StagedSnapshot::open_at(storage, &root)?.range(offset, length))
         .transpose()
 }
 
-pub(crate) fn acknowledge(instance: &str, staged: &str) -> Result<(), AccountError> {
+pub(crate) fn acknowledge(
+    storage_root: &StorageRoot,
+    instance: &str,
+    staged: &str,
+) -> Result<(), AccountError> {
     if staged.len() != 32 || !staged.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AccountError::new("invalid operation token"));
     }
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| AccountError::new("cannot begin acknowledgement"))?;
@@ -6569,17 +7226,19 @@ pub(crate) fn acknowledge(instance: &str, staged: &str) -> Result<(), AccountErr
         .map_err(|_| AccountError::new("cannot commit acknowledgement"))
 }
 
-fn open_staged(name: &str) -> Result<(std::fs::File, std::fs::Metadata), AccountError> {
+fn open_staged_in(
+    root: &StorageRoot,
+    name: &str,
+) -> Result<(std::fs::File, std::fs::Metadata), AccountError> {
     if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AccountError::new("invalid staged file name"));
     }
-    let dir = ownership::staging_dir()?;
-    let fd = fs::openat2(
+    let dir = root.staging_dir()?;
+    let fd = ownership::open_private_file(
         &dir,
         name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| AccountError::new("staged file is unavailable"))?;
     let file = std::fs::File::from(fd);
@@ -6594,6 +7253,8 @@ fn open_staged(name: &str) -> Result<(std::fs::File, std::fs::Metadata), Account
     {
         return Err(AccountError::new("staged file is unsafe"));
     }
+    #[cfg(target_os = "macos")]
+    ownership::darwin_acl::check_file(&file).map_err(AccountError::new)?;
     Ok((file, stat))
 }
 
@@ -6601,6 +7262,8 @@ fn verify_staged_metadata(
     file: &std::fs::File,
     before: &std::fs::Metadata,
 ) -> Result<(), AccountError> {
+    #[cfg(target_os = "macos")]
+    ownership::darwin_acl::check_file(file).map_err(AccountError::new)?;
     let after = file
         .metadata()
         .map_err(|_| AccountError::new("cannot inspect staged file"))?;
@@ -6618,10 +7281,6 @@ fn verify_staged_metadata(
         return Err(AccountError::new("staged file changed"));
     }
     Ok(())
-}
-
-fn staged_size(name: &str) -> Result<u64, AccountError> {
-    Ok(overlay::Overlay::load(name)?.len())
 }
 
 pub(crate) struct StagedSnapshot {
@@ -6648,10 +7307,10 @@ impl StagedSnapshot {
         Ok(format!("{:x}", digest.finalize()))
     }
 
-    pub(crate) fn open(name: &str) -> Result<Self, AccountError> {
+    pub(crate) fn open_at(storage: &StorageRoot, name: &str) -> Result<Self, AccountError> {
         Ok(Self {
             name: name.to_owned(),
-            root: overlay::Overlay::load(name)?,
+            root: overlay::Overlay::load_at(storage, name)?,
         })
     }
 
@@ -6660,7 +7319,7 @@ impl StagedSnapshot {
     }
 
     pub(crate) fn verify(&self) -> Result<(), AccountError> {
-        overlay::Overlay::load(&self.name).map(|_| ())
+        overlay::Overlay::load_at(self.root.storage()?, &self.name).map(|_| ())
     }
 
     pub(crate) fn stream(&self) -> Result<StagedStream, AccountError> {
@@ -6808,7 +7467,16 @@ fn confirmed_removal_matches(
     let parents = load_operation_parents(conn, removal.id, &removal.path)?;
     let Some(expected) = parents.last() else {
         // Root membership is scoped by the exact account/Space and path.
-        return Ok(parent.is_empty() && removal.reset);
+        let matches = parent.is_empty() && removal.reset;
+        if matches {
+            namespace_receipt::require_removal_observation(
+                &snapshot.storage_root()?,
+                conn,
+                instance,
+                removal.id,
+            )?;
+        }
+        return Ok(matches);
     };
     let expected = match expected {
         DirectoryIdentity::Remote(id) => id.clone(),
@@ -6833,6 +7501,14 @@ fn confirmed_removal_matches(
             "confirmed removal parent identity changed or unavailable",
         ));
     }
+    if matches {
+        namespace_receipt::require_removal_observation(
+            &snapshot.storage_root()?,
+            conn,
+            instance,
+            removal.id,
+        )?;
+    }
     Ok(matches)
 }
 
@@ -6842,7 +7518,8 @@ pub(crate) fn apply_staged_entries(
     parent: &[String],
     snapshot: &mut crate::DirectorySnapshot,
 ) -> Result<(), AccountError> {
-    let mut conn = database()?;
+    let storage_root = snapshot.storage_root()?;
+    let mut conn = database_in(&storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot load staged entries"))?;
@@ -6858,32 +7535,41 @@ fn apply_staged_entries_in(
     parent: &[String],
     snapshot: &mut crate::DirectorySnapshot,
 ) -> Result<(), AccountError> {
+    let storage_root = snapshot.storage_root()?;
     snapshot.begin_pending()?;
-    visit_staged_entries_in(conn, instance, space, parent, |name, state| match state {
-        LocalEntry::Reset => snapshot.reset_pending(name),
-        LocalEntry::Present(entry) => snapshot.pending(name, Some(&entry)),
-        LocalEntry::Remove => snapshot.pending(name, None),
-        LocalEntry::ConfirmedRemove(removal) => {
-            if confirmed_removal_matches(conn, (instance, space), &removal, snapshot)? {
-                snapshot.remove_observed(name)?;
-                if removal.reset {
+    visit_staged_entries_in(
+        &storage_root,
+        conn,
+        instance,
+        space,
+        parent,
+        |name, state| match state {
+            LocalEntry::Reset => snapshot.reset_pending(name),
+            LocalEntry::Present(entry) => snapshot.pending(name, Some(&entry)),
+            LocalEntry::Remove => snapshot.pending(name, None),
+            LocalEntry::ConfirmedRemove(removal) => {
+                if confirmed_removal_matches(conn, (instance, space), &removal, snapshot)? {
+                    snapshot.remove_observed(name)?;
+                    if removal.reset {
+                        snapshot.reset_pending(name)
+                    } else {
+                        // A copied MOVE base is historical evidence, not a later
+                        // mutation of the destination's pending local entries.
+                        Ok(())
+                    }
+                } else if removal.reset {
                     snapshot.reset_pending(name)
                 } else {
-                    // A copied MOVE base is historical evidence, not a later
-                    // mutation of the destination's pending local entries.
                     Ok(())
                 }
-            } else if removal.reset {
-                snapshot.reset_pending(name)
-            } else {
-                Ok(())
             }
-        }
-    })?;
+        },
+    )?;
     snapshot.finish_pending()
 }
 
 fn visit_staged_entries_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -6961,7 +7647,7 @@ fn visit_staged_entries_in(
                     id,
                     // Reuse this read transaction. Opening another SQLite reader
                     // here can deadlock a writer waiting for this snapshot to end.
-                    overlay::Overlay::load_in(conn, &staged)?.len(),
+                    overlay::Overlay::load_in_root(storage_root, conn, &staged)?.len(),
                     &staged,
                 )),
                 "mkdir" => Some(Entry::staged_directory(name.clone(), id)),
@@ -6993,22 +7679,24 @@ fn visit_staged_entries_in(
 }
 
 pub(crate) fn offline_directory(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
     owner: Option<(&str, &str)>,
 ) -> Result<crate::DirectorySnapshot, AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect offline directory"))?;
-    let entries = offline_directory_in(&tx, instance, space, path, owner)?;
+    let entries = offline_directory_in(storage_root, &tx, instance, space, path, owner)?;
     tx.commit()
         .map_err(|_| AccountError::new("cannot finish offline directory inspection"))?;
     Ok(entries)
 }
 
-fn offline_directory_in(
+pub(crate) fn offline_directory_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -7038,7 +7726,7 @@ fn offline_directory_in(
     // Resolve every ancestor from the same saved namespace and journal view.
     // No saved observation means unavailable, not an invented empty directory.
     let mut directory = Vec::new();
-    let mut entries = directory_snapshot_in(conn, instance, space, &directory)?
+    let mut entries = directory_snapshot_in_root(storage_root, conn, instance, space, &directory)?
         .ok_or_else(|| AccountError::new("offline directory metadata is unavailable"))?;
     for component in path {
         apply_staged_entries_in(conn, instance, space, &directory, &mut entries)?;
@@ -7049,9 +7737,9 @@ fn offline_directory_in(
         let local = entry.id().starts_with("cirrus-dir:");
         directory.push(component.clone());
         entries = if local {
-            crate::DirectorySnapshot::empty()?
+            crate::DirectorySnapshot::empty_in(storage_root)?
         } else {
-            offline_child_snapshot_in(conn, instance, space, &directory, entry.id())?
+            offline_child_snapshot_in(storage_root, conn, instance, space, &directory, entry.id())?
                 .ok_or_else(|| AccountError::new("offline directory metadata is unavailable"))?
         };
     }
@@ -7060,6 +7748,7 @@ fn offline_directory_in(
 }
 
 fn offline_child_snapshot_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -7067,11 +7756,11 @@ fn offline_child_snapshot_in(
     expected_id: &str,
 ) -> Result<Option<crate::DirectorySnapshot>, AccountError> {
     if let Some(snapshot) =
-        offline_replacement_snapshot_in(conn, instance, space, path, expected_id)?
+        offline_replacement_snapshot_in(storage_root, conn, instance, space, path, expected_id)?
     {
         return Ok(Some(snapshot));
     }
-    if let Some(snapshot) = directory_snapshot_in(conn, instance, space, path)? {
+    if let Some(snapshot) = directory_snapshot_in_root(storage_root, conn, instance, space, path)? {
         if !snapshot.matches_parent(expected_id)? {
             return Err(AccountError::new(
                 "offline directory parent identity changed",
@@ -7096,7 +7785,8 @@ fn offline_child_snapshot_in(
                 return Err(AccountError::new("offline directory MOVE identity differs"));
             }
             if operation.offline {
-                let observed = offline_tree_copy_in(conn, (instance, space), path, &operation)?;
+                let observed =
+                    offline_tree_copy_in(storage_root, conn, (instance, space), path, &operation)?;
                 // Every candidate for this destination must be unique, even
                 // when the immutable proof is independently complete.
                 if observed.is_none() {
@@ -7125,10 +7815,11 @@ fn offline_child_snapshot_in(
             }
             // The original snapshot must itself remain identity-bound. Never
             // promote an arbitrary orphan merely because its JSON was copied.
-            let source = directory_snapshot_in(conn, instance, space, &operation.source)?
-                .ok_or_else(|| {
-                    AccountError::new("offline directory MOVE source identity is unavailable")
-                })?;
+            let source =
+                directory_snapshot_in_root(storage_root, conn, instance, space, &operation.source)?
+                    .ok_or_else(|| {
+                        AccountError::new("offline directory MOVE source identity is unavailable")
+                    })?;
             if !source.matches_parent(expected_id)? {
                 return Err(AccountError::new(
                     "offline directory MOVE source identity is unavailable",
@@ -7140,13 +7831,21 @@ fn offline_child_snapshot_in(
     if !copied {
         return Ok(None);
     }
-    directory_snapshot_with_parent_in(conn, instance, space, path, Some(expected_id))
+    directory_snapshot_with_parent_in_root(
+        storage_root,
+        conn,
+        instance,
+        space,
+        path,
+        Some(expected_id),
+    )
 }
 
 // Replacement preflight observes the *old* destination; ordinary cache
 // publication may revoke/reuse that path. Serve only the immutable, admitted
 // source proof, never the observed target under the source's identity.
 fn offline_replacement_snapshot_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -7171,6 +7870,7 @@ fn offline_replacement_snapshot_in(
             let mut actual = Vec::with_capacity(operation.destination_parents.len());
             for index in 0..operation.destination.len() - 1 {
                 let entries = offline_directory_in(
+                    storage_root,
                     conn,
                     instance,
                     space,
@@ -7200,7 +7900,7 @@ fn offline_replacement_snapshot_in(
                     "offline replacement source proof changed",
                 ));
             }
-            let mut snapshot = crate::DirectorySnapshot::empty()?;
+            let mut snapshot = crate::DirectorySnapshot::empty_in(storage_root)?;
             snapshot.set_remote_parent(&id, &etag)?;
             let mut stmt = conn
                 .prepare("SELECT value FROM json_each(?1)")
@@ -7238,11 +7938,16 @@ fn tree_target_proof_in(
     Ok(())
 }
 
-pub(crate) fn tree_target_proof(instance: &str, operation: &TreeMove) -> Result<(), AccountError> {
-    tree_target_proof_in(&database()?, instance, operation)
+pub(crate) fn tree_target_proof(
+    storage: &StorageRoot,
+    instance: &str,
+    operation: &TreeMove,
+) -> Result<(), AccountError> {
+    tree_target_proof_in(&database_in(storage)?, instance, operation)
 }
 
 fn offline_tree_copy_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     location: (&str, &str),
     path: &[String],
@@ -7258,7 +7963,8 @@ fn offline_tree_copy_in(
     };
     let mut actual = Vec::with_capacity(parent.len());
     for index in 0..parent.len() {
-        let entries = offline_directory_in(conn, instance, space, &parent[..index], None)?;
+        let entries =
+            offline_directory_in(storage_root, conn, instance, space, &parent[..index], None)?;
         let entry = entries
             .get(&parent[index])?
             .filter(Entry::is_directory)
@@ -7275,8 +7981,15 @@ fn offline_tree_copy_in(
     )? {
         return Err(AccountError::new("offline tree destination parent changed"));
     }
-    let snapshot = directory_snapshot_with_parent_in(conn, instance, space, path, Some(&id))?
-        .ok_or_else(|| AccountError::new("offline tree copied observation unavailable"))?;
+    let snapshot = directory_snapshot_with_parent_in_root(
+        storage_root,
+        conn,
+        instance,
+        space,
+        path,
+        Some(&id),
+    )?
+    .ok_or_else(|| AccountError::new("offline tree copied observation unavailable"))?;
     if id != operation.entry.id()
         || Some(etag.as_str()) != operation.entry.etag()
         || generation != copied_generation
@@ -7289,6 +8002,7 @@ fn offline_tree_copy_in(
 }
 
 pub(crate) fn observed_parent_identities(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
@@ -7296,9 +8010,9 @@ pub(crate) fn observed_parent_identities(
     let mut parents = Vec::with_capacity(path.len().saturating_sub(1));
     for index in 0..path.len().saturating_sub(1) {
         let parent = &path[..index];
-        let mut entries = match directory_snapshot(instance, space, parent)? {
+        let mut entries = match directory_snapshot_at(storage_root, instance, space, parent)? {
             Some(entries) => entries,
-            None => crate::DirectorySnapshot::empty()?,
+            None => crate::DirectorySnapshot::empty_in(storage_root)?,
         };
         apply_staged_entries(instance, space, parent, &mut entries)?;
         let entry = entries
@@ -7311,6 +8025,7 @@ pub(crate) fn observed_parent_identities(
 }
 
 pub(crate) fn staged_version(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
@@ -7322,7 +8037,7 @@ pub(crate) fn staged_version(
     else {
         return Ok(None);
     };
-    let conn = database()?;
+    let conn = database_in(storage)?;
     // Ordinary handles must identify the current live write, not merely an
     // unchanged historical row. Only explicitly detached retained rows bypass
     // head selection (unlink and replacement-rename keep their open handles).
@@ -7332,7 +8047,7 @@ pub(crate) fn staged_version(
         return Ok(None);
     };
     publication::ensure_clear(&conn, instance, space)?;
-    let size = staged_size(&file)?;
+    let size = overlay::Overlay::load_in_root(storage, &conn, &file)?.len();
     Ok(Some((
         FileVersion {
             instance: instance.to_owned(),
@@ -7347,8 +8062,12 @@ pub(crate) fn staged_version(
     )))
 }
 
-pub(crate) fn has_unresolved(instance: &str, space: Option<&str>) -> Result<bool, AccountError> {
-    database()?
+pub(crate) fn has_unresolved(
+    storage: &StorageRoot,
+    instance: &str,
+    space: Option<&str>,
+) -> Result<bool, AccountError> {
+    database_in(storage)?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND state NOT IN ('synced','resolved'))",
             params![instance, space],
@@ -7357,14 +8076,15 @@ pub(crate) fn has_unresolved(instance: &str, space: Option<&str>) -> Result<bool
         .map_err(|_| AccountError::new("cannot inspect operation journal"))
 }
 
-pub(crate) fn journal(
+pub(crate) fn journal_in(
+    root: &StorageRoot,
     instance: &str,
     space: Option<&str>,
     before: Option<i64>,
 ) -> Result<JournalPage, AccountError> {
     const MAX_ENTRIES: usize = 50;
     const MAX_ENCODED_BYTES: usize = 128 * 1024;
-    let mut conn = database()?;
+    let mut conn = database_in(root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect operation journal"))?;
@@ -7764,8 +8484,10 @@ fn pin_local_state(conn: &Connection) -> Result<[u8; 32], AccountError> {
     Ok(hash.finalize().into())
 }
 
-pub(crate) fn current_pin_local_state() -> Result<[u8; 32], AccountError> {
-    let mut conn = database()?;
+pub(crate) fn current_pin_local_state(
+    storage_root: &StorageRoot,
+) -> Result<[u8; 32], AccountError> {
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect local pin state"))?;
@@ -7777,15 +8499,20 @@ pub(crate) fn current_pin_local_state() -> Result<[u8; 32], AccountError> {
 
 pub(crate) struct SnapshotObservation {
     conn: Connection,
+    root: StorageRoot,
     data_version: i64,
 }
 
-pub(crate) fn begin_snapshot() -> Result<SnapshotObservation, AccountError> {
-    let conn = database()?;
+pub(crate) fn begin_snapshot_in(root: &StorageRoot) -> Result<SnapshotObservation, AccountError> {
+    let conn = database_in(root)?;
     let data_version = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline metadata"))?;
-    Ok(SnapshotObservation { conn, data_version })
+    Ok(SnapshotObservation {
+        conn,
+        root: root.clone(),
+        data_version,
+    })
 }
 
 // A descendant can retain eligibility only through a directory child whose
@@ -7884,6 +8611,11 @@ pub(crate) fn save_directory_snapshot(
     path: &[String],
     entries: &crate::DirectorySnapshot,
 ) -> Result<bool, AccountError> {
+    if observation.root.identity() != entries.storage_root()?.identity() {
+        return Err(AccountError::new(
+            "directory observation storage root changed",
+        ));
+    }
     save_snapshot_json(
         observation,
         instance,
@@ -7903,7 +8635,9 @@ fn removed_directory_copy_compatible(
     path: &[String],
     fresh: &crate::DirectorySnapshot,
 ) -> Result<bool, AccountError> {
-    let Some(saved) = directory_snapshot_in(conn, instance, space, path)? else {
+    let storage_root = fresh.storage_root()?;
+    let Some(saved) = directory_snapshot_in_root(&storage_root, conn, instance, space, path)?
+    else {
         return Ok(false);
     };
     let permits = |entry: &Entry| -> Result<bool, AccountError> {
@@ -7913,9 +8647,9 @@ fn removed_directory_copy_compatible(
         let mut target = path.to_vec();
         target.push(entry.name().to_owned());
         // A successful receipt is proof of the completed DELETE, never a
-        // pending/uncertain request alone. Synced rows retain the same scoped
-        // projection after receipt retirement. No replacement mapping is allowed.
-        let mut stmt = conn.prepare("SELECT j.id,j.base_file_id,j.base_etag FROM operation_journal j LEFT JOIN mutation_receipts r ON r.operation_id=j.id AND r.kind='namespace' JOIN operation_parents p ON p.operation_id=j.id WHERE j.instance=?1 AND j.space=?2 AND j.path=?3 AND j.op_type IN ('rmdir','move-dir-source') AND (j.state='synced' OR (j.state='uncertain' AND json_extract(r.snapshot,'$.id')=j.id AND json_extract(r.snapshot,'$.space')=j.space AND json_extract(r.snapshot,'$.path')=j.path AND json_extract(r.snapshot,'$.kind')=j.op_type AND json_extract(r.snapshot,'$.base_id')=j.base_file_id AND json_extract(r.snapshot,'$.base_etag')=j.base_etag AND json_extract(r.snapshot,'$.token')=j.staged_file AND json_extract(r.snapshot,'$.parents')=p.parents)) ORDER BY j.id")
+        // pending/uncertain request alone. Legacy synced/observed-absent rows
+        // without exact receipts are unknown, never causal removal proof.
+        let mut stmt = conn.prepare("SELECT j.id,j.base_file_id,j.base_etag FROM operation_journal j JOIN mutation_receipts r ON r.operation_id=j.id WHERE j.instance=?1 AND j.space=?2 AND j.path=?3 AND j.op_type IN ('rmdir','move-dir-source') AND ((j.state='synced' AND r.kind='namespace-verified') OR (j.state='uncertain' AND r.kind='namespace')) ORDER BY j.id")
             .map_err(|_|AccountError::new("cannot inspect directory removal receipt"))?;
         let rows = stmt
             .query_map(params![instance, space, path_key(&target)?], |row| {
@@ -8008,13 +8742,14 @@ pub(crate) fn directory_copy_compatible(
     subject: &str,
 ) -> Result<bool, AccountError> {
     let json = entries.json()?;
-    let mut conn = database()?;
+    let storage_root = entries.storage_root()?;
+    let mut conn = database_in(&storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect optional directory publication"))?;
     let identity: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM account_identities WHERE instance=?1 AND issuer=?2 AND subject=?3)",params![instance,issuer,subject],|row|row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline account identity"))?;
-    if let Some(saved) = directory_snapshot_in(&tx, instance, space, path)?
+    if let Some(saved) = directory_snapshot_in_root(&storage_root, &tx, instance, space, path)?
         && !entries.matches_parent(&saved.remote_parent()?.0)?
     {
         return Ok(false);
@@ -8056,7 +8791,8 @@ pub(crate) fn directory_copy_compatible(
     Ok(identity && compatible && descendants_known)
 }
 
-fn snapshot_reservation(
+fn snapshot_reservation_in(
+    root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -8071,7 +8807,7 @@ fn snapshot_reservation(
             "cirrus lab snapshot admission: pid={} thread={:?} path={path:?} enabled={}",
             std::process::id(),
             std::thread::current().id(),
-            crate::storage::limits::view()?.limits.is_some()
+            crate::storage::limits::view_in(root)?.limits.is_some()
         );
     }
     let owner: (String, String) = conn
@@ -8094,7 +8830,7 @@ fn snapshot_reservation(
     // Complete bounded JSON already exists; no lease spans DAV, and this cap
     // belongs only to the publication connection, never recovery connections.
     let reservation =
-        SqlReservation::begin(Store::State, Some(conn), json.len() as u64, metadata, false).inspect_err(|error| {
+        SqlReservation::begin_in(root, Store::State, Some(conn), json.len() as u64, metadata, false).inspect_err(|error| {
             #[cfg(feature = "fault-injection")]
             if std::env::var_os("CIRRUS_TEST_BLOCKER_TRACE").is_some() {
                 eprintln!("cirrus lab snapshot refusal: path={path:?} storage_busy={} retryable_read={} unauthorized={}", error.storage_busy, error.retryable_read, error.unauthorized);
@@ -8117,8 +8853,15 @@ fn save_snapshot_json(
     json: &str,
     self_version: &(String, String),
 ) -> Result<bool, AccountError> {
-    let reservation =
-        snapshot_reservation(&observation.conn, instance, space, path, json, self_version)?;
+    let reservation = snapshot_reservation_in(
+        &observation.root,
+        &observation.conn,
+        instance,
+        space,
+        path,
+        json,
+        self_version,
+    )?;
     // Move after the guard declaration: SQLite closes/rolls back before the
     // durable allowance is released, including all early-return paths.
     let mut observation = observation;
@@ -8135,7 +8878,10 @@ fn save_snapshot_json(
     write_snapshot_json(&tx, instance, space, path, json, self_version)?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(&observation.root)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -8143,31 +8889,34 @@ fn save_snapshot_json(
     Ok(true)
 }
 
-pub(crate) fn directory_snapshot(
+pub(crate) fn directory_snapshot_at(
+    root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<Option<crate::DirectorySnapshot>, AccountError> {
-    let mut database = database()?;
+    let mut database = database_in(root)?;
     let tx = database
         .transaction()
         .map_err(|_| AccountError::new("cannot load directory snapshot"))?;
-    let snapshot = directory_snapshot_in(&tx, instance, space, path)?;
+    let snapshot = directory_snapshot_in_root(root, &tx, instance, space, path)?;
     tx.commit()
         .map_err(|_| AccountError::new("cannot finish directory snapshot"))?;
     Ok(snapshot)
 }
 
-fn directory_snapshot_in(
+fn directory_snapshot_in_root(
+    root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<Option<crate::DirectorySnapshot>, AccountError> {
-    directory_snapshot_with_parent_in(conn, instance, space, path, None)
+    directory_snapshot_with_parent_in_root(root, conn, instance, space, path, None)
 }
 
-fn directory_snapshot_with_parent_in(
+fn directory_snapshot_with_parent_in_root(
+    root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
@@ -8188,7 +8937,7 @@ fn directory_snapshot_with_parent_in(
         Some("array") => (),
         _ => return Err(AccountError::new("invalid offline metadata")),
     }
-    let mut snapshot = crate::DirectorySnapshot::empty()?;
+    let mut snapshot = crate::DirectorySnapshot::empty_in(root)?;
     let proof: Option<(String,String)> = conn.query_row("SELECT s.self_id,s.self_etag FROM snapshots s JOIN account_identities a ON a.instance=s.instance AND a.issuer=s.issuer AND a.subject=s.subject WHERE s.instance=?1 AND s.space=?2 AND s.path=?3 AND s.local_operation IS NULL",params![instance,space,key], |row|Ok((row.get(0)?,row.get(1)?)))
         .optional().map_err(|_| AccountError::new("invalid saved directory observation"))?;
     let Some((self_id, self_etag)) = proof else {
@@ -8260,29 +9009,36 @@ fn check_pin_operations(
 }
 
 pub(crate) fn check_pin_path(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     root: &[String],
 ) -> Result<(), AccountError> {
-    check_pin_operations(&database()?, instance, space, root)
+    check_pin_operations(&database_in(storage_root)?, instance, space, root)
 }
 
 pub(crate) struct PinSnapshot {
     conn: Connection,
+    storage: StorageRoot,
     data_version: i64,
 }
 
-pub(crate) fn begin_pin_snapshot(
+pub(crate) fn begin_pin_snapshot_in(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     root: &[String],
 ) -> Result<PinSnapshot, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     check_pin_operations(&conn, instance, space, root)?;
     let data_version = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline metadata"))?;
-    Ok(PinSnapshot { conn, data_version })
+    Ok(PinSnapshot {
+        conn,
+        storage: storage.clone(),
+        data_version,
+    })
 }
 
 pub(crate) fn save_pin_snapshot(
@@ -8293,6 +9049,9 @@ pub(crate) fn save_pin_snapshot(
     path: &[String],
     entries: &crate::DirectorySnapshot,
 ) -> Result<(), AccountError> {
+    if snapshot.storage.identity() != entries.storage_root()?.identity() {
+        return Err(AccountError::new("pin observation storage root changed"));
+    }
     #[cfg(feature = "fault-injection")]
     if let Some(marker) = std::env::var_os("CIRRUS_TEST_PIN_SNAPSHOT_WINDOW") {
         let marker = Path::new(&marker);
@@ -8310,7 +9069,8 @@ pub(crate) fn save_pin_snapshot(
         }
     }
     let json = entries.json()?;
-    let reservation = snapshot_reservation(
+    let reservation = snapshot_reservation_in(
+        &snapshot.storage,
         &snapshot.conn,
         instance,
         space,
@@ -8335,7 +9095,10 @@ pub(crate) fn save_pin_snapshot(
     crate::wait_test_window("CIRRUS_TEST_PIN_PEER_SNAPSHOT_COMMIT_WINDOW")?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(&snapshot.storage)?
+        .limits
+        .is_some()
+    {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()
@@ -8345,6 +9108,7 @@ pub(crate) fn save_pin_snapshot(
 enum PinScratch {
     Anonymous(std::sync::Arc<std::fs::File>),
     Reserved(crate::storage::sql_reservation::SqlReservation),
+    Downloaded(crate::storage::sql_reservation::PinDownload),
 }
 
 impl PinScratch {
@@ -8352,19 +9116,25 @@ impl PinScratch {
         match self {
             Self::Anonymous(file) => Ok(file),
             Self::Reserved(reservation) => reservation.scratch(),
+            Self::Downloaded(download) => download.file(),
         }
     }
-    fn validate(&self, conn: &Connection) -> Result<(), AccountError> {
+    fn release_download(self) -> Result<Self, AccountError> {
         match self {
-            Self::Anonymous(_) if crate::storage::limits::view()?.limits.is_none() => Ok(()),
-            Self::Anonymous(_) => Err(AccountError::new(crate::storage::limits::PRESSURE)),
-            Self::Reserved(reservation) => reservation.validate(conn),
+            Self::Reserved(reservation) => Ok(Self::Downloaded(reservation.release_download()?)),
+            other => Ok(other),
         }
     }
 }
 
-fn pin_scratch(conn: &Connection, bytes: u64, metadata: u64) -> Result<PinScratch, AccountError> {
-    if let Some(reservation) = crate::storage::sql_reservation::SqlReservation::begin(
+fn pin_scratch_in(
+    root: &StorageRoot,
+    conn: &Connection,
+    bytes: u64,
+    metadata: u64,
+) -> Result<PinScratch, AccountError> {
+    if let Some(reservation) = crate::storage::sql_reservation::SqlReservation::begin_in(
+        root,
         crate::storage::sql_reservation::Store::State,
         Some(conn),
         bytes,
@@ -8373,14 +9143,13 @@ fn pin_scratch(conn: &Connection, bytes: u64, metadata: u64) -> Result<PinScratc
     )? {
         return Ok(PinScratch::Reserved(reservation));
     }
-    let dir = ownership::staging_dir()?;
+    let dir = root.staging_dir()?;
     let name = namespace_token()?;
-    let fd = fs::openat2(
+    let fd = ownership::open_private_file(
         &dir,
         name.as_str(),
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|error| {
         if error == rustix::io::Errno::NOSPC {
@@ -8392,6 +9161,10 @@ fn pin_scratch(conn: &Connection, bytes: u64, metadata: u64) -> Result<PinScratc
     fs::unlinkat(&dir, name.as_str(), AtFlags::empty()).map_err(|_| {
         AccountError::new("cannot unlink pin scratch file; inspect staging directory")
     })?;
+    // Already anonymous: closing on ACL refusal is the original cleanup guard.
+    // Snapshot only (nlink is now zero), before any pin payload can be written.
+    #[cfg(target_os = "macos")]
+    ownership::darwin_acl::checked_fd(&fd).map_err(AccountError::new)?;
     // Persist the unlink before writing so a crash cannot resurrect pin bytes
     // as an apparently dirty staged file.
     fs::fsync(&dir).map_err(|error| {
@@ -8402,13 +9175,20 @@ fn pin_scratch(conn: &Connection, bytes: u64, metadata: u64) -> Result<PinScratc
         }
     })?;
     Ok(PinScratch::Anonymous(crate::storage::track(
+        root,
         std::fs::File::from(fd),
         crate::storage::AnonymousKind::Pin,
     )))
 }
 
 pub(crate) fn replace_pin<F, V, T>(
-    account: (&str, &str),
+    storage_root: &StorageRoot,
+    account: (
+        &cirrus_runtime::RuntimeDir,
+        &std::sync::atomic::AtomicBool,
+        &str,
+        &str,
+    ),
     root: &[String],
     tree: &PinTree,
     retry_state: Option<&[u8; 32]>,
@@ -8421,7 +9201,7 @@ where
     V: FnMut(&FileVersion) -> Result<(), AccountError>,
     T: FnOnce() -> Result<(), AccountError>,
 {
-    let (instance, space) = account;
+    let (runtime, cancelled, instance, space) = account;
     let total_bytes = tree
         .files
         .iter()
@@ -8431,16 +9211,20 @@ where
     // Declare before the connection so the allowance outlives SQLite close
     // (including rollback/checkpoint work on error paths).
     let scratch_file;
-    let mut conn = database()?;
+    let publication;
+    let mut conn = database_in(storage_root)?;
     // Keep this connection without a transaction so other writers can proceed;
     // its data version fences the later publication against intervening commits.
-    let data_version: i64 = conn
+    let mut data_version: i64 = conn
         .pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline metadata"))?;
     let root_path = root;
     check_pin_operations(&conn, instance, space, root_path)?;
     // Key/version JSON is disk row input too; do not estimate BLOB payload alone.
-    let metadata = if crate::storage::limits::view()?.limits.is_some() {
+    let metadata = if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
         let mut bytes = path_key(root_path)?.len() as u64;
         for version in &tree.files {
             let chunks = version.size.div_ceil(CHUNK).max(1);
@@ -8467,10 +9251,10 @@ where
     } else {
         0
     };
-    scratch_file = pin_scratch(&conn, total_bytes, metadata)?;
-    if let PinScratch::Reserved(reservation) = &scratch_file {
-        reservation.bound_pages(&conn)?;
-    }
+    // Keep preallocated bytes named/charged, but release the planning State
+    // allowance before any DAV request. Publication gets a fresh allowance.
+    scratch_file =
+        pin_scratch_in(storage_root, &conn, total_bytes, metadata)?.release_download()?;
     let mut scratch = scratch_file.file()?;
     let mut chunk_digests = Vec::new();
     for version in &tree.files {
@@ -8526,6 +9310,31 @@ where
         verify(version)?;
     }
     verify_tree()?;
+    // Downloads and remote verification must finish before excluding staging.
+    // An admitted staging turn must finish or cause immediate refusal, never
+    // a shared-to-exclusive upgrade or a wait while owning a State allowance.
+    let _owner = ownership::acquire_offline_exclusive_in(storage_root, runtime)?;
+    protect_pin_originals(
+        storage_root,
+        &mut conn,
+        instance,
+        space,
+        root_path,
+        &mut data_version,
+        cancelled,
+    )?;
+    publication = crate::storage::sql_reservation::SqlReservation::begin_in(
+        storage_root,
+        crate::storage::sql_reservation::Store::State,
+        Some(&conn),
+        total_bytes,
+        metadata,
+        false,
+    )?;
+    if let Some(reservation) = &publication {
+        reservation.bound_pages(&conn)?;
+    }
+    let mut scratch = scratch_file.file()?;
     scratch
         .seek(SeekFrom::Start(0))
         .map_err(|_| AccountError::new("cannot read pin scratch file"))?;
@@ -8546,12 +9355,14 @@ where
     {
         return Err(AccountError::new(PIN_SNAPSHOT_INTERRUPTED));
     }
-    if !snapshots_match(&tx, instance, space, root_path, tree)? {
+    if !snapshots_match(storage_root, &tx, instance, space, root_path, tree)? {
         return Err(AccountError::new(
             "offline metadata changed during pinning; saved metadata does not match the pin",
         ));
     }
     let root = path_key(root_path)?;
+    check_retained_identity(&tx, instance, space)?;
+    check_pin_originals(storage_root, &tx, instance, space, &root, cancelled)?;
     for table in ["chunks", "files", "pins"] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE instance=?1 AND space=?2 AND root=?3"),
@@ -8613,7 +9424,14 @@ where
     .map_err(|error| sqlite_storage_error(error, "cannot save pin"))?;
     #[cfg(feature = "fault-injection")]
     repin_stop("before-commit");
-    scratch_file.validate(&tx)?;
+    if let Some(reservation) = &publication {
+        reservation.validate(&tx)?;
+    } else if crate::storage::limits::view_in(storage_root)?
+        .limits
+        .is_some()
+    {
+        return Err(AccountError::new(crate::storage::limits::PRESSURE));
+    }
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_PIN_COMMIT_WINDOW")?;
     tx.commit()
@@ -8626,11 +9444,12 @@ where
 // Explicit local management addresses retained state, not the currently loaded
 // keyring account. Never adopt unbound data or infer a new authenticated Space.
 // Keep this check in the same transaction as inspection/removal.
-pub(crate) fn mount_identity(
+pub(crate) fn mount_identity_in(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
 ) -> Result<(String, String), AccountError> {
-    database()?.query_row("SELECT a.issuer,a.subject FROM account_identities a JOIN sync_spaces s ON s.instance=a.instance AND s.issuer=a.issuer AND s.subject=a.subject WHERE a.instance=?1 AND s.space=?2 AND a.issuer<>'' AND a.subject<>''", params![instance,space], |row| Ok((row.get(0)?,row.get(1)?)))
+    database_in(storage)?.query_row("SELECT a.issuer,a.subject FROM account_identities a JOIN sync_spaces s ON s.instance=a.instance AND s.issuer=a.issuer AND s.subject=a.subject WHERE a.instance=?1 AND s.space=?2 AND a.issuer<>'' AND a.subject<>''", params![instance,space], |row| Ok((row.get(0)?,row.get(1)?)))
         .optional().map_err(|_| AccountError::new("cannot inspect offline mount identity"))?
         .ok_or_else(|| AccountError::new("offline mount requires matching retained account and verified Space activation"))
 }
@@ -8663,13 +9482,33 @@ pub(crate) fn check_retained_identity(
     Ok(())
 }
 
-pub(crate) fn unpin(instance: &str, space: &str, root: &[String]) -> Result<(), AccountError> {
-    let mut conn = database()?;
+pub(crate) fn unpin(
+    storage_root: &StorageRoot,
+    instance: &str,
+    space: &str,
+    root: &[String],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    // Caller holds exclusive offline account ownership across this writer:
+    // no new staging candidate can cross the dependency scan/delete boundary.
+    let mut conn = database_in(storage_root)?;
+    let mut version = pin_data_version(&conn)?;
+    protect_pin_originals(
+        storage_root,
+        &mut conn,
+        instance,
+        space,
+        root,
+        &mut version,
+        cancelled,
+    )?;
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| AccountError::new("cannot start offline transaction"))?;
+    check_pin_data_version(&tx, version)?;
     check_retained_identity(&tx, instance, space)?;
     let root = path_key(root)?;
+    check_pin_originals(storage_root, &tx, instance, space, &root, cancelled)?;
     for table in ["chunks", "files", "pins"] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE instance=?1 AND space=?2 AND root=?3"),
@@ -8679,6 +9518,533 @@ pub(crate) fn unpin(instance: &str, space: &str, root: &[String]) -> Result<(), 
     }
     tx.commit()
         .map_err(|_| AccountError::new("cannot commit offline unpin"))
+}
+
+// Caller holds exclusive account ownership and the publication/removal writer.
+// Replacing a pin destroys its originals just as unpin does, even if only
+// resolved recovery interpretations (possibly at MOVE aliases) still need it.
+fn check_pin_originals(
+    storage_root: &StorageRoot,
+    tx: &Connection,
+    instance: &str,
+    space: &str,
+    root: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    check_originals_in(
+        storage_root,
+        tx,
+        instance,
+        space,
+        PinOriginalScope::Owner(root),
+        cancelled,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PinOriginalScope<'a> {
+    Owner(&'a str),
+    // JSON array of canonical path keys. Restrict dependency matching to
+    // transformed files, not unaffected siblings in an ancestor pin.
+    Moving(&'a str),
+}
+
+fn check_originals_in(
+    storage_root: &StorageRoot,
+    tx: &Connection,
+    instance: &str,
+    space: &str,
+    scope: PinOriginalScope<'_>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    let mut after = 0;
+    let mut budget = overlay::OriginalBudget::new();
+    loop {
+        check_pin_cancelled(cancelled)?;
+        let page = pin_original_page(storage_root, tx, instance, space, scope, after)?;
+        if page.is_empty() {
+            break;
+        }
+        for (id, overlay) in page {
+            after = id;
+            if !overlay.originals_independent_in(tx, &mut budget, cancelled)? {
+                return Err(AccountError::new(
+                    "local pin protection incomplete; pin retained; required original bytes are unavailable or storage is full",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pin_original_page(
+    storage_root: &StorageRoot,
+    tx: &Connection,
+    instance: &str,
+    space: &str,
+    scope: PinOriginalScope<'_>,
+    after: i64,
+) -> Result<Vec<(i64, overlay::Overlay)>, AccountError> {
+    // Include unpublished registered candidates and all historical roots,
+    // not just currently visible/pending journal heads. Resolved/detached
+    // and synced recovery interpretations are intentional retained data.
+    // Resource/version matching is conservative across MOVE paths, not
+    // permission to read an unproved alias. Check manifests too: missing
+    // active file rows must not hide a potential dependency. Filter before
+    // decoding so unrelated retained roots need no manifest/file access.
+    let (root, paths) = match scope {
+        PinOriginalScope::Owner(root) => (Some(root), None),
+        PinOriginalScope::Moving(paths) => (None, Some(paths)),
+    };
+    let mut statement = tx.prepare("SELECT r.rowid,CASE WHEN length(r.root)<=24000 THEN r.root END,CASE WHEN length(r.base)<=65536 THEN r.base END FROM dirty_roots r WHERE r.rowid>?1 AND json_extract(r.base,'$.instance')=?2 AND json_extract(r.base,'$.space')=?3 AND (EXISTS(SELECT 1 FROM files f WHERE f.instance=?2 AND f.space=?3 AND (?4 IS NULL OR f.root=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM json_each(?5) p WHERE f.path=p.value OR substr(f.path,1,length(p.value))=substr(p.value,1,length(p.value)-1)||',')) AND json_extract(f.version,'$.id')=json_extract(r.base,'$.id') AND json_extract(f.version,'$.etag')=json_extract(r.base,'$.etag')) OR EXISTS(SELECT 1 FROM pins p,json_each(p.manifest) f WHERE p.instance=?2 AND p.space=?3 AND (?4 IS NULL OR p.root=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM json_each(?5) q WHERE json_extract(f.value,'$.path')=q.value OR substr(json_extract(f.value,'$.path'),1,length(q.value))=substr(q.value,1,length(q.value)-1)||',')) AND json_extract(f.value,'$.id')=json_extract(r.base,'$.id') AND json_extract(f.value,'$.etag')=json_extract(r.base,'$.etag'))) ORDER BY r.rowid LIMIT 32").map_err(|_|AccountError::new("cannot inspect pin original dependencies; pin retained"))?;
+    let page = statement
+        .query_map(params![after, instance, space, root, paths], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| AccountError::new("cannot inspect pin original dependencies; pin retained"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AccountError::new("invalid pin original dependency; pin retained"))?;
+    drop(statement);
+    let mut roots = Vec::new();
+    for (id, name, encoded) in page {
+        let overlay = overlay::Overlay::load_in_root(storage_root, tx, &name)?;
+        if overlay.original_base_json()?.as_deref() != Some(encoded.as_str()) {
+            return Err(AccountError::new(
+                "dirty original identity changed; pin retained",
+            ));
+        }
+        roots.push((id, overlay));
+    }
+    Ok(roots)
+}
+
+fn pin_data_version(conn: &Connection) -> Result<i64, AccountError> {
+    conn.pragma_query_value(None, "data_version", |row| row.get(0))
+        .map_err(|_| {
+            AccountError::new("cannot inspect local pin protection generation; pin retained")
+        })
+}
+
+fn check_pin_data_version(conn: &Connection, expected: i64) -> Result<(), AccountError> {
+    if pin_data_version(conn)? != expected {
+        return Err(AccountError::new(PIN_SNAPSHOT_INTERRUPTED));
+    }
+    Ok(())
+}
+
+// Capturing through another connection changes data_version itself. Only
+// accept that advance after revalidating the full pin/root/identity plan;
+// unrelated fresh directory observations are checked again at publication.
+fn pin_protection_state(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+) -> Result<[u8; 32], AccountError> {
+    check_retained_identity(conn, instance, space)?;
+    let mut hash = Sha256::new();
+    hash.update(pin_local_state(conn)?);
+    for sql in [
+        "SELECT json_array(issuer,subject) FROM account_identities WHERE instance=?1 ORDER BY instance",
+        "SELECT json_array(issuer,subject) FROM sync_spaces WHERE instance=?1 AND space=?2 ORDER BY space",
+        "SELECT json_array(root,digest,base) FROM dirty_roots WHERE json_extract(base,'$.instance')=?1 AND json_extract(base,'$.space')=?2 ORDER BY root",
+        "SELECT json_array(root,path,version,verified_complete) FROM files WHERE instance=?1 AND space=?2 ORDER BY root,path",
+        "SELECT json_array(root,path,offset,length(body),digest) FROM chunks WHERE instance=?1 AND space=?2 ORDER BY root,path,offset",
+        "SELECT json_array(p.operation_id,p.path,p.self_id,p.self_etag,p.digest,p.entries) FROM tree_proofs p JOIN operation_journal j ON j.id=p.operation_id WHERE j.instance=?1 AND j.space=?2 ORDER BY p.operation_id,p.path",
+    ] {
+        hash.update(sql.as_bytes());
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|_| AccountError::new("cannot inspect pin protection plan; pin retained"))?;
+        // Named parameters may not occur in every plan query.
+        statement
+            .raw_bind_parameter(1, instance)
+            .map_err(|_| AccountError::new("invalid pin protection plan"))?;
+        if statement.parameter_count() == 2 {
+            statement
+                .raw_bind_parameter(2, space)
+                .map_err(|_| AccountError::new("invalid pin protection plan"))?;
+        }
+        let mut rows = statement.raw_query();
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| AccountError::new("cannot inspect pin protection plan; pin retained"))?
+        {
+            let value: String = row
+                .get(0)
+                .map_err(|_| AccountError::new("invalid pin protection plan; pin retained"))?;
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
+fn protect_pin_originals(
+    storage_root: &StorageRoot,
+    conn: &mut Connection,
+    instance: &str,
+    space: &str,
+    root: &[String],
+    generation: &mut i64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    let root = path_key(root)?;
+    protect_originals(
+        storage_root,
+        conn,
+        instance,
+        space,
+        PinOriginalScope::Owner(&root),
+        generation,
+        cancelled,
+    )
+}
+
+// Caller retains exclusive account/staging ownership through publication.
+// This phase owns no State allowance and no writer transaction: capture needs
+// its own allocation and registration phases. Publication rechecks originals
+// inside the namespace transaction as well as its ordinary generation/plan.
+pub(crate) fn protect_moving_pin_originals(
+    storage_root: &StorageRoot,
+    instance: &str,
+    space: &str,
+    source: &[String],
+    destination: &[String],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    let paths = serde_json::to_string(&[path_key(source)?, path_key(destination)?])
+        .map_err(|_| AccountError::new("invalid pin transformation paths"))?;
+    let mut conn = database_in(storage_root)?;
+    let mut generation = pin_data_version(&conn)?;
+    protect_originals(
+        storage_root,
+        &mut conn,
+        instance,
+        space,
+        PinOriginalScope::Moving(&paths),
+        &mut generation,
+        cancelled,
+    )
+}
+
+fn protect_originals(
+    storage_root: &StorageRoot,
+    conn: &mut Connection,
+    instance: &str,
+    space: &str,
+    scope: PinOriginalScope<'_>,
+    generation: &mut i64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), AccountError> {
+    let tx = conn
+        .transaction()
+        .map_err(|_| AccountError::new("cannot plan local pin protection; pin retained"))?;
+    check_pin_data_version(&tx, *generation)?;
+    let state = pin_protection_state(&tx, instance, space)?;
+    tx.commit()
+        .map_err(|_| AccountError::new("cannot finish local pin protection plan; pin retained"))?;
+    let mut after = 0;
+    let mut budget = overlay::OriginalBudget::new();
+    let mut sources = PinOriginalSources::new();
+    loop {
+        check_pin_cancelled(cancelled)?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| AccountError::new("cannot inspect pin dependencies; pin retained"))?;
+        check_pin_data_version(&tx, *generation)?;
+        let page = pin_original_page(storage_root, &tx, instance, space, scope, after)?;
+        tx.commit().map_err(|_| {
+            AccountError::new("cannot finish pin dependency inspection; pin retained")
+        })?;
+        if page.is_empty() {
+            break;
+        }
+        for (id, overlay) in page {
+            after = id;
+            let mut cursor = 0;
+            loop {
+                check_pin_cancelled(cancelled)?;
+                let tx = conn.transaction().map_err(|_| {
+                    AccountError::new("cannot read original pin bytes; pin retained")
+                })?;
+                check_pin_data_version(&tx, *generation)?;
+                let needed = overlay.next_missing_original_in(&tx, &mut cursor, &mut budget)?;
+                let captured = needed
+                    .map(|(base, offset, length)| {
+                        local_pin_original_in(
+                            storage_root,
+                            &tx,
+                            &base,
+                            offset,
+                            length,
+                            &mut sources,
+                            cancelled,
+                        )
+                        .map(|bytes| (base, offset, bytes))
+                    })
+                    .transpose()?;
+                tx.commit().map_err(|_| {
+                    AccountError::new("cannot finish original pin read; pin retained")
+                })?;
+                let Some((base, offset, bytes)) = captured else {
+                    break;
+                };
+                // No read snapshot, State lease or allocator lock survives
+                // this boundary. capture durably saves before registering.
+                overlay::capture_local_in(storage_root, &base, offset, &bytes)?;
+                let tx = conn.transaction().map_err(|_| {
+                    AccountError::new("cannot revalidate pin protection; pin retained")
+                })?;
+                if pin_protection_state(&tx, instance, space)? != state {
+                    return Err(AccountError::new(PIN_SNAPSHOT_INTERRUPTED));
+                }
+                *generation = pin_data_version(&tx)?;
+                tx.commit().map_err(|_| {
+                    AccountError::new("cannot finish pin protection revalidation; pin retained")
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_pin_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), AccountError> {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(AccountError::new(
+            "local pin protection cancelled; pin retained",
+        ));
+    }
+    Ok(())
+}
+
+fn pin_origin_in(
+    storage_root: &StorageRoot,
+    conn: &Connection,
+    version: &FileVersion,
+) -> Result<FileVersion, AccountError> {
+    let mut origin = version.clone();
+    let mut seen = Vec::new();
+    for _ in 0..128 {
+        let Some(previous) = tree_content_base_in(storage_root, conn, &origin, false)? else {
+            return Ok(origin);
+        };
+        if previous == origin || seen.contains(&previous) {
+            break;
+        }
+        seen.push(origin);
+        origin = previous;
+    }
+    Err(AccountError::new(
+        "ambiguous original pin relocation; pin retained",
+    ))
+}
+
+fn local_pin_original_in(
+    storage_root: &StorageRoot,
+    conn: &Connection,
+    base: &FileVersion,
+    offset: u64,
+    length: u32,
+    sources: &mut PinOriginalSources,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>, AccountError> {
+    let origin = pin_origin_in(storage_root, conn, base)?;
+    // Keep owner identity. Manifests participate too: a missing file row or
+    // verified flag must not make a damaged potential owner disappear.
+    let mut statement = conn.prepare("SELECT CASE WHEN length(root)<=24000 THEN root END,CASE WHEN length(version)<=65536 THEN version END FROM files WHERE instance=?1 AND space=?2 AND json_extract(version,'$.id')=?3 AND json_extract(version,'$.etag')=?4 UNION ALL SELECT CASE WHEN length(p.root)<=24000 THEN p.root END,CASE WHEN length(f.value)<=65536 THEN f.value END FROM pins p,json_each(p.manifest) f WHERE p.instance=?1 AND p.space=?2 AND json_extract(f.value,'$.id')=?3 AND json_extract(f.value,'$.etag')=?4 ORDER BY 1,2")
+        .map_err(|_|AccountError::new("cannot inspect local original source; pin retained"))?;
+    let rows = statement
+        .query_map(
+            params![base.instance, base.space, base.id, base.etag],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|_| AccountError::new("cannot inspect local original source; pin retained"))?;
+    let mut previous = None;
+    let mut agreed = None;
+    let mut owners = 0;
+    for row in rows {
+        check_pin_cancelled(cancelled)?;
+        let (root, encoded) =
+            row.map_err(|_| AccountError::new("invalid local original source; pin retained"))?;
+        // A file row and its manifest entry name the same owner, not two
+        // independent donors. SQL ordering keeps these duplicates adjacent.
+        let key = (
+            root.clone(),
+            <[u8; 32]>::from(Sha256::digest(encoded.as_bytes())),
+        );
+        if previous.as_ref() == Some(&key) {
+            continue;
+        }
+        previous = Some(key);
+        let candidate: FileVersion = serde_json::from_str(&encoded)
+            .map_err(|_| AccountError::new("invalid local original source; pin retained"))?;
+        if candidate.instance != base.instance || candidate.space != base.space {
+            return Err(AccountError::new(
+                "local original source identity changed; pin retained",
+            ));
+        }
+        if pin_origin_in(storage_root, conn, &candidate)? != origin {
+            continue;
+        }
+        owners += 1;
+        if owners > 4096 {
+            return Err(AccountError::new(
+                "local original owner limit reached; pin retained",
+            ));
+        }
+        let pin = pins_matching_in(
+            storage_root,
+            conn,
+            &base.instance,
+            &base.space,
+            false,
+            Some(&root),
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AccountError::new("local original owner is missing; pin retained"))?;
+        let header_matches = path_key(&pin.path)? == root
+            && if pin.tree.is_dir {
+                pin.tree
+                    .directories
+                    .iter()
+                    .any(|(path, _)| path == &pin.path)
+            } else {
+                pin.tree.directories.is_empty()
+                    && pin.tree.files.len() == 1
+                    && candidate.path == pin.path
+            };
+        if !pin.complete
+            || !header_matches
+            || !pin.tree.files.contains(&candidate)
+            || !crate::dav::valid_remote_id(&candidate.id)
+            || !crate::dav::strong_etag(&candidate.etag)
+        {
+            return Err(AccountError::new(
+                "local original owner is incomplete; pin retained",
+            ));
+        }
+        sources.verify_owner_in(conn, &root, &candidate, cancelled)?;
+        sources.charge(u64::from(length))?;
+        let bytes = read_pin_owner_in(conn, &root, &candidate, offset, length)?;
+        if agreed.as_ref().is_some_and(|expected| expected != &bytes) {
+            return Err(AccountError::new(
+                "local original pin owners disagree; pin retained; inspect retained copies before retrying",
+            ));
+        }
+        agreed = Some(bytes);
+    }
+    agreed.ok_or_else(|| AccountError::new(
+        "local pin protection unavailable: exact original bytes missing; pin retained; restore the original pin or export recovery data before retrying",
+    ))
+}
+
+struct PinOriginalSources {
+    remaining: u64,
+    verified: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
+}
+
+impl PinOriginalSources {
+    fn new() -> Self {
+        Self {
+            // Two maximum-sized matching owners can each be fully checked
+            // once and then supply the complete required original union.
+            remaining: 4 * MAX_PIN_BYTES,
+            verified: Default::default(),
+        }
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), AccountError> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
+            AccountError::new("local original owner verification exceeds 4 GiB; pin retained")
+        })?;
+        Ok(())
+    }
+
+    fn verify_owner_in(
+        &mut self,
+        conn: &Connection,
+        root: &str,
+        version: &FileVersion,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), AccountError> {
+        let invalid =
+            || AccountError::new("local original owner integrity check failed; pin retained");
+        let key = (
+            Sha256::digest(root.as_bytes()).into(),
+            Sha256::digest(serde_json::to_vec(version).map_err(|_| invalid())?).into(),
+        );
+        if self.verified.contains(&key) {
+            return Ok(());
+        }
+        if self.verified.len() == 8192 {
+            return Err(AccountError::new(
+                "local original owner witness limit reached; pin retained",
+            ));
+        }
+        let path = path_key(&version.path)?;
+        let mut statement = conn.prepare("SELECT offset,CASE WHEN length(body)<=131072 THEN body END,digest FROM chunks WHERE instance=?1 AND space=?2 AND root=?3 AND path=?4 ORDER BY offset").map_err(|_|invalid())?;
+        let rows = statement
+            .query_map(
+                params![version.instance, version.space, root, path],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|_| invalid())?;
+        let mut position = 0;
+        let mut sha256 = Sha256::new();
+        let mut sha1 = Sha1::new();
+        let mut md5 = Md5::new();
+        for row in rows {
+            check_pin_cancelled(cancelled)?;
+            let (offset, bytes, digest) = row.map_err(|_| invalid())?;
+            if offset != position
+                || position >= version.size
+                || bytes.len() as u64 != (version.size - position).min(CHUNK)
+                || format!("{:x}", Sha256::digest(&bytes)) != digest
+            {
+                return Err(invalid());
+            }
+            self.charge(bytes.len() as u64)?;
+            sha256.update(&bytes);
+            sha1.update(&bytes);
+            md5.update(&bytes);
+            position += bytes.len() as u64;
+        }
+        if position != version.size {
+            return Err(invalid());
+        }
+        let digests = [
+            ("SHA256", format!("{:x}", sha256.finalize())),
+            ("SHA1", format!("{:x}", sha1.finalize())),
+            ("MD5", format!("{:x}", md5.finalize())),
+        ];
+        for checksum in version
+            .checksums
+            .iter()
+            .flat_map(|value| value.split_ascii_whitespace())
+        {
+            let (algorithm, expected) = checksum.split_once(':').ok_or_else(invalid)?;
+            if let Some((_, actual)) = digests
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&algorithm.replace('-', "")))
+                && !expected.eq_ignore_ascii_case(actual)
+            {
+                return Err(invalid());
+            }
+        }
+        self.verified.insert(key);
+        Ok(())
+    }
 }
 
 fn complete_file(
@@ -8721,12 +10087,36 @@ fn complete_file(
 }
 
 fn snapshots_match(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
     root: &[String],
     tree: &PinTree,
 ) -> Result<bool, AccountError> {
+    // A queued tree MOVE is a local intent, not a fresh remote observation.
+    // In particular, replacement keeps the old target in the parent's raw
+    // listing while the destination copy has the source ID. Report metadata
+    // stale for affected pin roots instead of trying to authorize that copy
+    // through the old parent (or making local pin inspection fail entirely).
+    let mut moves = conn.prepare("SELECT j.path,m.destination FROM operation_journal j JOIN directory_moves m ON m.operation_id=j.id WHERE j.instance=?1 AND j.space=?2 AND j.op_type='move-tree' AND (j.state IN ('pending','conflict','uncertain') OR (j.state='resolved' AND j.error_msg='acknowledged locally; remote outcome not asserted'))")
+        .map_err(|_|AccountError::new("cannot inspect pinned tree intents"))?;
+    for row in moves
+        .query_map(params![instance, space], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| AccountError::new("cannot inspect pinned tree intents"))?
+    {
+        let (source, destination) =
+            row.map_err(|_| AccountError::new("invalid pinned tree intent"))?;
+        for encoded in [source, destination] {
+            let path: Vec<String> = serde_json::from_str(&encoded)
+                .map_err(|_| AccountError::new("invalid pinned tree intent"))?;
+            if path.starts_with(root) || root.starts_with(&path) {
+                return Ok(false);
+            }
+        }
+    }
     // Sorted pin files commonly share a large parent. Retain only the latest
     // complete scratch observation inside this publication transaction, rather
     // than decoding/rebuilding that parent for every file.
@@ -8737,7 +10127,7 @@ fn snapshots_match(
         {
             return Ok(Some(snapshot.clone()));
         }
-        let snapshot = directory_snapshot_in(conn, instance, space, path)?;
+        let snapshot = directory_snapshot_in_root(storage_root, conn, instance, space, path)?;
         latest = snapshot
             .as_ref()
             .map(|snapshot| (path.to_vec(), snapshot.clone()));
@@ -8755,7 +10145,43 @@ fn snapshots_match(
         }
     }
     for (path, id) in &tree.directories {
-        if load(path)?.is_none() {
+        let Some(entries) = load(path)? else {
+            return Ok(false);
+        };
+        // Matching retained members alone does not prove a directory capture
+        // still matches: a subsequently confirmed local create adds remote
+        // membership without changing any captured file version.
+        let expected = tree
+            .directories
+            .iter()
+            .filter(|(p, _)| p.split_last().is_some_and(|(_, parent)| parent == path))
+            .count()
+            + tree
+                .files
+                .iter()
+                .filter(|file| {
+                    file.path
+                        .split_last()
+                        .is_some_and(|(_, parent)| parent == path)
+                })
+                .count();
+        let mut count = 0usize;
+        let mut after = 0;
+        loop {
+            let page = entries.page(after)?;
+            if page.is_empty() {
+                break;
+            }
+            count += page.len();
+            if count > expected {
+                return Ok(false);
+            }
+            after = page
+                .last()
+                .ok_or_else(|| AccountError::new("invalid pin metadata page"))?
+                .0;
+        }
+        if count != expected {
             return Ok(false);
         }
         if let Some((name, parent)) = path.split_last() {
@@ -8791,34 +10217,47 @@ fn snapshots_match(
 }
 
 pub(crate) fn pins(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     verify_digests: bool,
 ) -> Result<Vec<Pin>, AccountError> {
-    let mut conn = database()?;
+    let mut conn = database_in(storage_root)?;
     let tx = conn
         .transaction()
         .map_err(|error| sqlite_storage_error(error, "cannot start offline transaction"))?;
-    let output = pins_in(&tx, instance, space, verify_digests)?;
+    let output = pins_in(storage_root, &tx, instance, space, verify_digests)?;
     tx.commit()
         .map_err(|error| sqlite_storage_error(error, "cannot finish listing pins"))?;
     Ok(output)
 }
 
 fn pins_in(
+    storage_root: &StorageRoot,
     conn: &Connection,
     instance: &str,
     space: &str,
     verify_digests: bool,
 ) -> Result<Vec<Pin>, AccountError> {
+    pins_matching_in(storage_root, conn, instance, space, verify_digests, None)
+}
+
+fn pins_matching_in(
+    storage_root: &StorageRoot,
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    verify_digests: bool,
+    root: Option<&str>,
+) -> Result<Vec<Pin>, AccountError> {
     check_retained_identity(conn, instance, space)?;
     let mut stmt = conn
         .prepare(
-            "SELECT root,is_dir,directories,manifest FROM pins WHERE instance=?1 AND space=?2 ORDER BY root",
+            "SELECT root,is_dir,directories,manifest FROM pins WHERE instance=?1 AND space=?2 AND (?3 IS NULL OR root=?3) ORDER BY root",
         )
         .map_err(|_| AccountError::new("cannot list pins"))?;
     let rows = stmt
-        .query_map(params![instance, space], |row| {
+        .query_map(params![instance, space, root], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, bool>(1)?,
@@ -8868,7 +10307,7 @@ fn pins_in(
             files: versions,
         };
         let metadata_matches =
-            !verify_digests || snapshots_match(conn, instance, space, &path, &tree)?;
+            !verify_digests || snapshots_match(storage_root, conn, instance, space, &path, &tree)?;
         output.push(Pin {
             path,
             complete,
@@ -8881,6 +10320,7 @@ fn pins_in(
 }
 
 pub(crate) fn version(
+    storage_root: &StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
@@ -8890,17 +10330,17 @@ pub(crate) fn version(
     let (name, parent) = path
         .split_last()
         .ok_or_else(|| AccountError::new("invalid pinned path"))?;
-    let entries = match directory_snapshot(instance, space, parent)? {
+    let entries = match directory_snapshot_at(storage_root, instance, space, parent)? {
         Some(entries) => entries,
-        None if owner.is_some() => offline_directory(instance, space, parent, owner)?,
+        None if owner.is_some() => offline_directory(storage_root, instance, space, parent, owner)?,
         None => return Ok(None),
     };
-    let roots = pins(instance, space, false)?
+    let roots = pins(storage_root, instance, space, false)?
         .into_iter()
         .filter(|pin| pin.complete)
         .map(|pin| path_key(&pin.path))
         .collect::<Result<Vec<_>, _>>()?;
-    let conn = database()?;
+    let conn = database_in(storage_root)?;
     let mut stmt = conn
         .prepare("SELECT root,version FROM files WHERE instance=?1 AND space=?2 AND path=?3 AND verified_complete=1")
         .map_err(|_| AccountError::new("cannot load pinned version"))?;
@@ -8945,11 +10385,12 @@ pub(crate) fn version(
 // FileVersion. Resolve only exact same-version local bytes through a scoped
 // durable MOVE; never fetch, alter the original base or infer remote freshness.
 pub(crate) fn read_moved_local(
+    storage: &StorageRoot,
     version: &FileVersion,
     offset: u64,
     length: u32,
 ) -> Result<Option<Vec<u8>>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(storage)?;
     check_retained_identity(&conn, &version.instance, &version.space)?;
     let through: i64 = conn
         .query_row(
@@ -9003,12 +10444,12 @@ pub(crate) fn read_moved_local(
                 .path
                 .extend_from_slice(&version.path[from.len()..]);
             if candidate.path.len() <= 128
-                && let Ok(bytes) = read(&candidate, offset, length)
+                && let Ok(bytes) = read(storage, &candidate, offset, length)
             {
                 return Ok(Some(bytes));
             }
             if candidate.path.len() <= 128 {
-                if let Some(bytes) = confirmed_local_range(&candidate, offset, length)? {
+                if let Some(bytes) = confirmed_local_range(storage, &candidate, offset, length)? {
                     return Ok(Some(bytes));
                 }
                 let (original, current) = if reverse {
@@ -9016,7 +10457,8 @@ pub(crate) fn read_moved_local(
                 } else {
                     (version, &candidate.path)
                 };
-                if let Some(bytes) = confirmed_range_at(original, current, offset, length)? {
+                if let Some(bytes) = confirmed_range_at(storage, original, current, offset, length)?
+                {
                     return Ok(Some(bytes));
                 }
             }
@@ -9025,22 +10467,36 @@ pub(crate) fn read_moved_local(
 }
 
 pub(crate) fn read(
+    storage: &StorageRoot,
     version: &FileVersion,
     offset: u64,
     length: u32,
 ) -> Result<Vec<u8>, AccountError> {
-    let end = offset
-        .checked_add(u64::from(length))
-        .filter(|end| length > 0 && u64::from(length) <= CHUNK && *end <= version.size)
-        .ok_or_else(|| AccountError::new("invalid pinned range"))?;
-    let mut conn = database()?;
-    // Pin publication replaces path-keyed chunks. Keep eligibility, the exact
-    // FileVersion row and every chunk in ONE read snapshot, including across a
-    // peer repin/unpin. No helper here may open another State connection.
+    let mut conn = database_in(storage)?;
     let tx = conn
         .transaction()
         .map_err(|error| sqlite_storage_error(error, "cannot start pinned read"))?;
-    let roots = pins_in(&tx, &version.instance, &version.space, false)?
+    let result = read_pin_in(storage, &tx, version, offset, length)?;
+    tx.commit()
+        .map_err(|error| sqlite_storage_error(error, "cannot finish pinned read"))?;
+    Ok(result)
+}
+
+fn read_pin_in(
+    storage_root: &StorageRoot,
+    tx: &Connection,
+    version: &FileVersion,
+    offset: u64,
+    length: u32,
+) -> Result<Vec<u8>, AccountError> {
+    offset
+        .checked_add(u64::from(length))
+        .filter(|end| length > 0 && u64::from(length) <= CHUNK && *end <= version.size)
+        .ok_or_else(|| AccountError::new("invalid pinned range"))?;
+    // Pin publication replaces path-keyed chunks. Keep eligibility, the exact
+    // FileVersion row and every chunk in ONE read snapshot, including across a
+    // peer repin/unpin. No helper here may open another State connection.
+    let roots = pins_in(storage_root, tx, &version.instance, &version.space, false)?
         .into_iter()
         .filter(|pin| pin.complete)
         .map(|pin| path_key(&pin.path))
@@ -9068,6 +10524,23 @@ pub(crate) fn read(
     drop(stmt);
     #[cfg(feature = "fault-injection")]
     crate::wait_test_window("CIRRUS_TEST_PIN_READ_SELECTED_WINDOW")?;
+    read_pin_owner_in(tx, &root, version, offset, length)
+}
+
+fn read_pin_owner_in(
+    tx: &Connection,
+    root: &str,
+    version: &FileVersion,
+    offset: u64,
+    length: u32,
+) -> Result<Vec<u8>, AccountError> {
+    let end = offset
+        .checked_add(u64::from(length))
+        .filter(|end| length > 0 && u64::from(length) <= CHUNK && *end <= version.size)
+        .ok_or_else(|| AccountError::new("invalid pinned range"))?;
+    let path = path_key(&version.path)?;
+    let encoded =
+        serde_json::to_string(version).map_err(|_| AccountError::new("invalid pinned version"))?;
     let mut result = Vec::with_capacity(length as usize);
     let mut position = offset;
     while position < end {
@@ -9083,7 +10556,5 @@ pub(crate) fn read(
         result.extend_from_slice(&body[start..start + count]);
         position += count as u64;
     }
-    tx.commit()
-        .map_err(|error| sqlite_storage_error(error, "cannot finish pinned read"))?;
     Ok(result)
 }

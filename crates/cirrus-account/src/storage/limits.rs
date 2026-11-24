@@ -4,12 +4,12 @@
 use std::io::{Read, Write};
 
 use rustix::{
-    fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, FileType, Mode, OFlags},
     process,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{AccountError, offline, ownership};
+use crate::{AccountError, account_storage::StorageRoot, offline, ownership};
 
 const FILE: &str = "storage-limits.json";
 pub(crate) const PRESSURE: &str = "configured storage pressure limit reached";
@@ -42,7 +42,7 @@ fn invalid() -> AccountError {
     AccountError::new("invalid or unsafe local storage limits; local growth refused")
 }
 
-fn validate(limits: &Option<StorageLimits>) -> Result<(), AccountError> {
+pub(crate) fn validate(limits: &Option<StorageLimits>) -> Result<(), AccountError> {
     if limits
         .as_ref()
         .is_some_and(|limits| limits.budget_bytes == 0)
@@ -52,14 +52,13 @@ fn validate(limits: &Option<StorageLimits>) -> Result<(), AccountError> {
     Ok(())
 }
 
-pub(crate) fn view() -> Result<StorageLimitsView, AccountError> {
-    let dir = ownership::state_dir()?;
-    let fd = match fs::openat2(
+pub(crate) fn view_in(root: &StorageRoot) -> Result<StorageLimitsView, AccountError> {
+    let dir = root.directory();
+    let fd = match ownership::open_private_file(
         &dir,
         FILE,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     ) {
         Ok(fd) => Some(fd),
         Err(rustix::io::Errno::NOENT) => None,
@@ -76,6 +75,8 @@ pub(crate) fn view() -> Result<StorageLimitsView, AccountError> {
             return Err(invalid());
         }
         let mut bytes = Vec::new();
+        #[cfg(target_os = "macos")]
+        ownership::darwin_acl::check_file(&fd).map_err(|_| invalid())?;
         std::fs::File::from(fd)
             .take(4097)
             .read_to_end(&mut bytes)
@@ -99,32 +100,53 @@ pub(crate) fn view() -> Result<StorageLimitsView, AccountError> {
     })
 }
 
-pub(crate) fn set(limits: Option<StorageLimits>) -> Result<StorageLimitsView, AccountError> {
+pub(crate) fn set_in(
+    root: &StorageRoot,
+    limits: Option<StorageLimits>,
+) -> Result<StorageLimitsView, AccountError> {
     validate(&limits)?;
     // Same lock as admission + actual fallocation. No account, network or SQLite
     // lock is acquired here. Below-current settings are allowed without cleanup.
-    let _staging = ownership::acquire_staging()?;
-    let dir = ownership::state_dir()?;
+    let _staging = ownership::acquire_staging_in(root)?;
+    let dir = root.directory();
     match fs::statat(&dir, FILE, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat)
             if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
                 && stat.st_uid == process::geteuid().as_raw()
                 && stat.st_mode & 0o7777 == 0o600
-                && stat.st_nlink == 1 => {}
+                && stat.st_nlink == 1 =>
+        {
+            #[cfg(target_os = "macos")]
+            {
+                let fd = ownership::open_private_file(
+                    dir,
+                    FILE,
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|_| invalid())?;
+                let actual = fs::fstat(&fd).map_err(|_| invalid())?;
+                if (stat.st_dev, stat.st_ino) != (actual.st_dev, actual.st_ino) {
+                    return Err(invalid());
+                }
+                ownership::darwin_acl::check_file(&fd).map_err(|_| invalid())?;
+            }
+        }
         Err(rustix::io::Errno::NOENT) => (),
         _ => return Err(invalid()),
     }
     let temporary = format!(".storage-limits-{}", offline::namespace_token()?);
-    let fd = fs::openat2(
+    let fd = ownership::open_private_file(
         &dir,
         temporary.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| invalid())?;
     let result = (|| {
         let mut file = std::fs::File::from(fd);
+        #[cfg(target_os = "macos")]
+        ownership::darwin_acl::check_file(&file).map_err(|_| invalid())?;
         let bytes = serde_json::to_vec(&Config { limits }).map_err(|_| invalid())?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
@@ -136,7 +158,7 @@ pub(crate) fn set(limits: Option<StorageLimits>) -> Result<StorageLimitsView, Ac
                 "cannot sync local storage limits; inspect current policy before retry",
             )
         })?;
-        view()
+        view_in(root)
     })();
     // Only our exclusively created configuration scratch name. Never touch a
     // payload, pin, journal, recovery copy or charged staging orphan.
@@ -150,11 +172,15 @@ pub(crate) fn is_pressure(error: &AccountError) -> bool {
 
 /// Caller holds staging flock and supplies a local reservation snapshot. Metadata-only:
 /// no SQL queries, cache reclamation, network or additional staging lock.
-pub(crate) fn check(bytes: u64, reservations: &[(String, u64)]) -> Result<(), AccountError> {
-    if view()?.limits.is_none() {
+pub(crate) fn check_in(
+    root: &StorageRoot,
+    bytes: u64,
+    reservations: &[(String, u64)],
+) -> Result<(), AccountError> {
+    if view_in(root)?.limits.is_none() {
         return Ok(());
     }
-    let observation = super::allocation_status(reservations)?;
+    let observation = super::allocation_status_in(root, reservations)?;
     if observation.storage_limits_error.is_some() {
         return Err(invalid());
     }

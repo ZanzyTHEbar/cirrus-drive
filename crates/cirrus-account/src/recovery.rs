@@ -4,14 +4,16 @@ use std::path::{Component, Path};
 
 use md5::Md5;
 use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 use rustix::{
-    fs::{self, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, FileType, Mode, OFlags},
     process,
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use crate::{AccountError, FileVersion, offline};
+use crate::{AccountError, FileVersion, account_storage::StorageRoot, offline};
 
 const CHUNK: u64 = 128 * 1024;
 const MAX_PIN_BYTES: u64 = 1024 * 1024 * 1024;
@@ -57,11 +59,12 @@ fn key(path: &[String]) -> Result<String, AccountError> {
 }
 
 pub(crate) fn list(
+    storage: &StorageRoot,
     instance: &str,
     space_root: Option<(&str, &[String])>,
     offset: u32,
 ) -> Result<Vec<(String, String)>, AccountError> {
-    let mut conn = offline::database()?;
+    let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
     let mut result = Vec::new();
     if let Some((space, root)) = space_root {
@@ -243,6 +246,7 @@ pub(crate) fn verify_active_file(
 }
 
 pub(crate) fn export(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     root: &[String],
@@ -251,6 +255,7 @@ pub(crate) fn export(
     destination: &Path,
 ) -> Result<(), AccountError> {
     export_pin(
+        storage,
         instance,
         space,
         root,
@@ -262,6 +267,7 @@ pub(crate) fn export(
 }
 
 fn export_pin(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     root: &[String],
@@ -285,7 +291,7 @@ fn export_pin(
     if expected_selector.len() != 64 || !expected_selector.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AccountError::new("invalid retained version selector"));
     }
-    let mut conn = offline::database()?;
+    let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
     if let Some(id) = copy {
         check_copy(&tx, instance, space, id)?;
@@ -395,10 +401,11 @@ fn check_copy(
 }
 
 pub(crate) fn pin_copies(
+    storage: &StorageRoot,
     instance: &str,
     offset: u32,
 ) -> Result<Vec<(String, String)>, AccountError> {
-    let conn = offline::database()?;
+    let conn = offline::database_in(storage)?;
     let mut stmt=conn.prepare("SELECT id,space,root,is_dir,displaced_path,target_id,target_etag FROM pin_copies WHERE instance=?1 ORDER BY id LIMIT ?2 OFFSET ?3").map_err(|_|invalid())?;
     let mut rows = stmt
         .query(params![instance, PAGE, offset])
@@ -418,12 +425,13 @@ pub(crate) fn pin_copies(
 }
 
 pub(crate) fn pin_copy_entries(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     id: i64,
     offset: u32,
 ) -> Result<Vec<(String, String)>, AccountError> {
-    let mut conn = offline::database()?;
+    let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
     let captured_root = check_copy(&tx, instance, space, id)?;
     let dirs: String = tx
@@ -502,6 +510,7 @@ pub(crate) fn pin_copy_entries(
 }
 
 pub(crate) fn export_pin_copy(
+    storage: &StorageRoot,
     instance: &str,
     space: &str,
     id: i64,
@@ -509,8 +518,9 @@ pub(crate) fn export_pin_copy(
     selector: &str,
     destination: &Path,
 ) -> Result<(), AccountError> {
-    let root = check_copy(&offline::database()?, instance, space, id)?;
+    let root = check_copy(&offline::database_in(storage)?, instance, space, id)?;
     export_pin(
+        storage,
         instance,
         space,
         &root,
@@ -521,8 +531,13 @@ pub(crate) fn export_pin_copy(
     )
 }
 
-pub(crate) fn remove_pin_copy(instance: &str, space: &str, id: i64) -> Result<(), AccountError> {
-    let mut conn = offline::database()?;
+pub(crate) fn remove_pin_copy(
+    storage: &StorageRoot,
+    instance: &str,
+    space: &str,
+    id: i64,
+) -> Result<(), AccountError> {
+    let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
     check_copy(&tx, instance, space, id)?;
     for table in ["pin_copy_chunks", "pin_copy_files"] {
@@ -559,22 +574,30 @@ fn write_output(
     let name = destination
         .file_name()
         .ok_or_else(|| AccountError::new("invalid destination"))?;
+    #[cfg(target_os = "linux")]
     let dir = fs::openat2(
         fs::CWD,
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| AccountError::new("cannot open destination parent without symlinks"))?;
-    let stat =
+    );
+    #[cfg(target_os = "macos")]
+    let dir = crate::ownership::file_ops::open_absolute(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    );
+    let dir =
+        dir.map_err(|_| AccountError::new("cannot open destination parent without symlinks"))?;
+    let parent_stat =
         fs::fstat(&dir).map_err(|_| AccountError::new("cannot inspect destination parent"))?;
-    if stat.st_uid != process::geteuid().as_raw() || stat.st_mode & 0o022 != 0 {
+    if parent_stat.st_uid != process::geteuid().as_raw() || parent_stat.st_mode & 0o022 != 0 {
         return Err(AccountError::new(
             "destination parent must be user-owned and not group or world writable",
         ));
     }
     // Never export into a FUSE mount, including this client's remote-backed mount.
+    #[cfg(target_os = "linux")]
     if fs::fstatfs(&dir)
         .map_err(|_| AccountError::new("cannot inspect destination filesystem"))?
         .f_type
@@ -584,14 +607,44 @@ fn write_output(
             "destination cannot be on a FUSE filesystem",
         ));
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Intentionally narrower than Linux: refuse network/unknown/FUSE mounts,
+        // not a fabricated Linux magic number for a Darwin filesystem.
+        if !crate::ownership::file_ops::local_apfs(&dir)
+            .map_err(|_| AccountError::new("cannot inspect destination filesystem"))?
+        {
+            return Err(AccountError::new(
+                "destination requires a local APFS filesystem",
+            ));
+        }
+        crate::ownership::darwin_acl::check_directory(&dir).map_err(AccountError::new)?;
+    }
+    #[cfg(target_os = "linux")]
     let fd = fs::openat2(
         &dir,
         name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| AccountError::new("destination exists or cannot be created"))?;
+    );
+    #[cfg(target_os = "macos")]
+    let name = name
+        .to_str()
+        .ok_or_else(|| AccountError::new("invalid destination"))?;
+    #[cfg(target_os = "macos")]
+    let fd = fs::openat(
+        &dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    );
+    let fd = fd.map_err(|_| AccountError::new("destination exists or cannot be created"))?;
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::ownership::darwin_acl::check_file(&fd) {
+        crate::ownership::darwin_acl::discard_unwritten_candidate(&dir, name, &fd);
+        return Err(AccountError::new(error));
+    }
     let stat = fs::fstat(&fd)
         .map_err(|_| AccountError::new("export failed; destination may contain partial data"))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
@@ -605,10 +658,48 @@ fn write_output(
     let mut output = std::fs::File::from(fd);
     write(&mut output)
         .map_err(|_| AccountError::new("export failed; destination may contain partial data"))?;
-    output
-        .sync_all()
-        .and_then(|()| fs::fsync(&dir).map_err(std::io::Error::from))
-        .map_err(|_| AccountError::new("export failed; destination may contain partial data"))?;
+    let partial = || AccountError::new("export failed; destination may contain partial data");
+    let verify_destination = || -> Result<(), AccountError> {
+        let held = fs::fstat(&output).map_err(|_| partial())?;
+        let named = fs::statat(&dir, name, fs::AtFlags::SYMLINK_NOFOLLOW).map_err(|_| partial())?;
+        let matches = |current: &fs::Stat| {
+            (current.st_dev, current.st_ino, current.st_uid)
+                == (stat.st_dev, stat.st_ino, stat.st_uid)
+                && FileType::from_raw_mode(current.st_mode) == FileType::RegularFile
+                && current.st_mode & 0o7777 == stat.st_mode & 0o7777
+                && current.st_nlink == 1
+        };
+        if !matches(&held) || !matches(&named) {
+            return Err(partial());
+        }
+        #[cfg(target_os = "linux")]
+        let current_parent = fs::openat2(
+            fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        );
+        #[cfg(target_os = "macos")]
+        let current_parent = crate::ownership::file_ops::open_absolute(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        );
+        let current_parent = current_parent.map_err(|_| partial())?;
+        let current = fs::fstat(&current_parent).map_err(|_| partial())?;
+        if (current.st_dev, current.st_ino, current.st_uid)
+            != (parent_stat.st_dev, parent_stat.st_ino, parent_stat.st_uid)
+            || current.st_mode & 0o022 != 0
+        {
+            return Err(partial());
+        }
+        Ok(())
+    };
+    output.sync_all().map_err(|_| partial())?;
+    // A synced held FD is not proof that the requested path still names it.
+    verify_destination()?;
+    fs::fsync(&dir).map_err(|_| partial())?;
+    verify_destination()?;
     Ok(())
 }
 
@@ -652,10 +743,11 @@ fn staged_selector(
 }
 
 pub(crate) fn staged_list(
+    storage: &StorageRoot,
     instance: &str,
     offset: u32,
 ) -> Result<Vec<(String, String)>, AccountError> {
-    let conn = offline::database()?;
+    let conn = offline::database_in(storage)?;
     let mut result = Vec::new();
     // Listing selects immutable roots without hashing logical file contents.
     // Otherwise even listing a retained sparse TiB file would scan a TiB.
@@ -679,7 +771,7 @@ pub(crate) fn staged_list(
         let parts: Vec<String> =
             serde_json::from_str(&path).map_err(|_| AccountError::new("invalid journal path"))?;
         key(&parts)?;
-        let info = offline::StagedSnapshot::open(&name)
+        let info = offline::StagedSnapshot::open_at(storage, &name)
             .and_then(|file| Ok((file.len(), file.root_digest()?)))
             .ok();
         let selected = info
@@ -694,6 +786,7 @@ pub(crate) fn staged_list(
 }
 
 pub(crate) fn staged_export(
+    storage: &StorageRoot,
     instance: &str,
     id: i64,
     expected: &str,
@@ -702,7 +795,7 @@ pub(crate) fn staged_export(
     if id <= 0 || expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AccountError::new("invalid retained staged selection"));
     }
-    let mut conn = offline::database()?;
+    let mut conn = offline::database_in(storage)?;
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect retained staged file"))?;
@@ -712,7 +805,7 @@ pub(crate) fn staged_export(
     let parts: Vec<String> =
         serde_json::from_str(&path).map_err(|_| AccountError::new("invalid journal path"))?;
     key(&parts)?;
-    let file = offline::StagedSnapshot::open(&name)?;
+    let file = offline::StagedSnapshot::open_at(storage, &name)?;
     if staged_selector(id, &space, &path, &name, file.len(), &file.root_digest()?) != expected {
         return Err(AccountError::new(
             "retained staged file changed; list it again",

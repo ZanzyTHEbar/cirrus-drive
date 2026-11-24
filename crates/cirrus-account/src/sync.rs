@@ -9,9 +9,61 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::account_storage::StorageRoot;
 use crate::{
     AccountError, Accounts, MountBinding, ReadSession, WriteTurnOutcome, executor, offline,
 };
+
+/// Retains one elected dispatcher's marker and its admitted filesystem root.
+pub struct SchedulerGuard {
+    _marker: std::os::fd::OwnedFd,
+    root: StorageRoot,
+}
+
+impl SchedulerGuard {
+    pub(crate) fn retained_root(&self) -> &StorageRoot {
+        &self.root
+    }
+    /// Enumerates activations under this election, without selecting storage again.
+    ///
+    /// # Errors
+    /// Refuses changed selection/ownership before accessing activation storage.
+    pub fn activated_spaces(
+        &self,
+        accounts: &Accounts,
+    ) -> Result<Vec<(String, String)>, AccountError> {
+        accounts.storage.validate(&self.root)?;
+        accounts.activated_spaces_in(&self.root)
+    }
+
+    /// Observes a Space under this election's retained storage capability.
+    ///
+    /// # Errors
+    /// Refuses changed selection/ownership before accessing status storage.
+    pub fn sync_status(
+        &self,
+        accounts: &Accounts,
+        instance: &str,
+        space: &str,
+    ) -> Result<SyncStatus, AccountError> {
+        accounts.storage.validate(&self.root)?;
+        accounts.sync_status_in(&self.root, instance, space)
+    }
+
+    /// Executes a turn using this election's root through observation and persistence.
+    ///
+    /// # Errors
+    /// Refuses changed selection/ownership before any turn storage or network I/O.
+    pub fn automatic_sync_turn(
+        &self,
+        accounts: &Accounts,
+        instance: &str,
+        space: &str,
+    ) -> Result<bool, AccountError> {
+        accounts.storage.validate(&self.root)?;
+        accounts.automatic_sync_turn_in(&self.root, instance, space)
+    }
+}
 
 #[cfg(feature = "fault-injection")]
 pub(crate) fn trace_automatic(event: &str) {
@@ -19,6 +71,10 @@ pub(crate) fn trace_automatic(event: &str) {
     if std::env::var_os("CIRRUS_TEST_AUTO_DIAGNOSTICS").is_some()
         && EVENTS.fetch_add(1, Ordering::Relaxed) < 2048
     {
+        #[cfg(target_os = "linux")]
+        let native = std::fs::read_link("/proc/thread-self").ok();
+        #[cfg(not(target_os = "linux"))]
+        let native: Option<std::path::PathBuf> = None;
         eprintln!(
             "cirrus lab auto diagnostic: time_ms={} pid={} native={:?} thread={:?} {event}",
             SystemTime::now()
@@ -26,7 +82,7 @@ pub(crate) fn trace_automatic(event: &str) {
                 .unwrap_or_default()
                 .as_millis(),
             std::process::id(),
-            std::fs::read_link("/proc/thread-self").ok(),
+            native,
             std::thread::current().id()
         );
     }
@@ -39,6 +95,12 @@ pub(crate) struct BackgroundAdmission {
 }
 
 impl BackgroundAdmission {
+    pub(crate) fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+    pub(crate) fn pause(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
     pub(crate) fn requested(&self) -> bool {
         self.paused.load(Ordering::Acquire) || self.requests.load(Ordering::Acquire) != 0
     }
@@ -123,8 +185,13 @@ pub(crate) fn now() -> Result<i64, AccountError> {
         .map_err(|_| AccountError::new("system clock is invalid"))
 }
 
-pub(crate) fn phase(instance: &str, space: &str, phase: SyncPhase) -> Result<(), AccountError> {
-    offline::database()?
+pub(crate) fn phase(
+    root: &StorageRoot,
+    instance: &str,
+    space: &str,
+    phase: SyncPhase,
+) -> Result<(), AccountError> {
+    offline::database_in(root)?
         .execute(
             "UPDATE sync_spaces SET phase=?3 WHERE instance=?1 AND space=?2",
             params![instance, space, format!("{phase:?}")],
@@ -133,8 +200,12 @@ pub(crate) fn phase(instance: &str, space: &str, phase: SyncPhase) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn verified(instance: &str, space: Option<&str>) -> Result<(), AccountError> {
-    offline::database()?.execute("UPDATE sync_spaces SET last_verified=?3 WHERE instance=?1 AND (?2 IS NULL OR space=?2)",params![instance,space,now()?])
+pub(crate) fn verified(
+    root: &StorageRoot,
+    instance: &str,
+    space: Option<&str>,
+) -> Result<(), AccountError> {
+    offline::database_in(root)?.execute("UPDATE sync_spaces SET last_verified=?3 WHERE instance=?1 AND (?2 IS NULL OR space=?2)",params![instance,space,now()?])
         .map_err(|_| AccountError::new("cannot record verified mutation time"))?;
     Ok(())
 }
@@ -143,8 +214,12 @@ pub(crate) fn verified(instance: &str, space: Option<&str>) -> Result<(), Accoun
 // Publish local idle/retire obsolete scheduling, not attention or mutation evidence.
 // The single statement rechecks each Space at publication: a concurrently
 // queued edit must prevent advancing its idle watermark.
-pub(crate) fn manual_idle(instance: &str, space: Option<&str>) -> Result<(), AccountError> {
-    offline::database()?.execute(
+pub(crate) fn manual_idle(
+    root: &StorageRoot,
+    instance: &str,
+    space: Option<&str>,
+) -> Result<(), AccountError> {
+    offline::database_in(root)?.execute(
         "UPDATE sync_spaces AS s SET phase='ObservedIdle',failures=0,next_at=0,cause=NULL,verified_through=COALESCE((SELECT max(j.id) FROM operation_journal j WHERE j.instance=s.instance AND j.space=s.space),0)
          WHERE s.instance=?1 AND (?2 IS NULL OR s.space=?2) AND s.phase IN ('Queued','Retry','ObservedIdle','Uploading','Verifying')
            AND EXISTS(SELECT 1 FROM account_identities a WHERE a.instance=s.instance AND a.issuer=s.issuer AND a.subject=s.subject)
@@ -154,32 +229,43 @@ pub(crate) fn manual_idle(instance: &str, space: Option<&str>) -> Result<(), Acc
     Ok(())
 }
 
-pub(crate) fn dependency_confirmed(instance: &str, id: i64) -> Result<bool, AccountError> {
-    offline::database()?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND id=?2 AND state='synced')",params![instance,id],|row| row.get(0))
+pub(crate) fn dependency_confirmed(
+    root: &StorageRoot,
+    instance: &str,
+    id: i64,
+) -> Result<bool, AccountError> {
+    offline::database_in(root)?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND id=?2 AND state='synced')",params![instance,id],|row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect rename dependency state"))
 }
 
 pub(crate) fn pending_tree(
+    root: &StorageRoot,
     instance: &str,
     space: &str,
 ) -> Result<Option<offline::TreeMove>, AccountError> {
-    let id: Option<i64> = offline::database()?.query_row("SELECT min(id) FROM operation_journal WHERE instance=?1 AND space=?2 AND op_type='move-tree' AND state='pending'",params![instance,space],|row| row.get(0)).map_err(|_| AccountError::new("cannot inspect pending tree move"))?;
+    let id: Option<i64> = offline::database_in(root)?.query_row("SELECT min(id) FROM operation_journal WHERE instance=?1 AND space=?2 AND op_type='move-tree' AND state='pending'",params![instance,space],|row| row.get(0)).map_err(|_| AccountError::new("cannot inspect pending tree move"))?;
     if let Some(id) = id {
-        Ok(offline::tree_move_page(instance, Some(space), id - 1, id)?
-            .into_iter()
-            .next())
+        Ok(
+            offline::tree_move_page_in(root, instance, Some(space), id - 1, id)?
+                .into_iter()
+                .next(),
+        )
     } else {
         Ok(None)
     }
 }
 
-pub(crate) fn has_attention(instance: &str, space: &str) -> Result<bool, AccountError> {
-    offline::database()?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE instance=?1 AND space=?2 AND (state='conflict' OR (state='uncertain' AND NOT EXISTS(SELECT 1 FROM upload_verifications v WHERE v.operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts r WHERE r.operation_id=j.id))))",params![instance,space],|row| row.get(0))
+pub(crate) fn has_attention(
+    root: &StorageRoot,
+    instance: &str,
+    space: &str,
+) -> Result<bool, AccountError> {
+    offline::database_in(root)?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE instance=?1 AND space=?2 AND (state='conflict' OR (state='uncertain' AND NOT EXISTS(SELECT 1 FROM upload_verifications v WHERE v.operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts r WHERE r.operation_id=j.id))))",params![instance,space],|row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect ambiguous operations"))
 }
 
 pub(crate) fn check_identity(session: &ReadSession, space: &str) -> Result<(), AccountError> {
-    let expected: Option<(String, String)> = offline::database()?
+    let expected: Option<(String, String)> = offline::database_in(&session.root)?
         .query_row(
             "SELECT issuer,subject FROM sync_spaces WHERE instance=?1 AND space=?2",
             params![session.base.as_str(), space],
@@ -217,16 +303,24 @@ impl Accounts {
     /// or new-row storage pressure. Commit/close failure has unknown outcome;
     /// inspect persisted status rather than assuming activation rolled back.
     pub fn activate_sync(&self, binding: &MountBinding) -> Result<(), AccountError> {
-        let session = self.read_session(&binding.instance)?;
+        let session = self.read_session_in(&binding.root, &binding.instance)?;
+        if binding.root.identity() != session.root.identity() {
+            return Err(AccountError::new("mount storage root changed"));
+        }
         let _guard = self.begin_local_operation(&session, false)?;
         if binding.issuer != session.account.issuer || binding.subject != session.account.subject {
             return Err(AccountError::new(
                 "mount identity differs; automatic activation refused",
             ));
         }
-        offline::bind_identity(&binding.instance, &binding.issuer, &binding.subject)?;
+        offline::bind_identity_in(
+            &session.root,
+            &binding.instance,
+            &binding.issuer,
+            &binding.subject,
+        )?;
         let reservation;
-        let mut conn = offline::database()?;
+        let mut conn = offline::database_in(&session.root)?;
         let planning_version: i64 = conn
             .pragma_query_value(None, "data_version", |row| row.get(0))
             .map_err(|_| AccountError::new("cannot inspect activation plan"))?;
@@ -237,7 +331,11 @@ impl Accounts {
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|_| AccountError::new("cannot inspect sync activation"))?;
-        let planned = if planned_new && crate::storage::limits::view()?.limits.is_some() {
+        let planned = if planned_new
+            && crate::storage::limits::view_in(&session.root)?
+                .limits
+                .is_some()
+        {
             serde_json::to_vec(&(
                 &binding.instance,
                 &binding.space,
@@ -267,7 +365,8 @@ impl Accounts {
             crate::wait_test_window("CIRRUS_TEST_ACTIVATION_ADMISSION_WINDOW")?;
         }
         reservation = if planned_new {
-            crate::storage::sql_reservation::SqlReservation::begin(
+            crate::storage::sql_reservation::SqlReservation::begin_in(
+                &session.root,
                 crate::storage::sql_reservation::Store::State,
                 Some(&conn),
                 planned,
@@ -318,7 +417,11 @@ impl Accounts {
         } else {
             // A concurrent removal of an existing activation must not turn an
             // uncapped reactivation into a new allocation under enabled policy.
-            if reservation.is_none() && crate::storage::limits::view()?.limits.is_some() {
+            if reservation.is_none()
+                && crate::storage::limits::view_in(&session.root)?
+                    .limits
+                    .is_some()
+            {
                 return Err(AccountError::new(crate::storage::limits::PRESSURE));
             }
             let count: i64 = tx
@@ -338,7 +441,10 @@ impl Accounts {
         if inserted {
             if let Some(reservation) = &reservation {
                 reservation.validate(&tx)?;
-            } else if crate::storage::limits::view()?.limits.is_some() {
+            } else if crate::storage::limits::view_in(&session.root)?
+                .limits
+                .is_some()
+            {
                 return Err(AccountError::new(crate::storage::limits::PRESSURE));
             }
         }
@@ -360,9 +466,14 @@ impl Accounts {
     ///
     /// # Errors
     /// Returns an error for unsupported state, unsafe paths or another dispatcher.
-    pub fn acquire_scheduler(&self) -> Result<std::os::fd::OwnedFd, AccountError> {
-        let _supported = offline::database()?;
-        crate::ownership::acquire_scheduler()
+    pub fn acquire_scheduler(&self) -> Result<SchedulerGuard, AccountError> {
+        let root = self.storage_root()?;
+        let _supported = offline::database_in(&root)?;
+        let marker = crate::ownership::acquire_scheduler_in(&root)?;
+        Ok(SchedulerGuard {
+            _marker: marker,
+            root,
+        })
     }
 
     /// Enumerates at most 64 local activations without reading credentials or mounting.
@@ -370,7 +481,15 @@ impl Accounts {
     /// # Errors
     /// Returns an error for unsupported or unreadable local state.
     pub fn activated_spaces(&self) -> Result<Vec<(String, String)>, AccountError> {
-        let conn = offline::database()?;
+        let root = self.storage_root()?;
+        self.activated_spaces_in(&root)
+    }
+
+    fn activated_spaces_in(
+        &self,
+        root: &StorageRoot,
+    ) -> Result<Vec<(String, String)>, AccountError> {
+        let conn = offline::database_in(root)?;
         let mut statement = conn
             .prepare("SELECT instance,space FROM sync_spaces ORDER BY instance,space LIMIT 64")
             .map_err(|_| AccountError::new("cannot inspect activated Spaces"))?;
@@ -387,11 +506,21 @@ impl Accounts {
     /// # Errors
     /// Returns an error for invalid input, unsupported schema or damaged state.
     pub fn sync_status(&self, instance: &str, space: &str) -> Result<SyncStatus, AccountError> {
+        let root = self.storage_root()?;
+        self.sync_status_in(&root, instance, space)
+    }
+
+    fn sync_status_in(
+        &self,
+        root: &StorageRoot,
+        instance: &str,
+        space: &str,
+    ) -> Result<SyncStatus, AccountError> {
         let instance = Self::canonical_instance(instance)?;
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
         }
-        let conn = offline::database()?;
+        let conn = offline::database_in(root)?;
         type Saved = (
             String,
             u32,
@@ -418,7 +547,15 @@ impl Accounts {
             verified_through,
             attention_stamp,
         ) = saved.unwrap_or_else(|| ("Queued".into(), 0, 0, None, None, 0, None));
-        let active = self.active_writes.lock().map_err(|_| AccountError::new("upload status unavailable"))?.iter().any(|id| conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE id=?1 AND instance=?2 AND space=?3 AND state='uncertain' AND NOT EXISTS(SELECT 1 FROM upload_verifications v WHERE v.operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts r WHERE r.operation_id=j.id))",params![id,instance,space],|row| row.get::<_,bool>(0)).unwrap_or(false));
+        let active_ids: Vec<_> = self
+            .active_writes
+            .lock()
+            .map_err(|_| AccountError::new("upload status unavailable"))?
+            .iter()
+            .filter(|(identity, _)| *identity == root.identity())
+            .map(|(_, id)| *id)
+            .collect();
+        let active = active_ids.iter().any(|id| conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal j WHERE id=?1 AND instance=?2 AND space=?3 AND state='uncertain' AND NOT EXISTS(SELECT 1 FROM upload_verifications v WHERE v.operation_id=j.id) AND NOT EXISTS(SELECT 1 FROM mutation_receipts r WHERE r.operation_id=j.id))",params![id,instance,space],|row| row.get::<_,bool>(0)).unwrap_or(false));
         let uploading = u64::from(active);
         let uncertain = uncertain.saturating_sub(uploading);
         let mut status = SyncStatus {
@@ -507,7 +644,10 @@ impl Accounts {
     // Local namespace preparation needs exclusive ownership. It may wait for
     // this daemon's automatic turn, rather than spuriously returning EBUSY for
     // an ordinary rename. Explicit/cross-daemon contention keeps its old fence.
-    pub(super) fn wait_for_automatic_turn(&self) -> Result<crate::Operation<'_>, AccountError> {
+    pub(super) fn wait_for_automatic_turn_in(
+        &self,
+        root: &StorageRoot,
+    ) -> Result<crate::Operation<'_>, AccountError> {
         let _priority = self.request_foreground();
         #[cfg(feature = "fault-injection")]
         crate::wait_test_window("CIRRUS_TEST_PRIORITY_WAIT_WINDOW")?;
@@ -515,7 +655,7 @@ impl Accounts {
         loop {
             self.check_cancelled()?;
             match self.operation.try_lock() {
-                Ok(lock) => return self.operation_with_lock(lock),
+                Ok(lock) => return self.operation_with_lock_in(lock, root),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err(AccountError::new("account state is unavailable"));
                 }
@@ -532,11 +672,22 @@ impl Accounts {
 
     /// Executes one automatic turn and reports useful progress for fair re-admission.
     /// Authentication/listing and local storage/hash work are not hard wall-clock bounded.
+    /// Dispatchers retaining an election must instead use `SchedulerGuard::automatic_sync_turn`.
     ///
     /// # Errors
     /// Returns an error if local activation/status cannot be safely inspected or persisted.
     pub fn automatic_sync_turn(&self, instance: &str, space: &str) -> Result<bool, AccountError> {
-        let before = self.sync_status(instance, space)?;
+        let root = self.storage_root()?;
+        self.automatic_sync_turn_in(&root, instance, space)
+    }
+
+    fn automatic_sync_turn_in(
+        &self,
+        root: &StorageRoot,
+        instance: &str,
+        space: &str,
+    ) -> Result<bool, AccountError> {
+        let before = self.sync_status_in(root, instance, space)?;
         if !before.activated || matches!(before.phase, SyncPhase::Retry | SyncPhase::Attention) {
             return Ok(false);
         }
@@ -545,7 +696,7 @@ impl Accounts {
         }
         let _automatic = executor::automatic_guard(self);
         let progress = executor::progress_stamp();
-        let result = self.sync_pending_in(instance, Some(space), executor::Mode::Automatic);
+        let result = self.sync_pending_at(root, instance, Some(space), executor::Mode::Automatic);
         #[cfg(feature = "fault-injection")]
         trace_automatic(&format!(
             "transfer space={space} result={result:?} foreground={} cancelled={}",
@@ -559,9 +710,9 @@ impl Accounts {
                 .is_ok_and(|outcome| *outcome == WriteTurnOutcome::Retry)
             || result.as_ref().is_err_and(AccountError::can_retry_read)
         {
-            offline::database()?.execute("DELETE FROM sync_reads WHERE operation_id IN (SELECT id FROM operation_journal WHERE instance=?1 AND space=?2)",params![before.instance,space]).map_err(|_| AccountError::new("cannot invalidate interrupted metadata preflight"))?;
+            offline::database_in(root)?.execute("DELETE FROM sync_reads WHERE operation_id IN (SELECT id FROM operation_journal WHERE instance=?1 AND space=?2)",params![before.instance,space]).map_err(|_| AccountError::new("cannot invalidate interrupted metadata preflight"))?;
         }
-        let after = self.sync_status(instance, space)?;
+        let after = self.sync_status_in(root, instance, space)?;
         let advanced = executor::progress_stamp() != progress || stamp(&before) != stamp(&after);
         let (phase,failures,next,cause,attention_stamp) = match result {
             Ok(WriteTurnOutcome::Idle) => (SyncPhase::ObservedIdle,0,0,None,None),
@@ -591,7 +742,7 @@ impl Accounts {
             && after.uncertain == 0
             && after.conflicts == 0
             && after.damaged == 0;
-        offline::database()?.execute("UPDATE sync_spaces SET phase=?3,failures=?4,next_at=?5,cause=?6,attention_stamp=?7,verified_through=CASE WHEN ?8 THEN ?9 ELSE verified_through END WHERE instance=?1 AND space=?2",params![before.instance,space,format!("{phase:?}"),failures,next,cause,attention_stamp,idle,after.high_water]).map_err(|_| AccountError::new("cannot persist automatic sync result"))?;
+        offline::database_in(root)?.execute("UPDATE sync_spaces SET phase=?3,failures=?4,next_at=?5,cause=?6,attention_stamp=?7,verified_through=CASE WHEN ?8 THEN ?9 ELSE verified_through END WHERE instance=?1 AND space=?2",params![before.instance,space,format!("{phase:?}"),failures,next,cause,attention_stamp,idle,after.high_water]).map_err(|_| AccountError::new("cannot persist automatic sync result"))?;
         Ok(advanced)
     }
 }

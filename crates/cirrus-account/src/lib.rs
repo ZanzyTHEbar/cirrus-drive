@@ -1,5 +1,6 @@
 //! Browser-based OpenID account connection and read-only Space discovery.
 
+mod account_storage;
 mod browser;
 mod cache;
 mod callback;
@@ -7,22 +8,42 @@ mod dav;
 mod executor;
 mod http;
 mod offline;
+mod operation_result;
 mod ownership;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod provider_catalog;
+pub mod provider_mutation;
 mod recovery;
 mod secrets;
+mod sqlite_open;
 mod storage;
 mod sync;
 mod upload;
+
+#[cfg(target_os = "macos")]
+mod native_bridge;
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_storage_acceptance;
+
+#[cfg(all(test, target_os = "linux", feature = "fault-injection"))]
+mod provider_reconciliation_acceptance;
+
+#[cfg(test)]
+mod sign_in_acceptance;
 
 pub use storage::{
     NamespaceStorageReservation, SqlStorageReservation, StorageLimits, StorageLimitsView,
     StorageStatus, StorageUsage,
 };
 
+#[cfg(target_os = "linux")]
+pub use account_storage::StorageRoot;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,12 +59,26 @@ use openidconnect::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+#[doc(hidden)]
+pub use browser::BrowserRequest;
 pub use browser::{Browser, PortalBrowser};
 pub use dav::Entry;
 mod directory;
 pub use directory::DirectorySnapshot;
 use secrets::{AccountData, Store};
-pub use sync::{ForegroundPriority, SyncPhase, SyncStatus};
+
+#[cfg(target_os = "macos")]
+impl From<secrets::CredentialError> for AccountError {
+    fn from(error: secrets::CredentialError) -> Self {
+        if error.retryable && executor::is_automatic() {
+            Self::retryable_read(error.message)
+        } else {
+            Self::new(error.message)
+        }
+    }
+}
+pub use operation_result::{OperationHandle, OperationResult};
+pub use sync::{ForegroundPriority, SchedulerGuard, SyncPhase, SyncStatus};
 pub use upload::WriteTurnOutcome;
 
 /// One locally durable change to an immutable dirty extent map.
@@ -231,6 +266,7 @@ pub struct JournalSummary {
 /// A mount's account and Space binding, verified online or from retained activation.
 #[derive(Clone)]
 pub struct MountBinding {
+    root: account_storage::StorageRoot,
     instance: String,
     space: String,
     name: Option<String>,
@@ -332,61 +368,72 @@ impl Space {
 
 /// Account access with serialized credential changes and bounded concurrent reads.
 pub struct Accounts {
+    storage: account_storage::StorageSelection,
     runtime: RuntimeDir,
-    pending: Mutex<HashMap<String, AccountData>>,
+    #[cfg(target_os = "macos")]
+    keychain: Option<ownership::credentials::KeychainConfig>,
+    credentials: Mutex<CredentialState>,
     operation: Mutex<()>,
-    pending_guard: Mutex<Option<ownership::Guard>>,
     cancelled: Arc<AtomicBool>,
-    read_session: Mutex<Option<ReadSession>>,
+    read_session: Mutex<Option<Arc<ReadSession>>>,
     session_ready: Condvar,
     reads_in_flight: Mutex<usize>,
     read_available: Condvar,
     metadata_generation: AtomicU64,
     clean_cache_generation: AtomicU64,
     clean_cache_update: Mutex<()>,
-    sync_staging: RwLock<bool>,
+    sync_staging: RwLock<Option<Arc<ReadSession>>>,
     read_ahead_active: AtomicBool,
-    active_writes: Mutex<HashSet<i64>>,
+    active_writes: Mutex<HashSet<(account_storage::RootIdentity, i64)>>,
     background_admission: Arc<sync::BackgroundAdmission>,
-    automatic_active: Arc<AtomicBool>,
+    // Live policy scopes, not account/transfer ownership.
+    automatic_active: Arc<AtomicUsize>,
 }
 
 /// Cancellation fence for one browser sign-in attempt.
 #[derive(Debug, Default)]
 pub struct SignIn {
-    phase: Mutex<SignInPhase>,
-    cancelled: AtomicBool,
+    phase: AtomicU8,
 }
 
-#[derive(Debug, Default)]
+#[repr(u8)]
 enum SignInPhase {
-    #[default]
-    Pending,
-    Finishing,
-    Cancelled,
+    Pending = 0,
+    Finishing = 1,
+    Cancelled = 2,
 }
 
 impl SignIn {
     /// Cancels the attempt before token exchange starts.
     pub fn cancel(&self) -> Result<(), AccountError> {
-        let mut phase = self
-            .phase
-            .lock()
-            .map_err(|_| AccountError::new("sign-in state unavailable"))?;
-        match *phase {
-            SignInPhase::Pending | SignInPhase::Cancelled => {
-                *phase = SignInPhase::Cancelled;
-                self.cancelled.store(true, Ordering::Release);
-                Ok(())
-            }
-            SignInPhase::Finishing => Err(AccountError::new(
+        if self.cancel_pending() {
+            Ok(())
+        } else {
+            Err(AccountError::new(
                 "sign-in is finishing; wait for its result",
-            )),
+            ))
         }
     }
 
+    // Typed private result for the native adapter; never parse Display text.
+    fn cancel_pending(&self) -> bool {
+        match self.phase.compare_exchange(
+            SignInPhase::Pending as u8,
+            SignInPhase::Cancelled as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(phase) => phase == SignInPhase::Cancelled as u8,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == SignInPhase::Cancelled as u8
+    }
+
     fn check(&self) -> Result<(), AccountError> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.is_cancelled() {
             Err(AccountError::new("sign-in cancelled; you can try again"))
         } else {
             Ok(())
@@ -394,23 +441,47 @@ impl SignIn {
     }
 
     fn begin_exchange(&self) -> Result<(), AccountError> {
-        let mut phase = self
-            .phase
-            .lock()
-            .map_err(|_| AccountError::new("sign-in state unavailable"))?;
-        if matches!(*phase, SignInPhase::Cancelled) {
-            return Err(AccountError::new("sign-in cancelled; you can try again"));
+        match self.phase.compare_exchange(
+            SignInPhase::Pending as u8,
+            SignInPhase::Finishing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(phase) if phase == SignInPhase::Finishing as u8 => Ok(()),
+            Err(_) => Err(AccountError::new("sign-in cancelled; you can try again")),
         }
-        *phase = SignInPhase::Finishing;
-        Ok(())
     }
 }
 
 #[derive(Clone)]
 struct ReadSession {
+    root: account_storage::StorageRoot,
     base: Url,
     account: AccountData,
     client: reqwest::blocking::Client,
+}
+
+enum CredentialState {
+    Idle,
+    Active(HashMap<String, AccountData>),
+    Retained {
+        pending: HashMap<String, AccountData>,
+        guard: ownership::Guard,
+    },
+}
+
+fn verified_selection(account: &AccountData) -> Result<&str, AccountError> {
+    let selected = account
+        .selected_space
+        .as_deref()
+        .ok_or_else(|| AccountError::new("no Space is selected"))?;
+    if account.selected_space_verified.as_deref() != Some(selected) {
+        return Err(AccountError::new(
+            "reselect your Space from the signed-in user's listing before accessing it",
+        ));
+    }
+    Ok(selected)
 }
 
 fn bound_space<'a>(
@@ -418,6 +489,9 @@ fn bound_space<'a>(
     binding: Option<&'a MountBinding>,
 ) -> Result<&'a str, AccountError> {
     if let Some(binding) = binding {
+        if binding.root.identity() != session.root.identity() {
+            return Err(AccountError::new("mount storage root changed"));
+        }
         if binding.offline {
             return Err(AccountError::new(
                 "offline mount is read-only and cannot authenticate",
@@ -431,11 +505,7 @@ fn bound_space<'a>(
         }
         return Ok(&binding.space);
     }
-    session
-        .account
-        .selected_space
-        .as_deref()
-        .ok_or_else(|| AccountError::new("no Space is selected"))
+    verified_selection(&session.account)
 }
 
 struct ReadPermit<'a>(&'a Accounts);
@@ -458,9 +528,8 @@ struct Operation<'a> {
 
 /// A remotely verified tree move holding account ownership until it is committed.
 pub struct PreparedRemoteTree<'a> {
-    // Drain identity-checked local staging before releasing account ownership.
+    // Admission and the account owner move together until explicit drain.
     _staging: Option<SyncStaging<'a>>,
-    _guard: Option<Operation<'a>>,
     _offline_owner: Option<rustix::fd::OwnedFd>,
     _sync_owner: Option<rustix::fd::OwnedFd>,
     offline: Option<MountBinding>,
@@ -476,6 +545,7 @@ pub struct PreparedRemoteTree<'a> {
     open_versions: &'a [FileVersion],
     open_directories: &'a [(Vec<String>, String)],
     relocated: Vec<FileVersion>,
+    root: account_storage::StorageRoot,
 }
 
 impl PreparedRemoteTree<'_> {
@@ -484,26 +554,63 @@ impl PreparedRemoteTree<'_> {
     /// # Errors
     /// Returns an error if the durable journal no longer permits the move.
     pub fn commit(self) -> Result<Vec<FileVersion>, AccountError> {
+        self.commit_operation().map(|(versions, _)| versions)
+    }
+
+    /// Journals the move and captures its exact operation in the same transaction.
+    ///
+    /// # Errors
+    /// Refuses changed namespace, parent, pin protection or storage admission.
+    pub fn commit_operation(self) -> Result<(Vec<FileVersion>, OperationHandle), AccountError> {
+        self.commit_inner(None)
+    }
+
+    pub(crate) fn commit_provider(
+        self,
+        record: &provider_mutation::Record,
+    ) -> Result<(Vec<FileVersion>, OperationHandle), AccountError> {
+        self.commit_inner(Some(record))
+    }
+
+    fn commit_inner(
+        mut self,
+        record: Option<&provider_mutation::Record>,
+    ) -> Result<(Vec<FileVersion>, OperationHandle), AccountError> {
+        // Finish admitted local writers before capturing originals. Keep the
+        // exclusive account owner until the namespace transaction completes.
+        let _operation = self._staging.take().map(SyncStaging::finish);
+        offline::protect_moving_pin_originals(
+            &self.root,
+            &self.instance,
+            &self.space,
+            self.source,
+            self.destination,
+            &self.cancelled,
+        )?;
         let _turn = self
             .offline
             .as_ref()
-            .map(|_| ownership::local_state_turn(Arc::clone(&self.cancelled)))
+            .map(|_| ownership::local_state_turn_in(&self.root, Arc::clone(&self.cancelled)))
             .transpose()?;
         let mut attempts = 0;
-        loop {
-            let result = offline::queue_tree_move(offline::TreeMoveRequest {
-                instance: &self.instance,
-                space: &self.space,
-                source: self.source,
-                destination: self.destination,
-                entry: &self.entry,
-                target: self.target.as_ref(),
-                local_target: self.local_target,
-                parents: self.parents,
-                open_versions: self.open_versions,
-                open_directories: self.open_directories,
-                offline: self.offline.as_ref(),
-            });
+        let operation = loop {
+            let result = offline::queue_tree_move_correlated(
+                &self.root,
+                offline::TreeMoveRequest {
+                    instance: &self.instance,
+                    space: &self.space,
+                    source: self.source,
+                    destination: self.destination,
+                    entry: &self.entry,
+                    target: self.target.as_ref(),
+                    local_target: self.local_target,
+                    parents: self.parents,
+                    open_versions: self.open_versions,
+                    open_directories: self.open_directories,
+                    offline: self.offline.as_ref(),
+                },
+                record,
+            );
             if self.offline.is_some()
                 && attempts < 7
                 && result
@@ -513,25 +620,24 @@ impl PreparedRemoteTree<'_> {
                 attempts += 1;
                 continue;
             }
-            result?;
-            break;
-        }
-        Ok(self.relocated)
+            break result?;
+        };
+        Ok((self.relocated, operation))
     }
 }
 
 /// A verified empty-directory move holding account ownership until it is committed.
 pub struct PreparedEmptyDirectory<'a> {
-    // Close staging admission and wait for its local readers before releasing
-    // the original exclusive account guard (field drop order matters).
+    // Owns both staging admission and the original exclusive account guard.
     _staging: SyncStaging<'a>,
-    _guard: Operation<'a>,
     instance: String,
     space: String,
     source: &'a [String],
     destination: &'a [String],
     base: (&'a str, &'a str),
     parents: RenameParents<'a>,
+    cancelled: Arc<AtomicBool>,
+    root: account_storage::StorageRoot,
 }
 
 impl PreparedEmptyDirectory<'_> {
@@ -540,7 +646,17 @@ impl PreparedEmptyDirectory<'_> {
     /// # Errors
     /// Returns an error if the durable journal no longer permits the move.
     pub fn commit(self) -> Result<i64, AccountError> {
+        let _operation = self._staging.finish();
+        offline::protect_moving_pin_originals(
+            &self.root,
+            &self.instance,
+            &self.space,
+            self.source,
+            self.destination,
+            &self.cancelled,
+        )?;
         offline::queue_empty_directory_move(
+            &self.root,
             &self.instance,
             &self.space,
             self.source,
@@ -552,16 +668,31 @@ impl PreparedEmptyDirectory<'_> {
     }
 }
 
-// The account ownership guard stays held while this window is open. Readers
-// finish their local journal transactions before the guard can be released.
-struct SyncStaging<'a>(&'a Accounts);
-
-struct LocalOperation<'a> {
-    _sync_window: Option<RwLockReadGuard<'a, bool>>,
-    _operation: Option<OwnedLocalOperation<'a>>,
+// Drop admission before the owned account operation, including early returns.
+struct SyncStaging<'a> {
+    window: StagingWindow<'a>,
+    operation: Operation<'a>,
 }
 
-/// A verified file rename holding account identity stable until it is committed.
+struct StagingWindow<'a>(&'a Accounts);
+
+impl<'a> SyncStaging<'a> {
+    fn finish(self) -> Operation<'a> {
+        drop(self.window);
+        self.operation
+    }
+}
+
+enum LocalOperation<'a> {
+    Staging {
+        _lease: RwLockReadGuard<'a, Option<Arc<ReadSession>>>,
+    },
+    Owned {
+        _operation: OwnedLocalOperation<'a>,
+    },
+}
+
+/// A verified file rename with journal-only or exclusive publication ownership.
 pub struct PreparedFileRename<'a> {
     _guard: Option<OwnedLocalOperation<'a>>,
     _offline_owner: Option<rustix::fd::OwnedFd>,
@@ -572,6 +703,10 @@ pub struct PreparedFileRename<'a> {
     parents: RenameParents<'a>,
     offline: Option<MountBinding>,
     cancelled: Arc<AtomicBool>,
+    runtime: &'a RuntimeDir,
+    online: Option<Arc<ReadSession>>,
+    local_observation: Option<[String; 2]>,
+    root: account_storage::StorageRoot,
 }
 
 impl PreparedFileRename<'_> {
@@ -579,16 +714,106 @@ impl PreparedFileRename<'_> {
     ///
     /// # Errors
     /// Returns an error if either staged version or its parents changed.
-    pub fn commit(self) -> Result<(FileVersion, Option<FileVersion>), AccountError> {
+    pub fn commit(mut self) -> Result<(FileVersion, Option<FileVersion>), AccountError> {
+        // A pristine same-parent create changes only its journal path. Retain
+        // the prepared principal owner through classification and publication;
+        // ineligible transformations still take the original fresh EX fence.
+        if let (Some(session), Some(observation)) = (&self.online, &self.local_observation) {
+            match offline::rename_pristine_local_write(
+                session,
+                self.source,
+                self.destination,
+                self.parents,
+                observation,
+                &self.cancelled,
+            )? {
+                offline::LocalRename::Renamed(version) => {
+                    #[cfg(feature = "fault-injection")]
+                    if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
+                        eprintln!(
+                            "cirrus lab file rename admission: pid={} thread={:?} boundary=commit-local-renamed",
+                            std::process::id(),
+                            std::thread::current().id()
+                        );
+                    }
+                    return Ok((version, None));
+                }
+                offline::LocalRename::NeedsExclusive => {}
+            }
+        }
+        // Online preparation permits unrelated writers during DAV. Release
+        // its shared owner before taking a fresh exclusive publication fence;
+        // never upgrade a shared lease in place. The transaction below still
+        // revalidates the exact prepared versions and parent dependencies.
+        let _owner = if let Some(session) = &self.online {
+            drop(self._guard.take());
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
+                eprintln!(
+                    "cirrus lab file rename admission: pid={} thread={:?} boundary=commit-exclusive-request",
+                    std::process::id(),
+                    std::thread::current().id()
+                );
+            }
+            let owner = ownership::acquire_offline_exclusive_in(&self.root, self.runtime)?;
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
+                eprintln!(
+                    "cirrus lab file rename admission: pid={} thread={:?} boundary=commit-exclusive-acquired",
+                    std::process::id(),
+                    std::thread::current().id()
+                );
+            }
+            offline::verify_identity_in(
+                &session.root,
+                &self.source.instance,
+                &session.account.issuer,
+                &session.account.subject,
+            )?;
+            offline::protect_moving_pin_originals(
+                &self.root,
+                &self.source.instance,
+                &self.source.space,
+                &self.source.path,
+                self.destination,
+                &self.cancelled,
+            )?;
+            // Preserve the previous optional cache retention only AFTER pin
+            // agreement. It cannot promote an arbitrary conflicting owner
+            // ahead of the protection-specific all-owner comparison.
+            for version in std::iter::once(self.source).chain(self.pending_target) {
+                let (_, name) = offline::staged_version(
+                    &session.root,
+                    &version.instance,
+                    &version.space,
+                    &version.path,
+                    &version.id,
+                )?
+                .filter(|(current, _)| current == version)
+                .ok_or_else(|| AccountError::new("rename snapshot changed"))?;
+                offline::overlay::Overlay::load_at(&self.root, &name)?.retain_available(
+                    |base, offset, length| {
+                        cache::read(session, base, offset, length)
+                            .ok()
+                            .flatten()
+                            .or_else(|| offline::read(&session.root, base, offset, length).ok())
+                    },
+                )?;
+            }
+            Some(owner)
+        } else {
+            None
+        };
         let _state_turn = self
             .offline
             .as_ref()
-            .map(|_| ownership::local_state_turn(Arc::clone(&self.cancelled)))
+            .map(|_| ownership::local_state_turn_in(&self.root, Arc::clone(&self.cancelled)))
             .transpose()?;
         let mut retries = 0;
         loop {
             let result = if let Some(target) = self.pending_target {
                 offline::replace_pending_write(
+                    &self.root,
                     self.source,
                     target,
                     self.parents.source,
@@ -597,6 +822,7 @@ impl PreparedFileRename<'_> {
                 )
             } else {
                 offline::rename_staged_write(
+                    &self.root,
                     self.source,
                     self.destination,
                     self.target,
@@ -623,13 +849,14 @@ impl PreparedFileRename<'_> {
     }
 }
 
-struct OwnedLocalOperation<'a> {
-    _shared: Option<ownership::Guard>,
-    _exclusive: Option<Operation<'a>>,
+enum OwnedLocalOperation<'a> {
+    Shared(ownership::Guard),
+    Exclusive(Operation<'a>),
 }
 
 struct ActiveWrite<'a> {
     accounts: &'a Accounts,
+    root: account_storage::StorageRoot,
     id: i64,
 }
 
@@ -641,36 +868,114 @@ enum ConflictCopyOutcome {
 impl Drop for ActiveWrite<'_> {
     fn drop(&mut self) {
         if let Ok(mut active) = self.accounts.active_writes.lock() {
-            active.remove(&self.id);
+            active.remove(&(self.root.identity(), self.id));
         }
     }
 }
 
-impl Drop for SyncStaging<'_> {
+impl Drop for StagingWindow<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.0.sync_staging.write() {
-            *active = false;
-        }
+        let retired = self
+            .0
+            .sync_staging
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(retired);
     }
 }
 
-impl Operation<'_> {
-    fn connection(&self) -> Result<&zbus::blocking::Connection, AccountError> {
+impl<'a> Operation<'a> {
+    fn storage_root(&self) -> Result<&account_storage::StorageRoot, AccountError> {
         self.guard
             .as_ref()
-            .map(ownership::Guard::connection)
+            .map(ownership::Guard::storage_root)
             .ok_or_else(|| AccountError::new("account ownership is unavailable"))
+    }
+    fn credential_context(&self) -> Result<&ownership::credentials::Context, AccountError> {
+        self.guard
+            .as_ref()
+            .map(ownership::Guard::credential_context)
+            .ok_or_else(|| AccountError::new("account ownership is unavailable"))
+    }
+
+    fn begin_staging(self, session: Arc<ReadSession>) -> Result<SyncStaging<'a>, AccountError> {
+        if self.storage_root()?.identity() != session.root.identity() {
+            return Err(AccountError::new("account session storage root changed"));
+        }
+        let mut active = self
+            .accounts
+            .sync_staging
+            .write()
+            .map_err(|_| AccountError::new("account state is unavailable"))?;
+        if active.is_some() {
+            return Err(AccountError::new("account staging is already active"));
+        }
+        *active = Some(session);
+        drop(active);
+        Ok(SyncStaging {
+            window: StagingWindow(self.accounts),
+            operation: self,
+        })
+    }
+
+    fn persist_pending(&self, store: &Store, instance: &str) -> Result<(), AccountError> {
+        let account = {
+            let credentials = self
+                .accounts
+                .credentials
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            let CredentialState::Active(pending) = &*credentials else {
+                return Err(AccountError::new("account ownership is unavailable"));
+            };
+            pending.get(instance).cloned()
+        };
+        if let Some(account) = account {
+            store.save(&account).map_err(|_| {
+                AccountError::new("account credentials are awaiting keyring persistence")
+            })?;
+            let mut credentials = self
+                .accounts
+                .credentials
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            let CredentialState::Active(pending) = &mut *credentials else {
+                return Err(AccountError::new("account ownership is unavailable"));
+            };
+            if pending.get(instance) == Some(&account) {
+                pending.remove(instance);
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Operation<'_> {
     fn drop(&mut self) {
-        if self.accounts.has_pending_credentials().unwrap_or(true)
-            && let Ok(mut retained) = self.accounts.pending_guard.lock()
-        {
-            *retained = self.guard.take();
+        if let Some(guard) = self.guard.take() {
+            let released = {
+                // Drop must retain unsaved credentials and their writer fence,
+                // even when unwinding poisoned this state mutex.
+                let mut credentials = self
+                    .accounts
+                    .credentials
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match std::mem::replace(&mut *credentials, CredentialState::Idle) {
+                    CredentialState::Active(pending) if !pending.is_empty() => {
+                        *credentials = CredentialState::Retained { pending, guard };
+                        None
+                    }
+                    CredentialState::Active(_) => Some(guard),
+                    previous => {
+                        *credentials = previous;
+                        Some(guard)
+                    }
+                }
+            };
+            drop(released);
         }
-        drop(self.guard.take());
         // Pair the operation release with session waiters so they cannot miss it.
         let session = self.accounts.read_session.lock();
         drop(self.lock.take());
@@ -686,13 +991,27 @@ impl fmt::Debug for Accounts {
 }
 
 impl Accounts {
+    /// Creates an account boundary using one previously admitted storage root.
+    ///
+    /// Does not access credentials or the network. Filesystem operations retain
+    /// this capability through deferred work and cleanup. Credentials remain in
+    /// the canonical account namespace, shared across storage roots.
+    #[cfg(target_os = "linux")]
+    pub fn with_storage(runtime: RuntimeDir, root: StorageRoot) -> Self {
+        let mut accounts = Self::new(runtime);
+        accounts.storage = account_storage::StorageSelection::Explicit(root);
+        accounts
+    }
+
     /// Creates an account boundary without accessing the keyring or network.
     pub fn new(runtime: RuntimeDir) -> Self {
         Self {
+            storage: account_storage::StorageSelection::Default,
             runtime,
-            pending: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            keychain: None,
+            credentials: Mutex::new(CredentialState::Idle),
             operation: Mutex::new(()),
-            pending_guard: Mutex::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
             read_session: Mutex::new(None),
             session_ready: Condvar::new(),
@@ -701,11 +1020,11 @@ impl Accounts {
             metadata_generation: AtomicU64::new(0),
             clean_cache_generation: AtomicU64::new(0),
             clean_cache_update: Mutex::new(()),
-            sync_staging: RwLock::new(false),
+            sync_staging: RwLock::new(None),
             read_ahead_active: AtomicBool::new(false),
             active_writes: Mutex::new(HashSet::new()),
             background_admission: Arc::new(sync::BackgroundAdmission::default()),
-            automatic_active: Arc::new(AtomicBool::new(false)),
+            automatic_active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -715,6 +1034,24 @@ impl Accounts {
     /// Returns an error if the instance URL is unsafe or invalid.
     pub fn canonical_instance(instance: &str) -> Result<String, AccountError> {
         http::instance_and_ca(instance, None).map(|(base, _)| base.to_string())
+    }
+
+    /// Creates a native account boundary with an explicit Keychain access group.
+    ///
+    /// The containing app and extension must hold matching entitlements. This
+    /// group is separate from filesystem App Group configuration. All Keychain
+    /// access is noninteractive, including manual operations. `new` remains
+    /// usable for offline work on macOS, but refuses credential access without
+    /// this configuration. Construction performs no Keychain or network I/O.
+    ///
+    /// # Errors
+    /// Rejects an empty or malformed group; OS entitlement checks occur on use.
+    #[cfg(target_os = "macos")]
+    pub fn with_keychain(runtime: RuntimeDir, access_group: &str) -> Result<Self, AccountError> {
+        let config = ownership::credentials::KeychainConfig::new(access_group)?;
+        let mut accounts = Self::new(runtime);
+        accounts.keychain = Some(config);
+        Ok(accounts)
     }
 
     /// Returns the generation of locally invalidated mount metadata.
@@ -737,7 +1074,7 @@ impl Accounts {
     /// # Errors
     /// Returns an error if the cache cannot be safely inspected.
     pub fn clean_cache_status(&self) -> Result<CleanCacheStatus, AccountError> {
-        cache::status()
+        cache::status_in(&self.storage_root()?)
     }
 
     /// Observes all local stores without credentials, network or account-operation ownership.
@@ -745,7 +1082,7 @@ impl Accounts {
     /// # Errors
     /// Returns an error for unsafe paths, unavailable metadata/SQLite, overflow or scan limits.
     pub fn storage_status(&self) -> Result<StorageStatus, AccountError> {
-        storage::status()
+        storage::status_in(&self.storage_root()?)
     }
 
     /// Reads shared opt-in allocation-pressure policy without credentials/network.
@@ -753,7 +1090,7 @@ impl Accounts {
     /// # Errors
     /// Returns an error for invalid or unsafe private configuration.
     pub fn storage_limits(&self) -> Result<StorageLimitsView, AccountError> {
-        storage::limits::view()
+        storage::limits::view_in(&self.storage_root()?)
     }
 
     /// Persists user-chosen limits, or disables them, without deleting protected data.
@@ -764,7 +1101,8 @@ impl Accounts {
         &self,
         limits: Option<StorageLimits>,
     ) -> Result<StorageLimitsView, AccountError> {
-        storage::limits::set(limits)
+        storage::limits::validate(&limits)?;
+        storage::limits::set_in(&self.storage_root()?, limits)
     }
 
     /// Releases an inspected inactive store or namespace allowance, never data.
@@ -776,7 +1114,7 @@ impl Accounts {
         store: &str,
         token: &str,
     ) -> Result<(), AccountError> {
-        storage::sql_reservation::release(store, token)
+        storage::sql_reservation::release_in(&self.storage_root()?, store, token)
     }
 
     /// Reserves the single bounded background read-ahead slot.
@@ -843,14 +1181,19 @@ impl Accounts {
     ) -> Result<(), AccountError> {
         let _guard = self.begin_operation()?;
         self.clear_read_session()?;
-        let store = Store::open(_guard.connection()?)?;
+        let store = Store::open(_guard.credential_context()?)?;
         let (base, ca) = http::instance_and_ca(instance, ca_pem)?;
-        self.persist_pending(&store, base.as_str())?;
+        _guard.persist_pending(&store, base.as_str())?;
         // Check the destination before opening a browser; never replace ambiguous items.
         // Refuse to overwrite a matching item unless its contents are ours.
         let mut existing = store.load_existing_account(base.as_str())?;
         if let Some(account) = &existing {
-            offline::bind_identity(base.as_str(), &account.issuer, &account.subject)?;
+            offline::bind_identity_in(
+                _guard.storage_root()?,
+                base.as_str(),
+                &account.issuer,
+                &account.subject,
+            )?;
         }
         let discovery = match ca_pem {
             Some(pem) => Discovery::with_additional_ca(pem),
@@ -901,15 +1244,19 @@ impl Accounts {
         }
         let (url, state, nonce) = authorization.url();
         attempt.check()?;
-        browser
-            .open(url.as_str())
+        let deadline = std::time::Instant::now() + callback::CALLBACK_TIMEOUT;
+        let mut browser_request = browser
+            .open_for_sign_in(url.as_str(), attempt, &self.cancelled, deadline)
             .map_err(|_| AccountError::new("desktop browser could not open authorization"))?;
-        let code = listener.wait(
+        let deadline = browser_request.deadline();
+        let code = listener.wait_for_browser(
             state.secret(),
             config.issuer(),
             config.callback_issuer_required(),
             &self.cancelled,
-            &attempt.cancelled,
+            attempt,
+            &mut browser_request,
+            deadline,
         )?;
         self.check_cancelled()?;
         attempt.begin_exchange()?;
@@ -988,7 +1335,12 @@ impl Accounts {
                 .as_ref()
                 .and_then(|account| account.selected_space_verified.clone()),
         };
-        offline::bind_identity(base.as_str(), &account.issuer, &account.subject)?;
+        offline::bind_identity_in(
+            _guard.storage_root()?,
+            base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
         self.save_refresh(&store, &account)?;
         Ok(())
     }
@@ -1000,9 +1352,9 @@ impl Accounts {
     pub fn spaces(&self, instance: &str) -> Result<Vec<Space>, AccountError> {
         let _guard = self.begin_operation()?;
         self.clear_read_session()?;
-        let store = Store::open(_guard.connection()?)?;
+        let store = Store::open(_guard.credential_context()?)?;
         let (base, _) = http::instance_and_ca(instance, None)?;
-        self.persist_pending(&store, base.as_str())?;
+        _guard.persist_pending(&store, base.as_str())?;
         let mut account = store.load(base.as_str())?;
         let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
         self.refresh_if_needed(&mut account, &store, &client)?;
@@ -1016,9 +1368,9 @@ impl Accounts {
     pub fn select_space(&self, instance: &str, id: &str) -> Result<(), AccountError> {
         let _guard = self.begin_operation()?;
         self.clear_read_session()?;
-        let store = Store::open(_guard.connection()?)?;
+        let store = Store::open(_guard.credential_context()?)?;
         let (base, _) = http::instance_and_ca(instance, None)?;
-        self.persist_pending(&store, base.as_str())?;
+        _guard.persist_pending(&store, base.as_str())?;
         let mut account = store.load(base.as_str())?;
         let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
         self.refresh_if_needed(&mut account, &store, &client)?;
@@ -1031,7 +1383,8 @@ impl Accounts {
         self.check_cancelled()?;
         account.selected_space = Some(id.to_owned());
         account.selected_space_verified = Some(id.to_owned());
-        store.save(&account)
+        store.save(&account)?;
+        Ok(())
     }
 
     /// Checks the selected Space against the current user-scoped listing before mounting.
@@ -1043,11 +1396,7 @@ impl Accounts {
     /// Returns an error for an unverified selection or a failed online access check.
     pub fn check_mount_access(&self, instance: &str) -> Result<MountBinding, AccountError> {
         let session = self.read_session(instance)?;
-        let selected = session
-            .account
-            .selected_space
-            .as_deref()
-            .ok_or_else(|| AccountError::new("no Space is selected"))?;
+        let selected = bound_space(&session, None)?;
         let (listing, offline_allowed) = match list_spaces(
             &session.base,
             &session.account.access_token,
@@ -1068,6 +1417,7 @@ impl Accounts {
             Err(error) => return Err(error),
         };
         Ok(MountBinding {
+            root: session.root.clone(),
             instance: session.base.to_string(),
             space: selected.to_owned(),
             name: None,
@@ -1102,6 +1452,7 @@ impl Accounts {
             == 1)
             .then(|| found.name.clone());
         Ok(MountBinding {
+            root: session.root.clone(),
             instance: session.base.to_string(),
             space: id.to_owned(),
             name,
@@ -1145,7 +1496,8 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid offline Space path"));
         }
-        offline::offline_directory(base.as_str(), space, path, None)?.collect()
+        offline::offline_directory(&self.storage_root()?, base.as_str(), space, path, None)?
+            .collect()
     }
 
     /// Binds a read-only local mount to a previously verified retained Space.
@@ -1158,13 +1510,23 @@ impl Accounts {
         instance: &str,
         space: &str,
     ) -> Result<MountBinding, AccountError> {
+        self.bind_offline_space_in(self.storage_root()?, instance, space)
+    }
+
+    fn bind_offline_space_in(
+        &self,
+        root: account_storage::StorageRoot,
+        instance: &str,
+        space: &str,
+    ) -> Result<MountBinding, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid offline Space"));
         }
-        let (issuer, subject) = offline::mount_identity(base.as_str(), space)?;
-        offline::offline_directory(base.as_str(), space, &[], Some((&issuer, &subject)))?;
+        let (issuer, subject) = offline::mount_identity_in(&root, base.as_str(), space)?;
+        offline::offline_directory(&root, base.as_str(), space, &[], Some((&issuer, &subject)))?;
         Ok(MountBinding {
+            root,
             instance: base.to_string(),
             space: space.to_owned(),
             name: None,
@@ -1185,15 +1547,17 @@ impl Accounts {
         instance: &str,
         space: &str,
     ) -> Result<MountBinding, AccountError> {
-        let _owner = ownership::acquire_offline(&self.runtime)?;
+        let root = self.storage_root()?;
+        let _owner = ownership::acquire_offline_in(&root, &self.runtime)?;
         self.check_cancelled()?;
-        let mut binding = self.bind_offline_space(instance, space)?;
+        let mut binding = self.bind_offline_space_in(root, instance, space)?;
         binding.offline_writable = true;
         Ok(binding)
     }
 
     fn verify_offline_mount(&self, binding: &MountBinding) -> Result<(), AccountError> {
-        if offline::mount_identity(&binding.instance, &binding.space)?
+        self.storage.validate(&binding.root)?;
+        if offline::mount_identity_in(&binding.root, &binding.instance, &binding.space)?
             != (binding.issuer.clone(), binding.subject.clone())
         {
             return Err(AccountError::new("offline mount identity changed"));
@@ -1213,10 +1577,12 @@ impl Accounts {
         parent_id: &str,
     ) -> Result<DirectorySnapshot, AccountError> {
         if space.offline {
+            self.verify_offline_mount(space)?;
             if instance != space.instance {
                 return Err(AccountError::new("offline mount instance changed"));
             }
             return offline::offline_directory(
+                &space.root,
                 instance,
                 &space.space,
                 path,
@@ -1273,18 +1639,22 @@ impl Accounts {
         }) else {
             return Ok(None);
         };
+        self.storage.validate(&session.root)?;
         let space = bound_space(&session, Some(binding))?;
-        offline::verify_identity(
+        offline::verify_identity_in(
+            &session.root,
             session.base.as_str(),
             &session.account.issuer,
             &session.account.subject,
         )?;
-        let (remote, fenced) = offline::tree_remote_path(session.base.as_str(), space, path)?;
-        if fenced || offline::local_directory(session.base.as_str(), space, path)? {
+        let (remote, fenced) =
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
+        if fenced || offline::local_directory(&session.root, session.base.as_str(), space, path)? {
             return Ok(None);
         }
-        let observation = offline::begin_snapshot()?;
-        let observed = dav::directory_snapshot_timed(
+        let observation = offline::begin_snapshot_in(&session.root)?;
+        let observed = dav::directory_snapshot_timed_in(
+            &session.root,
             &session.base,
             space,
             &remote,
@@ -1293,15 +1663,7 @@ impl Accounts {
             Duration::from_secs(2),
         );
         if observed.as_ref().is_err_and(|error| error.unauthorized) {
-            let mut cached = self
-                .read_session
-                .lock()
-                .map_err(|_| AccountError::new("account state is unavailable"))?;
-            if cached.as_ref().is_some_and(|current| {
-                current.base == session.base && current.account == session.account
-            }) {
-                *cached = None;
-            }
+            self.invalidate_read_session(&session)?;
         }
         let mut entries = observed?;
         if !available() {
@@ -1314,13 +1676,12 @@ impl Accounts {
             .lock()
             .map_err(|_| AccountError::new("account state is unavailable"))?
             .as_ref()
-            .is_none_or(|current| {
-                current.base != session.base || current.account != session.account
-            })
+            .is_none_or(|current| !Arc::ptr_eq(current, &session))
         {
             return Ok(None);
         }
-        offline::verify_identity(
+        offline::verify_identity_in(
+            &session.root,
             session.base.as_str(),
             &session.account.issuer,
             &session.account.subject,
@@ -1365,7 +1726,7 @@ impl Accounts {
             self.verify_offline_mount(binding)?;
             return self.confirmed_mount_versions_local(binding, versions, entries);
         }
-        let session = self.read_session(binding.instance())?;
+        let session = self.read_session_in(&binding.root, binding.instance())?;
         self.confirmed_mount_versions_in(&session, binding, versions, entries)
     }
 
@@ -1388,6 +1749,9 @@ impl Accounts {
         versions: &[FileVersion],
         entries: &DirectorySnapshot,
     ) -> Result<Vec<(FileVersion, FileVersion)>, AccountError> {
+        if entries.storage_root()?.identity() != binding.root.identity() {
+            return Err(AccountError::new("directory storage root changed"));
+        }
         let mut confirmed = Vec::new();
         for staged in versions {
             if staged.instance != binding.instance || staged.space != binding.space {
@@ -1395,7 +1759,7 @@ impl Accounts {
                     "file version does not match mounted Space",
                 ));
             }
-            let Some((id, etag)) = offline::confirmed_write(staged)? else {
+            let Some((id, etag)) = offline::confirmed_write(&binding.root, staged)? else {
                 continue;
             };
             let Some(name) = staged.path.last() else {
@@ -1441,7 +1805,7 @@ impl Accounts {
             self.verify_offline_mount(binding)?;
             return self.confirmed_mount_directories_local(binding, directories, entries);
         }
-        let session = self.read_session(binding.instance())?;
+        let session = self.read_session_in(&binding.root, binding.instance())?;
         self.confirmed_mount_directories_in(&session, binding, directories, entries)
     }
 
@@ -1462,6 +1826,9 @@ impl Accounts {
         directories: &[(Vec<String>, String)],
         entries: &DirectorySnapshot,
     ) -> Result<Vec<(Vec<String>, String, Entry)>, AccountError> {
+        if entries.storage_root()?.identity() != binding.root.identity() {
+            return Err(AccountError::new("directory storage root changed"));
+        }
         let mut confirmed = Vec::new();
         for (path, resource) in directories {
             let Some(id) = resource
@@ -1470,7 +1837,8 @@ impl Accounts {
             else {
                 return Err(AccountError::new("invalid local directory identity"));
             };
-            let Some(confirmed_directory) = offline::confirmed_directory(&binding.instance, id)?
+            let Some(confirmed_directory) =
+                offline::confirmed_directory(&binding.root, &binding.instance, id)?
             else {
                 continue;
             };
@@ -1496,19 +1864,25 @@ impl Accounts {
         parent_id: Option<&str>,
     ) -> Result<DirectorySnapshot, AccountError> {
         let _permit = self.read_permit()?;
-        let session = self.read_session(instance)?;
+        let session = self.read_session_bound(instance, expected_space)?;
         let space = bound_space(&session, expected_space)?;
-        let observation = offline::begin_snapshot()?;
+        let observation = offline::begin_snapshot_in(&session.root)?;
         let (remote_path, move_fenced) =
-            offline::tree_remote_path(session.base.as_str(), space, path)?;
-        let mut entries = if offline::local_directory(session.base.as_str(), space, path)? {
-            DirectorySnapshot::empty()?
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
+        let mut entries = if offline::local_directory(
+            &session.root,
+            session.base.as_str(),
+            space,
+            path,
+        )? {
+            DirectorySnapshot::empty_in(&session.root)?
         } else if move_fenced {
-            offline::directory_snapshot(session.base.as_str(), space, path)?
+            offline::directory_snapshot_at(&session.root, session.base.as_str(), space, path)?
                 .ok_or_else(|| AccountError::new("directory rename requires attention"))?
         } else {
             match self.read_with_refresh(&session, |current| {
-                dav::directory_snapshot(
+                dav::directory_snapshot_in(
+                    &current.root,
                     &current.base,
                     space,
                     &remote_path,
@@ -1528,12 +1902,15 @@ impl Accounts {
                     // Queue behind local readers only after DAV, before SQL
                     // planning; retain the original observation's CAS fence.
                     let _state_turn = if expected_space.is_none() {
-                        Some(ownership::local_state_turn(Arc::clone(&self.cancelled))?)
+                        Some(ownership::local_state_turn_in(
+                            &session.root,
+                            Arc::clone(&self.cancelled),
+                        )?)
                     } else {
                         None
                     };
                     let _state_phase = if _state_turn.is_some() {
-                        Some(ownership::admit_local_state_turn()?)
+                        Some(ownership::admit_local_state_turn_in(&session.root)?)
                     } else {
                         None
                     };
@@ -1588,7 +1965,12 @@ impl Accounts {
                     entries
                 }
                 Err(error) if error.network => {
-                    let saved = offline::directory_snapshot(session.base.as_str(), space, path)?;
+                    let saved = offline::directory_snapshot_at(
+                        &session.root,
+                        session.base.as_str(),
+                        space,
+                        path,
+                    )?;
                     #[cfg(feature = "fault-injection")]
                     if std::env::var_os("CIRRUS_TEST_BLOCKER_TRACE").is_some() {
                         eprintln!(
@@ -1603,6 +1985,7 @@ impl Accounts {
                         // ancestor view, not the raw remote parent. Reuse its
                         // exact identity/copy proof, never an orphan fallback.
                         return offline::offline_directory(
+                            &session.root,
                             session.base.as_str(),
                             space,
                             path,
@@ -1629,7 +2012,7 @@ impl Accounts {
         path: &[String],
         id: &str,
     ) -> Result<FileVersion, AccountError> {
-        self.open_file_inner(instance, None, path, id, true)
+        self.open_file_inner(&self.storage_root()?, instance, None, path, id, true)
     }
 
     /// Opens a file within the Space bound to a mount.
@@ -1667,11 +2050,12 @@ impl Accounts {
                 checksums: entry.checksums().to_vec(),
             });
         }
-        self.open_file_inner(instance, Some(space), path, id, true)
+        self.open_file_inner(&space.root, instance, Some(space), path, id, true)
     }
 
     fn open_file_inner(
         &self,
+        storage: &account_storage::StorageRoot,
         instance: &str,
         expected_space: Option<&MountBinding>,
         path: &[String],
@@ -1682,16 +2066,19 @@ impl Accounts {
             .split_last()
             .ok_or_else(|| AccountError::new("invalid file path"))?;
         let _permit = self.read_permit()?;
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(storage, instance)?;
         let space = bound_space(&session, expected_space)?;
         if id.starts_with("cirrus-staged:") {
-            if !offline::publication::spaces(session.base.as_str(), Some(space))?.is_empty() {
+            if !offline::publication::spaces_in(&session.root, session.base.as_str(), Some(space))?
+                .is_empty()
+            {
                 let _guard = self.begin_local_operation(&session, true)?;
                 let operation = id
                     .strip_prefix("cirrus-staged:")
                     .and_then(|id| id.parse::<i64>().ok())
                     .ok_or_else(|| AccountError::new("invalid staged identity"))?;
-                offline::publication::recover(
+                offline::publication::recover_in(
+                    &session.root,
                     session.base.as_str(),
                     space,
                     path,
@@ -1700,14 +2087,15 @@ impl Accounts {
                     true,
                 )?;
             }
-            return offline::staged_version(session.base.as_str(), space, path, id)?
+            return offline::staged_version(&session.root, session.base.as_str(), space, path, id)?
                 .map(|(version, _)| version)
                 .ok_or_else(|| AccountError::new("staged file is unavailable"));
         }
         let (remote_path, move_fenced) =
-            offline::tree_remote_path(session.base.as_str(), space, path)?;
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
         if move_fenced {
             return offline::version(
+                &session.root,
                 session.base.as_str(),
                 space,
                 path,
@@ -1725,7 +2113,8 @@ impl Accounts {
             .split_last()
             .ok_or_else(|| AccountError::new("invalid file path"))?;
         let entries = match self.read_with_refresh(&session, |current| {
-            dav::directory_snapshot(
+            dav::directory_snapshot_in(
+                &current.root,
                 &current.base,
                 space,
                 remote_parent,
@@ -1736,6 +2125,7 @@ impl Accounts {
             Ok(entries) => entries,
             Err(error) if error.network && allow_offline => {
                 if let Some(version) = offline::version(
+                    &session.root,
                     session.base.as_str(),
                     space,
                     path,
@@ -1752,9 +2142,15 @@ impl Accounts {
                 let (name, parent) = path
                     .split_last()
                     .ok_or_else(|| AccountError::new("invalid file path"))?;
-                let saved = offline::directory_snapshot(session.base.as_str(), space, parent)?;
+                let saved = offline::directory_snapshot_at(
+                    &session.root,
+                    session.base.as_str(),
+                    space,
+                    parent,
+                )?;
                 let saved = if saved.is_none() && expected_space.is_some() {
                     Some(offline::offline_directory(
+                        &session.root,
                         session.base.as_str(),
                         space,
                         parent,
@@ -1779,6 +2175,7 @@ impl Accounts {
                         checksums: entry.checksums().to_vec(),
                     };
                     let origin = self.moved_cache_version(
+                        &session.root,
                         &version,
                         &session.account.issuer,
                         &session.account.subject,
@@ -1821,6 +2218,7 @@ impl Accounts {
 
     fn online_directory(
         &self,
+        storage: &account_storage::StorageRoot,
         instance: &str,
         binding: Option<&MountBinding>,
         path: &[String],
@@ -1828,10 +2226,11 @@ impl Accounts {
         pin_root: &[String],
     ) -> Result<DirectorySnapshot, AccountError> {
         let _permit = self.read_permit()?;
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(storage, instance)?;
         let space = bound_space(&session, binding)?;
         let snapshot = if save {
-            Some(offline::begin_pin_snapshot(
+            Some(offline::begin_pin_snapshot_in(
+                &session.root,
                 session.base.as_str(),
                 space,
                 pin_root,
@@ -1840,7 +2239,8 @@ impl Accounts {
             None
         };
         let entries = self.read_with_refresh(&session, |current| {
-            dav::directory_snapshot(
+            dav::directory_snapshot_in(
+                &current.root,
                 &current.base,
                 space,
                 path,
@@ -1872,7 +2272,7 @@ impl Accounts {
     /// Pins a path in an explicitly verified Space without changing selection.
     ///
     /// # Errors
-    /// Returns an error if the Space, traversal or durable pin cannot be verified.
+    /// Refuses active staging, unavailable retained originals, or an unverifiable Space or pin.
     pub fn pin_space(
         &self,
         instance: &str,
@@ -1900,27 +2300,29 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid Space path"));
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_bound(instance, binding)?;
         let space = bound_space(&session, binding)?.to_owned();
         let instance = session.base.to_string();
-        offline::check_pin_path(&instance, &space, root)?;
-        let local_state = offline::current_pin_local_state()?;
+        offline::check_pin_path(&session.root, &instance, &space, root)?;
+        let local_state = offline::current_pin_local_state(&session.root)?;
         let mut retries = 0;
         loop {
             let result = self
-                .collect_pin_files(&instance, binding, root, true)
+                .collect_pin_files(&session.root, &instance, binding, root, true)
                 .and_then(|tree| {
                     offline::replace_pin(
-                        (&instance, &space),
+                        &session.root,
+                        (&self.runtime, &self.cancelled, &instance, &space),
                         root,
                         &tree,
                         (retries != 0).then_some(&local_state),
                         |version, offset, length| {
-                            self.read_range_online(version, binding, offset, length)
+                            self.read_range_online(&session.root, version, binding, offset, length)
                                 .map(|(bytes, _metadata)| bytes)
                         },
                         |version| {
                             if self.open_file_inner(
+                                &session.root,
                                 &version.instance,
                                 binding,
                                 &version.path,
@@ -1933,7 +2335,14 @@ impl Accounts {
                             Ok(())
                         },
                         || {
-                            if self.collect_pin_files(&instance, binding, root, false)? != tree {
+                            if self.collect_pin_files(
+                                &session.root,
+                                &instance,
+                                binding,
+                                root,
+                                false,
+                            )? != tree
+                            {
                                 return Err(AccountError::new(
                                     "pin tree changed during verification",
                                 ));
@@ -1944,7 +2353,7 @@ impl Accounts {
                 });
             match result {
                 Err(error) if error.message == offline::PIN_SNAPSHOT_INTERRUPTED && retries < 2 => {
-                    if offline::current_pin_local_state()? != local_state {
+                    if offline::current_pin_local_state(&session.root)? != local_state {
                         return Err(error);
                     }
                     retries += 1;
@@ -1956,6 +2365,7 @@ impl Accounts {
 
     fn collect_pin_files(
         &self,
+        storage: &account_storage::StorageRoot,
         instance: &str,
         binding: Option<&MountBinding>,
         root: &[String],
@@ -1968,7 +2378,8 @@ impl Accounts {
         // Save every ancestor needed to reach a nested pin after restart,
         // including when pinning without first mounting the Space.
         for depth in 0..root.len().saturating_sub(1) {
-            let entries = self.online_directory(instance, binding, &root[..depth], save, root)?;
+            let entries =
+                self.online_directory(storage, instance, binding, &root[..depth], save, root)?;
             if !entries
                 .get(&root[depth])?
                 .is_some_and(|entry| entry.is_directory())
@@ -1977,7 +2388,7 @@ impl Accounts {
             }
         }
         if let Some((name, parent)) = root.split_last() {
-            let entries = self.online_directory(instance, binding, parent, save, root)?;
+            let entries = self.online_directory(storage, instance, binding, parent, save, root)?;
             let entry = entries
                 .get(name)?
                 .ok_or_else(|| AccountError::new("pin path not found"))?;
@@ -1987,7 +2398,14 @@ impl Accounts {
                 directories.push(root.to_vec());
             } else {
                 is_dir = false;
-                files.push(self.open_file_inner(instance, binding, root, entry.id(), false)?);
+                files.push(self.open_file_inner(
+                    storage,
+                    instance,
+                    binding,
+                    root,
+                    entry.id(),
+                    false,
+                )?);
             }
         } else {
             is_dir = true;
@@ -1996,7 +2414,7 @@ impl Accounts {
         }
         let mut visited = 0usize;
         while let Some(path) = directories.pop() {
-            let entries = self.online_directory(instance, binding, &path, save, root)?;
+            let entries = self.online_directory(storage, instance, binding, &path, save, root)?;
             let mut after = 0;
             loop {
                 let page = entries.page(after)?;
@@ -2020,6 +2438,7 @@ impl Accounts {
                         directories.push(child);
                     } else {
                         files.push(self.open_file_inner(
+                            storage,
                             instance,
                             binding,
                             &child,
@@ -2039,10 +2458,10 @@ impl Accounts {
         })
     }
 
-    /// Removes a pin and its stored chunks.
+    /// Protects retained original bytes locally before removing a pin.
     ///
     /// # Errors
-    /// Returns an error if account selection or durable storage is unavailable.
+    /// Refuses active staging, unavailable originals or insufficient durable storage.
     pub fn unpin(&self, instance: &str, root: &[String]) -> Result<(), AccountError> {
         self.unpin_inner(instance, None, root)
     }
@@ -2050,7 +2469,7 @@ impl Accounts {
     /// Removes only the named local pin, without credentials or network access.
     ///
     /// # Errors
-    /// Returns an error for invalid input, missing local identity or durable storage failure.
+    /// Refuses active staging, unavailable originals, invalid identity or insufficient storage.
     pub fn unpin_space(
         &self,
         instance: &str,
@@ -2061,7 +2480,9 @@ impl Accounts {
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
         }
-        offline::unpin(base.as_str(), space, root)
+        let storage_root = self.storage_root()?;
+        let _owner = ownership::acquire_offline_exclusive_in(&storage_root, &self.runtime)?;
+        offline::unpin(&storage_root, base.as_str(), space, root, &self.cancelled)
     }
 
     fn unpin_inner(
@@ -2070,9 +2491,16 @@ impl Accounts {
         binding: Option<&MountBinding>,
         root: &[String],
     ) -> Result<(), AccountError> {
-        let session = self.read_session(instance)?;
+        let session = self.read_session_bound(instance, binding)?;
         let space = bound_space(&session, binding)?;
-        offline::unpin(session.base.as_str(), space, root)
+        let _owner = ownership::acquire_offline_exclusive_in(&session.root, &self.runtime)?;
+        offline::unpin(
+            &session.root,
+            session.base.as_str(),
+            space,
+            root,
+            &self.cancelled,
+        )
     }
 
     /// Durably stages a local file and records an observed base version when available.
@@ -2086,6 +2514,7 @@ impl Accounts {
         source: &std::path::Path,
     ) -> Result<(), AccountError> {
         self.stage_file_inner(instance, None, path, source)
+            .map(|_| ())
     }
 
     /// Stages a local file in an explicitly verified Space without changing selection.
@@ -2101,6 +2530,23 @@ impl Accounts {
     ) -> Result<(), AccountError> {
         let binding = self.bind_space(instance, space)?;
         self.stage_file_inner(instance, Some(&binding), path, source)
+            .map(|_| ())
+    }
+
+    /// Streams a file into durable staging and returns its exact journal correlation.
+    ///
+    /// # Errors
+    /// Refuses unsafe source paths, changed principal/Space or failed publication.
+    /// This uses the normal engine source import; it is not remote completion.
+    pub fn stage_file_operation(
+        &self,
+        instance: &str,
+        space: &str,
+        path: &[String],
+        source: &std::path::Path,
+    ) -> Result<OperationHandle, AccountError> {
+        let binding = self.bind_space(instance, space)?;
+        self.stage_file_inner(instance, Some(&binding), path, source)
     }
 
     fn stage_file_inner(
@@ -2109,7 +2555,7 @@ impl Accounts {
         binding: Option<&MountBinding>,
         path: &[String],
         source: &std::path::Path,
-    ) -> Result<(), AccountError> {
+    ) -> Result<OperationHandle, AccountError> {
         if path.is_empty()
             || path.len() > 128
             || path.iter().any(|part| {
@@ -2123,13 +2569,25 @@ impl Accounts {
             return Err(AccountError::new("invalid Space path"));
         }
         let (base, _) = http::instance_and_ca(instance, None)?;
-        let guard = self.begin_operation()?;
-        let store = Store::open(guard.connection()?)?;
-        self.persist_pending(&store, base.as_str())?;
+        let root = if let Some(binding) = binding {
+            self.storage.validate(&binding.root)?;
+            binding.root.clone()
+        } else {
+            self.storage_root()?
+        };
+        let guard = self.begin_operation_in(&root)?;
+        let store = Store::open(guard.credential_context()?)?;
+        guard.persist_pending(&store, base.as_str())?;
         let account = store.load(base.as_str())?;
-        offline::bind_identity(base.as_str(), &account.issuer, &account.subject)?;
+        offline::bind_identity_in(
+            guard.storage_root()?,
+            base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
         let space = if let Some(binding) = binding {
-            if binding.instance != base.as_str()
+            if binding.root.identity() != guard.storage_root()?.identity()
+                || binding.instance != base.as_str()
                 || binding.issuer != account.issuer
                 || binding.subject != account.subject
             {
@@ -2137,13 +2595,11 @@ impl Accounts {
             }
             binding.space.as_str()
         } else {
-            account
-                .selected_space
-                .as_deref()
-                .ok_or_else(|| AccountError::new("no Space is selected"))?
+            verified_selection(&account)?
         };
-        let observation = offline::begin_snapshot().ok();
-        let (remote_path, uncertain) = offline::tree_remote_path(base.as_str(), space, path)?;
+        let observation = offline::begin_snapshot_in(guard.storage_root()?).ok();
+        let (remote_path, uncertain) =
+            offline::tree_remote_path(guard.storage_root()?, base.as_str(), space, path)?;
         if uncertain {
             return Err(AccountError::new("directory rename requires attention"));
         }
@@ -2157,17 +2613,27 @@ impl Accounts {
         {
             for depth in 0..path.len().saturating_sub(1) {
                 let logical = &path[..depth];
-                if offline::local_directory(base.as_str(), space, logical)? {
+                if offline::local_directory(guard.storage_root()?, base.as_str(), space, logical)? {
                     continue;
                 }
-                let (remote, fenced) = offline::tree_remote_path(base.as_str(), space, logical)?;
+                let (remote, fenced) = offline::tree_remote_path(
+                    guard.storage_root()?,
+                    base.as_str(),
+                    space,
+                    logical,
+                )?;
                 if fenced {
                     return Err(AccountError::new("directory rename requires attention"));
                 }
-                let observation = offline::begin_snapshot()?;
-                if let Ok(entries) =
-                    dav::directory_snapshot(&base, space, &remote, &account.access_token, &client)
-                {
+                let observation = offline::begin_snapshot_in(guard.storage_root()?)?;
+                if let Ok(entries) = dav::directory_snapshot_in(
+                    guard.storage_root()?,
+                    &base,
+                    space,
+                    &remote,
+                    &account.access_token,
+                    &client,
+                ) {
                     let _ = offline::save_directory_snapshot(
                         observation,
                         base.as_str(),
@@ -2178,14 +2644,20 @@ impl Accounts {
                 }
             }
         }
-        let parents = offline::observed_parent_identities(base.as_str(), space, path)?;
+        let parents =
+            offline::observed_parent_identities(guard.storage_root()?, base.as_str(), space, path)?;
         let entries = if !account.refresh_in_progress
             && now.is_some_and(|now| account.expires_at > now.saturating_add(30))
             && let Ok(client) = http::client(account.ca_pem.as_deref().map(str::as_bytes))
             && let Some((name, parent)) = remote_path.split_last()
-            && let Ok(entries) =
-                dav::directory_snapshot(&base, space, parent, &account.access_token, &client)
-        {
+            && let Ok(entries) = dav::directory_snapshot_in(
+                guard.storage_root()?,
+                &base,
+                space,
+                parent,
+                &account.access_token,
+                &client,
+            ) {
             if let (Some(observation), Some((_, logical_parent))) = (observation, path.split_last())
             {
                 let _ = offline::save_directory_snapshot(
@@ -2201,14 +2673,14 @@ impl Accounts {
             None
         };
         offline::stage_file(
+            guard.storage_root()?,
             base.as_str(),
             space,
             path,
             source,
             entries.as_ref(),
             &parents,
-        )?;
-        Ok(())
+        )
     }
 
     /// Publishes an extent-map mutation after payload and directory durability.
@@ -2224,6 +2696,24 @@ impl Accounts {
         base: Option<&FileVersion>,
         parents: &[DirectoryIdentity],
     ) -> Result<FileVersion, AccountError> {
+        self.stage_mount_mutation_operation(instance, expected_space, path, mutation, base, parents)
+            .map(|(version, _)| version)
+    }
+
+    /// Publishes a mounted mutation and its immutable operation correlation together.
+    ///
+    /// # Errors
+    /// Applies the same base-version, parent, principal and storage gates as
+    /// `stage_mount_mutation`; an operation handle is not remote confirmation.
+    pub fn stage_mount_mutation_operation(
+        &self,
+        instance: &str,
+        expected_space: &MountBinding,
+        path: &[String],
+        mutation: DirtyMutation<'_>,
+        base: Option<&FileVersion>,
+        parents: &[DirectoryIdentity],
+    ) -> Result<(FileVersion, OperationHandle), AccountError> {
         if path.is_empty()
             || path.len() > 128
             || path.iter().any(|part| {
@@ -2241,7 +2731,8 @@ impl Accounts {
             if !expected_space.offline_writable || instance != expected_space.instance {
                 return Err(AccountError::new("offline mount writes unavailable"));
             }
-            let _owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&expected_space.root)?;
+            let _owner = ownership::acquire_offline_in(&expected_space.root, &self.runtime)?;
             #[cfg(feature = "fault-injection")]
             if std::env::var("CIRRUS_TEST_OFFLINE_WRITE_OWNED_SPACE")
                 .ok()
@@ -2261,10 +2752,17 @@ impl Accounts {
                     "file version does not match mounted path",
                 ));
             }
-            let _state_turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
-            return offline::stage_offline_mutation(expected_space, path, mutation, base, parents);
+            let _state_turn =
+                ownership::local_state_turn_in(&expected_space.root, Arc::clone(&self.cancelled))?;
+            return offline::stage_offline_mutation_operation(
+                expected_space,
+                path,
+                mutation,
+                base,
+                parents,
+            );
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
         if base.is_some_and(|version| {
             version.instance != session.base.as_str()
@@ -2278,14 +2776,16 @@ impl Accounts {
         #[cfg(feature = "fault-injection")]
         wait_test_window("CIRRUS_TEST_WRITE_SYNC_WINDOW")?;
         let _guard = self.begin_local_operation(&session, true)?;
-        let _state_turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
-        let (_, uncertain) = offline::tree_remote_path(session.base.as_str(), space, path)?;
+        let _state_turn =
+            ownership::local_state_turn_in(&session.root, Arc::clone(&self.cancelled))?;
+        let (_, uncertain) =
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
         if uncertain && !base.is_some_and(|version| version.id.starts_with("cirrus-staged:")) {
             return Err(AccountError::new("directory rename requires attention"));
         }
         #[cfg(feature = "fault-injection")]
         wait_test_window("CIRRUS_TEST_WRITE_TREE_WINDOW")?;
-        offline::stage_mutation(expected_space, path, mutation, base, parents)
+        offline::stage_mutation_operation(expected_space, path, mutation, base, parents)
     }
 
     /// Verifies a pending staged-file rename before its journal transaction.
@@ -2330,13 +2830,15 @@ impl Accounts {
             {
                 return Err(AccountError::new("offline rename binding changed"));
             }
-            let owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&expected_space.root)?;
+            let owner = ownership::acquire_offline_in(&expected_space.root, &self.runtime)?;
             self.check_cancelled()?;
             self.verify_offline_mount(expected_space)?;
             // Preserve only already verified local ranges. Missing originals
             // remain unavailable; no credential lookup, DAV or hydration.
             for version in std::iter::once(source).chain(pending_target) {
                 let (_, name) = offline::staged_version(
+                    &expected_space.root,
                     &version.instance,
                     &version.space,
                     &version.path,
@@ -2344,7 +2846,7 @@ impl Accounts {
                 )?
                 .filter(|(current, _)| current == version)
                 .ok_or_else(|| AccountError::new("rename snapshot changed"))?;
-                offline::overlay::Overlay::load(&name)?.retain_available(
+                offline::overlay::Overlay::load_at(&expected_space.root, &name)?.retain_available(
                     |base, offset, length| {
                         self.read_offline_range(expected_space, base, offset, length)
                             .ok()
@@ -2352,6 +2854,7 @@ impl Accounts {
                 )?;
             }
             return Ok(PreparedFileRename {
+                root: expected_space.root.clone(),
                 _guard: None,
                 _offline_owner: Some(owner),
                 source,
@@ -2361,9 +2864,20 @@ impl Accounts {
                 parents,
                 offline: Some(expected_space.clone()),
                 cancelled: Arc::clone(&self.cancelled),
+                runtime: &self.runtime,
+                online: None,
+                local_observation: None,
             });
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
+            eprintln!(
+                "cirrus lab file rename admission: pid={} thread={:?} boundary=prepare-session-acquired",
+                std::process::id(),
+                std::thread::current().id()
+            );
+        }
         let space = bound_space(&session, Some(expected_space))?;
         if source.instance != session.base.as_str() || source.space != space {
             return Err(AccountError::new(
@@ -2387,36 +2901,29 @@ impl Accounts {
             .split_last()
             .ok_or_else(|| AccountError::new("invalid target path"))?;
         let guard = self.begin_shared_staging_operation(&session)?;
-        let source_base = offline::staged_source_base(source)?;
-        for version in std::iter::once(source).chain(pending_target) {
-            let (_, name) = offline::staged_version(
-                &version.instance,
-                &version.space,
-                &version.path,
-                &version.id,
-            )?
-            .filter(|(current, _)| current == version)
-            .ok_or_else(|| AccountError::new("rename snapshot changed"))?;
-            offline::overlay::Overlay::load(&name)?.retain_available(|base, offset, length| {
-                cache::read(&session, base, offset, length)
-                    .ok()
-                    .flatten()
-                    .or_else(|| offline::read(base, offset, length).ok())
-            })?;
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
+            eprintln!(
+                "cirrus lab file rename admission: pid={} thread={:?} boundary=prepare-staging-acquired",
+                std::process::id(),
+                std::thread::current().id()
+            );
         }
+        let source_base = offline::staged_source_base(&session.root, source)?;
         let directory = |path: &[String]| -> Result<DirectorySnapshot, AccountError> {
-            let observation = offline::begin_snapshot()?;
+            let observation = offline::begin_snapshot_in(&session.root)?;
             #[cfg(feature = "fault-injection")]
             wait_test_window("CIRRUS_TEST_FILE_RENAME_PREP_WINDOW")?;
-            if offline::local_directory(session.base.as_str(), space, path)? {
-                return DirectorySnapshot::empty();
+            if offline::local_directory(&session.root, session.base.as_str(), space, path)? {
+                return DirectorySnapshot::empty_in(&session.root);
             }
             let (remote_path, uncertain) =
-                offline::tree_remote_path(session.base.as_str(), space, path)?;
+                offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
             if uncertain {
                 return Err(AccountError::new("directory rename requires attention"));
             }
-            match dav::directory_snapshot(
+            match dav::directory_snapshot_in(
+                &session.root,
                 &session.base,
                 space,
                 &remote_path,
@@ -2437,9 +2944,13 @@ impl Accounts {
                     }
                     Ok(entries)
                 }
-                Err(error) if error.network => {
-                    offline::directory_snapshot(session.base.as_str(), space, path)?.ok_or(error)
-                }
+                Err(error) if error.network => offline::directory_snapshot_at(
+                    &session.root,
+                    session.base.as_str(),
+                    space,
+                    path,
+                )?
+                .ok_or(error),
                 Err(error) => Err(error),
             }
         };
@@ -2484,7 +2995,7 @@ impl Accounts {
         if let Some(pending_target) = pending_target
             && let Some((id, etag)) = observed_target
         {
-            let base = offline::staged_source_base(pending_target)?;
+            let base = offline::staged_source_base(&session.root, pending_target)?;
             if !base
                 .as_ref()
                 .is_some_and(|(base_id, base_etag)| base_id == id && base_etag == etag)
@@ -2492,7 +3003,25 @@ impl Accounts {
                 return Err(AccountError::new("rename target changed"));
             }
         }
+        let local_observation = if source_base.is_none()
+            && pending_target.is_none()
+            && observed_target.or(expected_target).is_none()
+            && source_parent == target_parent
+            && source_parent.len() == 1
+            && matches!(parents.source, [DirectoryIdentity::Pending(_)])
+            && parents.source == parents.destination
+        {
+            offline::local_rename_observation(
+                &session.root,
+                session.base.as_str(),
+                space,
+                source_parent,
+            )?
+        } else {
+            None
+        };
         Ok(PreparedFileRename {
+            root: session.root.clone(),
             _guard: Some(guard),
             _offline_owner: None,
             source,
@@ -2502,6 +3031,9 @@ impl Accounts {
             parents,
             offline: None,
             cancelled: Arc::clone(&self.cancelled),
+            runtime: &self.runtime,
+            online: Some(session),
+            local_observation,
         })
     }
 
@@ -2538,10 +3070,21 @@ impl Accounts {
             if !expected_space.offline_writable || instance != expected_space.instance {
                 return Err(AccountError::new("offline directory rename unavailable"));
             }
-            let _owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&expected_space.root)?;
+            let _owner =
+                ownership::acquire_offline_exclusive_in(&expected_space.root, &self.runtime)?;
             self.check_cancelled()?;
             self.verify_offline_mount(expected_space)?;
-            let _turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
+            offline::protect_moving_pin_originals(
+                &expected_space.root,
+                instance,
+                &expected_space.space,
+                source,
+                destination,
+                &self.cancelled,
+            )?;
+            let _turn =
+                ownership::local_state_turn_in(&expected_space.root, Arc::clone(&self.cancelled))?;
             let mut relocated = Vec::with_capacity(open_versions.len());
             for version in open_versions {
                 if version.instance != instance
@@ -2556,6 +3099,7 @@ impl Accounts {
                 relocated.push(next);
             }
             offline::rename_local_directory(
+                &expected_space.root,
                 (instance, &expected_space.space),
                 source,
                 destination,
@@ -2566,9 +3110,19 @@ impl Accounts {
             )?;
             return Ok(relocated);
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
-        let _guard = self.begin_local_operation(&session, false)?;
+        #[cfg(feature = "fault-injection")]
+        wait_test_window("CIRRUS_TEST_LOCAL_TREE_SESSION_WINDOW")?;
+        let _guard = self.begin_owned_local_operation(&session)?;
+        offline::protect_moving_pin_originals(
+            &session.root,
+            session.base.as_str(),
+            space,
+            source,
+            destination,
+            &self.cancelled,
+        )?;
         let mut relocated = Vec::with_capacity(open_versions.len());
         for version in open_versions {
             if version.instance != session.base.as_str()
@@ -2576,6 +3130,7 @@ impl Accounts {
                 || !version.path.starts_with(source)
                 || !version.id.starts_with("cirrus-staged:")
                 || offline::staged_version(
+                    &session.root,
                     &version.instance,
                     &version.space,
                     &version.path,
@@ -2593,6 +3148,7 @@ impl Accounts {
             relocated.push(next);
         }
         offline::rename_local_directory(
+            &session.root,
             (session.base.as_str(), space),
             source,
             destination,
@@ -2640,13 +3196,16 @@ impl Accounts {
             if !expected_space.offline_writable || instance != expected_space.instance {
                 return Err(AccountError::new("offline directory rename unavailable"));
             }
-            let owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&expected_space.root)?;
+            let owner =
+                ownership::acquire_offline_exclusive_in(&expected_space.root, &self.runtime)?;
             self.check_cancelled()?;
             self.verify_offline_mount(expected_space)?;
             let (name, parent) = source_path
                 .split_last()
                 .ok_or_else(|| AccountError::new("invalid tree source"))?;
             let entry = offline::offline_directory(
+                &expected_space.root,
                 instance,
                 &expected_space.space,
                 parent,
@@ -2677,6 +3236,7 @@ impl Accounts {
                     .ok_or_else(|| AccountError::new("invalid tree destination"))?;
                 Some(
                     offline::offline_directory(
+                        &expected_space.root,
                         instance,
                         &expected_space.space,
                         parent,
@@ -2692,11 +3252,14 @@ impl Accounts {
                 None
             };
             return Ok(PreparedRemoteTree {
+                root: expected_space.root.clone(),
                 _staging: None,
-                _guard: None,
                 _offline_owner: Some(owner),
                 // Exclude admitted sync preflights as well as uncertain MOVEs.
-                _sync_owner: Some(ownership::acquire_sync(&self.runtime)?),
+                _sync_owner: Some(ownership::acquire_sync_in(
+                    &expected_space.root,
+                    &self.runtime,
+                )?),
                 offline: Some(expected_space.clone()),
                 cancelled: Arc::clone(&self.cancelled),
                 instance: instance.to_owned(),
@@ -2712,35 +3275,32 @@ impl Accounts {
                 relocated,
             });
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
         let guard = self.begin_owned_local_operation(&session)?;
         // As for empty-directory preparation, keep exclusive cross-process
         // ownership but allow this daemon's local staging during DAV work.
-        *self
-            .sync_staging
-            .write()
-            .map_err(|_| AccountError::new("account state is unavailable"))? = true;
-        let staging = SyncStaging(self);
+        let staging = guard.begin_staging(Arc::clone(&session))?;
         let (mapped_source, _) =
-            offline::tree_remote_path(session.base.as_str(), space, source_path)?;
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, source_path)?;
         let (mapped_destination, _) =
-            offline::tree_remote_path(session.base.as_str(), space, destination)?;
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, destination)?;
         if mapped_source != source_path || mapped_destination != destination {
             return Err(AccountError::new("path has unresolved operations"));
         }
         let directory = |path: &[String]| -> Result<DirectorySnapshot, AccountError> {
             self.check_cancelled()?;
-            let observation = offline::begin_snapshot()?;
-            if offline::local_directory(session.base.as_str(), space, path)? {
-                return DirectorySnapshot::empty();
+            let observation = offline::begin_snapshot_in(&session.root)?;
+            if offline::local_directory(&session.root, session.base.as_str(), space, path)? {
+                return DirectorySnapshot::empty_in(&session.root);
             }
             let (remote, uncertain) =
-                offline::tree_remote_path(session.base.as_str(), space, path)?;
+                offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
             if uncertain {
                 return Err(AccountError::new("directory rename requires attention"));
             }
-            match dav::directory_snapshot(
+            match dav::directory_snapshot_in(
+                &session.root,
                 &session.base,
                 space,
                 &remote,
@@ -2761,9 +3321,13 @@ impl Accounts {
                     }
                     Ok(entries)
                 }
-                Err(error) if error.network => {
-                    offline::directory_snapshot(session.base.as_str(), space, path)?.ok_or(error)
-                }
+                Err(error) if error.network => offline::directory_snapshot_at(
+                    &session.root,
+                    session.base.as_str(),
+                    space,
+                    path,
+                )?
+                .ok_or(error),
                 Err(error) => Err(error),
             }
         };
@@ -2806,6 +3370,7 @@ impl Accounts {
             }
             let current = if version.id.starts_with("cirrus-staged:") {
                 offline::staged_version(
+                    &session.root,
                     &version.instance,
                     &version.space,
                     &version.path,
@@ -2844,8 +3409,8 @@ impl Accounts {
             relocated.push(next);
         }
         Ok(PreparedRemoteTree {
+            root: session.root.clone(),
             _staging: Some(staging),
-            _guard: Some(guard),
             _offline_owner: None,
             _sync_owner: None,
             offline: None,
@@ -2891,31 +3456,29 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid Space path"));
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
         let guard = self.begin_owned_local_operation(&session)?;
         // Keep the same cross-process credential/namespace ownership as before,
         // but admit this daemon's identity-checked local staging while DAV is
         // in flight, just as during sync. Other account operations and peer
         // writers still cannot acquire this exclusive account owner.
-        *self
-            .sync_staging
-            .write()
-            .map_err(|_| AccountError::new("account state is unavailable"))? = true;
-        let staging = SyncStaging(self);
-        let (mapped_source, _) = offline::tree_remote_path(session.base.as_str(), space, source)?;
+        let staging = guard.begin_staging(Arc::clone(&session))?;
+        let (mapped_source, _) =
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, source)?;
         let (mapped_destination, _) =
-            offline::tree_remote_path(session.base.as_str(), space, destination)?;
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, destination)?;
         if mapped_source != source || mapped_destination != destination {
             return Err(AccountError::new("path has unresolved operations"));
         }
         let directory = |path: &[String]| -> Result<DirectorySnapshot, AccountError> {
             self.check_cancelled()?;
-            let observation = offline::begin_snapshot()?;
-            if offline::local_directory(session.base.as_str(), space, path)? {
-                return DirectorySnapshot::empty();
+            let observation = offline::begin_snapshot_in(&session.root)?;
+            if offline::local_directory(&session.root, session.base.as_str(), space, path)? {
+                return DirectorySnapshot::empty_in(&session.root);
             }
-            match dav::directory_snapshot(
+            match dav::directory_snapshot_in(
+                &session.root,
                 &session.base,
                 space,
                 path,
@@ -2936,9 +3499,13 @@ impl Accounts {
                     }
                     Ok(entries)
                 }
-                Err(error) if error.network => {
-                    offline::directory_snapshot(session.base.as_str(), space, path)?.ok_or(error)
-                }
+                Err(error) if error.network => offline::directory_snapshot_at(
+                    &session.root,
+                    session.base.as_str(),
+                    space,
+                    path,
+                )?
+                .ok_or(error),
                 Err(error) => Err(error),
             }
         };
@@ -2960,14 +3527,15 @@ impl Accounts {
             return Err(AccountError::new("rename target changed"));
         }
         Ok(PreparedEmptyDirectory {
+            root: session.root.clone(),
             _staging: staging,
-            _guard: guard,
             instance: session.base.to_string(),
             space: space.to_owned(),
             source,
             destination,
             base,
             parents,
+            cancelled: Arc::clone(&self.cancelled),
         })
     }
 
@@ -2981,9 +3549,9 @@ impl Accounts {
         expected_space: &MountBinding,
         path: &[String],
     ) -> Result<bool, AccountError> {
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
-        offline::any_unresolved_beneath(session.base.as_str(), space, path)
+        offline::any_unresolved_beneath(&session.root, session.base.as_str(), space, path)
     }
 
     /// Queues a bounded local namespace operation and returns its journal ID.
@@ -2999,6 +3567,23 @@ impl Accounts {
         base: Option<(&str, &str)>,
         parents: &[DirectoryIdentity],
     ) -> Result<i64, AccountError> {
+        self.stage_namespace_operation(instance, expected_space, path, kind, base, parents)
+            .map(|operation| operation.id())
+    }
+
+    /// Queues namespace work and captures its exact identity in the publication transaction.
+    ///
+    /// # Errors
+    /// Applies the same binding, parent, namespace and storage gates as `stage_namespace`.
+    pub fn stage_namespace_operation(
+        &self,
+        instance: &str,
+        expected_space: &MountBinding,
+        path: &[String],
+        kind: &str,
+        base: Option<(&str, &str)>,
+        parents: &[DirectoryIdentity],
+    ) -> Result<OperationHandle, AccountError> {
         if path.is_empty()
             || path.len() > 128
             || path.iter().any(|part| {
@@ -3025,11 +3610,14 @@ impl Accounts {
             {
                 return Err(AccountError::new("offline namespace operation unavailable"));
             }
-            let _owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&expected_space.root)?;
+            let _owner = ownership::acquire_offline_in(&expected_space.root, &self.runtime)?;
             self.check_cancelled()?;
             self.verify_offline_mount(expected_space)?;
-            let _state_turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
-            return offline::queue_namespace(
+            let _state_turn =
+                ownership::local_state_turn_in(&expected_space.root, Arc::clone(&self.cancelled))?;
+            return offline::queue_namespace_operation(
+                &expected_space.root,
                 instance,
                 &expected_space.space,
                 path,
@@ -3039,14 +3627,16 @@ impl Accounts {
                 Some(expected_space),
             );
         }
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
         let _guard = self.begin_local_operation(&session, false)?;
-        let (_, uncertain) = offline::tree_remote_path(session.base.as_str(), space, path)?;
+        let (_, uncertain) =
+            offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
         if uncertain {
             return Err(AccountError::new("directory rename requires attention"));
         }
-        offline::queue_namespace(
+        offline::queue_namespace_operation(
+            &session.root,
             session.base.as_str(),
             space,
             path,
@@ -3070,10 +3660,11 @@ impl Accounts {
         detached: bool,
         parents: &[DirectoryIdentity],
     ) -> Result<(), AccountError> {
-        let session = self.read_session(instance)?;
+        let session = self.read_session_in(&expected_space.root, instance)?;
         let space = bound_space(&session, Some(expected_space))?;
         let _guard = self.begin_local_operation(&session, false)?;
         offline::remove_staged(
+            &session.root,
             (session.base.as_str(), space),
             path,
             resource,
@@ -3102,11 +3693,14 @@ impl Accounts {
             return Err(AccountError::new("offline unlink binding changed"));
         }
         let _priority = self.request_foreground();
-        let _owner = ownership::acquire_offline(&self.runtime)?;
+        self.storage.validate(&binding.root)?;
+        let _owner = ownership::acquire_offline_in(&binding.root, &self.runtime)?;
         self.check_cancelled()?;
         self.verify_offline_mount(binding)?;
-        let _state_turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
+        let _state_turn =
+            ownership::local_state_turn_in(&binding.root, Arc::clone(&self.cancelled))?;
         offline::remove_staged(
+            &binding.root,
             (&version.instance, &version.space),
             &version.path,
             &version.id,
@@ -3134,22 +3728,30 @@ impl Accounts {
                 return Err(AccountError::new("offline detached binding changed"));
             }
             let _priority = self.request_foreground();
-            let _owner = ownership::acquire_offline(&self.runtime)?;
+            self.storage.validate(&binding.root)?;
+            let _owner = ownership::acquire_offline_in(&binding.root, &self.runtime)?;
             self.check_cancelled()?;
+            self.verify_offline_mount(binding)?;
             if !offline::verify_offline_detached(binding, version)? {
                 return Err(AccountError::new("offline detached version changed"));
             }
-            let _state_turn = ownership::local_state_turn(Arc::clone(&self.cancelled))?;
-            return offline::stage_detached_mutation(version, mutation, Some(binding));
+            let _state_turn =
+                ownership::local_state_turn_in(&binding.root, Arc::clone(&self.cancelled))?;
+            return offline::stage_detached_mutation(
+                &binding.root,
+                version,
+                mutation,
+                Some(binding),
+            );
         }
-        let session = self.read_session(&version.instance)?;
+        let session = self.read_session_in(&binding.root, &version.instance)?;
         if bound_space(&session, Some(binding))? != version.space {
             return Err(AccountError::new(
                 "file version does not match mounted Space",
             ));
         }
         let _guard = self.begin_local_operation(&session, true)?;
-        offline::stage_detached_mutation(version, mutation, None)
+        offline::stage_detached_mutation(&session.root, version, mutation, None)
     }
 
     /// Lists locally staged operations; none are uploaded automatically.
@@ -3169,7 +3771,8 @@ impl Accounts {
         if before == Some(0) {
             return Err(AccountError::new("invalid journal cursor"));
         }
-        let mut page = offline::journal(base.as_str(), space, before)?;
+        let root = self.storage_root()?;
+        let mut page = offline::journal_in(&root, base.as_str(), space, before)?;
         // Do not hold the upload-state lock while SQLite scans retained history.
         // Another daemon's active upload remains conservatively ambiguous.
         let active = self
@@ -3177,7 +3780,9 @@ impl Accounts {
             .lock()
             .map_err(|_| AccountError::new("upload status is unavailable"))?;
         for entry in &mut page.entries {
-            if entry.state == JournalState::UncertainOrInProgress && active.contains(&entry.id) {
+            if entry.state == JournalState::UncertainOrInProgress
+                && active.contains(&(root.identity(), entry.id))
+            {
                 entry.state = JournalState::Uploading;
             }
         }
@@ -3194,7 +3799,8 @@ impl Accounts {
         offset: u32,
     ) -> Result<Vec<(String, String)>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::list(base.as_str(), None, offset)
+        let storage = self.storage_root()?;
+        recovery::list(&storage, base.as_str(), None, offset)
     }
 
     /// Lists immutable displaced pin copies by independent local ID.
@@ -3207,7 +3813,8 @@ impl Accounts {
         offset: u32,
     ) -> Result<Vec<(String, String)>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::pin_copies(base.as_str(), offset)
+        let storage = self.storage_root()?;
+        recovery::pin_copies(&storage, base.as_str(), offset)
     }
 
     /// Lists captured directories and exact file versions in one retained copy.
@@ -3222,7 +3829,8 @@ impl Accounts {
         offset: u32,
     ) -> Result<Vec<(String, String)>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::pin_copy_entries(base.as_str(), space, id, offset)
+        let storage = self.storage_root()?;
+        recovery::pin_copy_entries(&storage, base.as_str(), space, id, offset)
     }
 
     /// Exports one retained copy's selected file without credentials or network.
@@ -3239,7 +3847,16 @@ impl Accounts {
         destination: &std::path::Path,
     ) -> Result<(), AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::export_pin_copy(base.as_str(), space, id, path, selector, destination)
+        let storage = self.storage_root()?;
+        recovery::export_pin_copy(
+            &storage,
+            base.as_str(),
+            space,
+            id,
+            path,
+            selector,
+            destination,
+        )
     }
 
     /// Removes only one explicitly identified immutable retained pin copy.
@@ -3253,7 +3870,8 @@ impl Accounts {
         id: i64,
     ) -> Result<(), AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::remove_pin_copy(base.as_str(), space, id)
+        let storage = self.storage_root()?;
+        recovery::remove_pin_copy(&storage, base.as_str(), space, id)
     }
 
     /// Lists journal-referenced immutable roots without scanning logical file content.
@@ -3266,7 +3884,8 @@ impl Accounts {
         offset: u32,
     ) -> Result<Vec<(String, String)>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::staged_list(base.as_str(), offset)
+        let storage = self.storage_root()?;
+        recovery::staged_list(&storage, base.as_str(), offset)
     }
 
     /// Exports a selected journal-referenced staged copy without network access.
@@ -3281,7 +3900,8 @@ impl Accounts {
         destination: &std::path::Path,
     ) -> Result<(), AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::staged_export(base.as_str(), id, selector, destination)
+        let storage = self.storage_root()?;
+        recovery::staged_export(&storage, base.as_str(), id, selector, destination)
     }
 
     /// Lists retained file metadata for one pin. Each value is a selector,
@@ -3297,7 +3917,8 @@ impl Accounts {
         offset: u32,
     ) -> Result<Vec<(String, String)>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
-        recovery::list(base.as_str(), Some((space, root)), offset)
+        let storage = self.storage_root()?;
+        recovery::list(&storage, base.as_str(), Some((space, root)), offset)
     }
 
     /// Exports a retained, possibly stale, version to a new local file.
@@ -3315,6 +3936,7 @@ impl Accounts {
     ) -> Result<(), AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         recovery::export(
+            &self.storage_root()?,
             base.as_str(),
             space,
             source.0,
@@ -3376,8 +3998,19 @@ impl Accounts {
         requested_space: Option<&str>,
         mode: executor::Mode,
     ) -> Result<WriteTurnOutcome, AccountError> {
-        let _sync_guard = ownership::acquire_sync(&self.runtime)?;
-        let mut session = self.read_session(instance)?;
+        let root = self.storage_root()?;
+        self.sync_pending_at(&root, instance, requested_space, mode)
+    }
+
+    fn sync_pending_at(
+        &self,
+        root: &account_storage::StorageRoot,
+        instance: &str,
+        requested_space: Option<&str>,
+        mode: executor::Mode,
+    ) -> Result<WriteTurnOutcome, AccountError> {
+        let _sync_guard = ownership::acquire_sync_in(root, &self.runtime)?;
+        let mut session = self.read_session_in(root, instance)?.as_ref().clone();
         let result = self.sync_pending_once(&mut session, requested_space, mode);
         if mode != executor::Mode::Automatic
             || !result
@@ -3394,9 +4027,9 @@ impl Accounts {
         // recursively enter account preparation.
         self.check_cancelled()?;
         executor::preflight_checkpoint()?;
-        offline::database()?.execute("DELETE FROM sync_reads WHERE operation_id IN (SELECT id FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2))", rusqlite::params![session.base.as_str(),requested_space])
+        offline::database_in(&session.root)?.execute("DELETE FROM sync_reads WHERE operation_id IN (SELECT id FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2))", rusqlite::params![session.base.as_str(),requested_space])
             .map_err(|_| AccountError::new("cannot invalidate rejected sync preflight"))?;
-        session = self.refresh_rejected_session(&session)?;
+        session = self.refresh_rejected_session(&session)?.as_ref().clone();
         self.check_cancelled()?;
         executor::preflight_checkpoint()?;
         // One renewed turn only. A second 401 is Attention, not an endless
@@ -3412,13 +4045,14 @@ impl Accounts {
         mode: executor::Mode,
     ) -> Result<WriteTurnOutcome, AccountError> {
         let bounded = mode != executor::Mode::Manual;
-        let guard = self.begin_operation()?;
+        let mut guard = self.begin_operation_in(&session.root)?;
         self.clear_read_session()?;
-        let store = Store::open(guard.connection()?)?;
-        self.persist_pending(&store, session.base.as_str())?;
+        let store = Store::open(guard.credential_context()?)?;
+        guard.persist_pending(&store, session.base.as_str())?;
         session.account = store.load(session.base.as_str())?;
         if mode == executor::Mode::Automatic {
-            offline::verify_identity(
+            offline::verify_identity_in(
+                &session.root,
                 session.base.as_str(),
                 &session.account.issuer,
                 &session.account.subject,
@@ -3428,7 +4062,8 @@ impl Accounts {
                 error
             })?;
         } else {
-            offline::bind_identity(
+            offline::bind_identity_in(
+                &session.root,
                 session.base.as_str(),
                 &session.account.issuer,
                 &session.account.subject,
@@ -3455,7 +4090,8 @@ impl Accounts {
         }
         if mode == executor::Mode::Manual
             && let Some(space) = requested_space
-            && !offline::publication::spaces(session.base.as_str(), Some(space))?.is_empty()
+            && !offline::publication::spaces_in(&session.root, session.base.as_str(), Some(space))?
+                .is_empty()
         {
             return Err(AccountError::new(
                 "local publication requires recovery; Space fenced; reopen the file before syncing",
@@ -3477,7 +4113,7 @@ impl Accounts {
         }
         guard
             .guard
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| AccountError::new("account ownership is unavailable"))?
             .downgrade()?;
         // flock downgrade is not atomic. Re-read credentials under the shared
@@ -3489,17 +4125,11 @@ impl Accounts {
                 "account changed while starting sync; retry",
             ));
         }
-        *self
-            .read_session
-            .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))? =
-            Some(session.clone());
+        drop(store);
+        let published = Arc::new(session.clone());
+        self.publish_read_session(&guard, Arc::clone(&published))?;
         self.session_ready.notify_all();
-        *self
-            .sync_staging
-            .write()
-            .map_err(|_| AccountError::new("account state is unavailable"))? = true;
-        let _staging_window = SyncStaging(self);
+        let staging_window = guard.begin_staging(published)?;
         if mode == executor::Mode::Automatic {
             // Same-principal refresh is serialized by the exclusive bus owner;
             // shared principal ownership also permits retained local staging.
@@ -3535,11 +4165,12 @@ impl Accounts {
             }
         };
         let mut unlisted = HashSet::new();
-        let preflight_through = offline::journal_high_water(session.base.as_str())?;
+        let preflight_through = offline::journal_high_water(&session.root, session.base.as_str())?;
         let mut after = 0;
         loop {
             self.check_cancelled()?;
-            let page = offline::tree_move_page(
+            let page = offline::tree_move_page_in(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 after,
@@ -3557,6 +4188,7 @@ impl Accounts {
         loop {
             self.check_cancelled()?;
             let page = offline::pending_writes(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 after,
@@ -3575,6 +4207,7 @@ impl Accounts {
             loop {
                 self.check_cancelled()?;
                 let page = offline::pending_namespace(
+                    &session.root,
                     session.base.as_str(),
                     requested_space,
                     mkdir,
@@ -3591,21 +4224,24 @@ impl Accounts {
             }
         }
         let invalid_journal =
-            offline::invalid_journal_spaces(session.base.as_str(), requested_space)?;
+            offline::invalid_journal_spaces(&session.root, session.base.as_str(), requested_space)?;
         let local_publications =
-            offline::publication::spaces(session.base.as_str(), requested_space)?;
+            offline::publication::spaces_in(&session.root, session.base.as_str(), requested_space)?;
         let mut blocked = unlisted.clone();
         blocked.extend(local_publications.iter().cloned());
         blocked.extend(invalid_journal.iter().cloned());
         blocked.extend(offline::unsettled_mkdir_spaces(
+            &session.root,
             session.base.as_str(),
             requested_space,
         )?);
         blocked.extend(offline::tree_blocked_spaces(
+            &session.root,
             session.base.as_str(),
             requested_space,
         )?);
         blocked.extend(offline::parent_conflict_spaces(
+            &session.root,
             session.base.as_str(),
             requested_space,
         )?);
@@ -3620,6 +4256,7 @@ impl Accounts {
         let mut verification_after = 0;
         loop {
             let page = offline::upload_verifications(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 verification_after,
@@ -3640,12 +4277,13 @@ impl Accounts {
                         .active_writes
                         .lock()
                         .map_err(|_| AccountError::new("upload status is unavailable"))?;
-                    if !active.insert(verification.operation.id) {
+                    if !active.insert((session.root.identity(), verification.operation.id)) {
                         return Err(AccountError::new("write is already being synchronized"));
                     }
                 }
                 let _active = ActiveWrite {
                     accounts: self,
+                    root: session.root.clone(),
                     id: verification.operation.id,
                 };
                 let outcome = self.advance_upload(session, &mut verification, bounded)?;
@@ -3665,11 +4303,17 @@ impl Accounts {
         if bounded && !blocked.is_empty() {
             return Ok(WriteTurnOutcome::Attention);
         }
-        if bounded && offline::write_turn_dependencies(session.base.as_str(), requested_space)? {
+        if bounded
+            && offline::write_turn_dependencies(
+                &session.root,
+                session.base.as_str(),
+                requested_space,
+            )?
+        {
             return Ok(WriteTurnOutcome::Dependencies);
         }
-        let trees_through = offline::journal_high_water(session.base.as_str())?;
-        let mkdir_through = offline::journal_high_water(session.base.as_str())?;
+        let trees_through = offline::journal_high_water(&session.root, session.base.as_str())?;
+        let mkdir_through = offline::journal_high_water(&session.root, session.base.as_str())?;
         let mut after = (0, 0);
         loop {
             if bounded {
@@ -3677,6 +4321,7 @@ impl Accounts {
             }
             self.check_cancelled()?;
             let page = offline::pending_namespace(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 true,
@@ -3691,6 +4336,7 @@ impl Accounts {
                 }
                 check(&operation.space)?;
                 if !offline::tree_destination_contains(
+                    &session.root,
                     session.base.as_str(),
                     &operation.space,
                     &operation.path,
@@ -3706,7 +4352,8 @@ impl Accounts {
                 break;
             }
             self.check_cancelled()?;
-            let page = offline::tree_move_page(
+            let page = offline::tree_move_page_in(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 after,
@@ -3720,8 +4367,12 @@ impl Accounts {
                 }
                 check(&tree.space)?;
                 if let Err(error) = self.sync_tree_move(session, &tree) {
-                    if offline::tree_blocked_spaces(session.base.as_str(), Some(&tree.space))?
-                        .contains(&tree.space)
+                    if offline::tree_blocked_spaces(
+                        &session.root,
+                        session.base.as_str(),
+                        Some(&tree.space),
+                    )?
+                    .contains(&tree.space)
                     {
                         blocked.insert(tree.space.clone());
                     } else {
@@ -3730,7 +4381,7 @@ impl Accounts {
                 }
             }
         }
-        let mkdir_through = offline::journal_high_water(session.base.as_str())?;
+        let mkdir_through = offline::journal_high_water(&session.root, session.base.as_str())?;
         let mut after = (0, 0);
         loop {
             if bounded {
@@ -3738,6 +4389,7 @@ impl Accounts {
             }
             self.check_cancelled()?;
             let page = offline::pending_namespace(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 true,
@@ -3756,12 +4408,13 @@ impl Accounts {
         }
         // Bound this pass even when mounted writers append journal entries while
         // network I/O is in flight. Newly appended writes remain for a later pass.
-        let writes_through = offline::journal_high_water(session.base.as_str())?;
+        let writes_through = offline::journal_high_water(&session.root, session.base.as_str())?;
         let mut after = 0;
         let mut attempted = false;
         'writes: loop {
             self.check_cancelled()?;
             let page = offline::pending_writes(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 after,
@@ -3775,6 +4428,7 @@ impl Accounts {
                 }
                 check(&operation.space)?;
                 if offline::tree_destination_contains(
+                    &session.root,
                     session.base.as_str(),
                     &operation.space,
                     &operation.path,
@@ -3792,12 +4446,13 @@ impl Accounts {
                         .active_writes
                         .lock()
                         .map_err(|_| AccountError::new("upload status is unavailable"))?;
-                    if !active.insert(operation.id) {
+                    if !active.insert((session.root.identity(), operation.id)) {
                         return Err(AccountError::new("write is already being synchronized"));
                     }
                 }
                 let _active = ActiveWrite {
                     accounts: self,
+                    root: session.root.clone(),
                     id: operation.id,
                 };
                 let (name, parent) = operation
@@ -3811,6 +4466,7 @@ impl Accounts {
                     &operation.parents,
                 )? {
                     offline::set_write_state(
+                        &session.root,
                         session.base.as_str(),
                         &operation,
                         "pending",
@@ -3820,7 +4476,7 @@ impl Accounts {
                     blocked.insert(operation.space.clone());
                     continue;
                 }
-                let data = offline::StagedSnapshot::open(&operation.staged)?;
+                let data = offline::StagedSnapshot::open_at(&session.root, &operation.staged)?;
                 if !self.prepare_dirty_snapshot(session, &data, bounded)?
                     || !self.protect_dirty_bases(
                         session,
@@ -3870,6 +4526,7 @@ impl Accounts {
                 }
                 self.verify_incoming_file_source(session, &operation)?;
                 offline::set_write_state(
+                    &session.root,
                     session.base.as_str(),
                     &operation,
                     "pending",
@@ -3897,6 +4554,7 @@ impl Accounts {
                     || status == reqwest::StatusCode::CONFLICT
                 {
                     offline::set_write_state(
+                        &session.root,
                         session.base.as_str(),
                         &operation,
                         "uncertain",
@@ -3925,6 +4583,7 @@ impl Accounts {
                         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     {
                         offline::set_write_state(
+                            &session.root,
                             session.base.as_str(),
                             &operation,
                             "uncertain",
@@ -3936,6 +4595,7 @@ impl Accounts {
                         continue;
                     }
                     offline::set_write_state(
+                        &session.root,
                         session.base.as_str(),
                         &operation,
                         "uncertain",
@@ -3950,6 +4610,7 @@ impl Accounts {
                 // changed in flight, keep the ambiguous operation fenced forever.
                 if let Err(error) = data.verify() {
                     offline::set_write_state(
+                        &session.root,
                         session.base.as_str(),
                         &operation,
                         "uncertain",
@@ -3961,6 +4622,7 @@ impl Accounts {
                     continue;
                 }
                 let mut verification = offline::UploadVerification::record(
+                    &session.root,
                     session.base.as_str(),
                     &operation,
                     digest,
@@ -3984,14 +4646,15 @@ impl Accounts {
             return if !blocked.is_empty() || rejected_upload || uncertain_upload {
                 Ok(WriteTurnOutcome::Attention)
             } else {
-                offline::write_turn_remaining(session.base.as_str(), requested_space)
+                offline::write_turn_remaining(&session.root, session.base.as_str(), requested_space)
             };
         }
-        let namespace_through = offline::journal_high_water(session.base.as_str())?;
+        let namespace_through = offline::journal_high_water(&session.root, session.base.as_str())?;
         let mut after = (0, 0);
         loop {
             self.check_cancelled()?;
             let page = offline::pending_namespace(
+                &session.root,
                 session.base.as_str(),
                 requested_space,
                 false,
@@ -4007,6 +4670,7 @@ impl Accounts {
                 check(&operation.space)?;
                 if operation.kind == "rmdir" {
                     let Some(current) = offline::pending_rmdir_base(
+                        &session.root,
                         session.base.as_str(),
                         &operation.space,
                         &operation.path,
@@ -4021,7 +4685,11 @@ impl Accounts {
                 }
                 if let Err(error) = self.sync_namespace(session, &operation) {
                     self.check_cancelled()?;
-                    if offline::namespace_needs_attention(session.base.as_str(), &operation)? {
+                    if offline::namespace_needs_attention(
+                        &session.root,
+                        session.base.as_str(),
+                        &operation,
+                    )? {
                         blocked.insert(operation.space.clone());
                         namespace_attention = true;
                     } else {
@@ -4031,7 +4699,7 @@ impl Accounts {
             }
         }
         // Wait for local writes admitted during sync before reporting completion.
-        drop(_staging_window);
+        let _operation = staging_window.finish();
         if deferred_upload {
             return Err(AccountError::retryable_read(
                 "successful uploads await safe read-back retry; local copies retained",
@@ -4077,12 +4745,12 @@ impl Accounts {
                 "directory conflict or uncertain outcome requires attention; other eligible operations may have synced",
             ));
         }
-        if offline::has_unresolved(session.base.as_str(), requested_space)? {
+        if offline::has_unresolved(&session.root, session.base.as_str(), requested_space)? {
             return Err(AccountError::new(
                 "pending, conflict or uncertain operations require attention; local copies retained",
             ));
         }
-        sync::manual_idle(session.base.as_str(), requested_space)?;
+        sync::manual_idle(&session.root, session.base.as_str(), requested_space)?;
         Ok(WriteTurnOutcome::Idle)
     }
 
@@ -4100,8 +4768,12 @@ impl Accounts {
                     operation.id, operation.kind, operation.path
                 );
             }
-            if offline::unsettled_mkdir_spaces(session.base.as_str(), Some(&operation.space))?
-                .contains(&operation.space)
+            if offline::unsettled_mkdir_spaces(
+                &session.root,
+                session.base.as_str(),
+                Some(&operation.space),
+            )?
+            .contains(&operation.space)
             {
                 blocked.insert(operation.space.clone());
             } else {
@@ -4127,7 +4799,8 @@ impl Accounts {
             Ok(ConflictCopyOutcome::Recorded) => {}
             Err(error) => {
                 self.check_cancelled()?;
-                if offline::write_needs_attention(session.base.as_str(), operation)? {
+                if offline::write_needs_attention(&session.root, session.base.as_str(), operation)?
+                {
                     blocked.insert(operation.space.clone());
                     *attention = true;
                 } else {
@@ -4169,6 +4842,7 @@ impl Accounts {
             &operation.destination_parents,
         )? {
             offline::set_tree_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4216,6 +4890,7 @@ impl Accounts {
                     .is_empty()?)
         {
             offline::set_tree_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4231,8 +4906,12 @@ impl Accounts {
             let mut after = None;
             loop {
                 self.check_cancelled()?;
-                let page =
-                    offline::tree_proof_page(session.base.as_str(), operation, after.as_deref())?;
+                let page = offline::tree_proof_page(
+                    &session.root,
+                    session.base.as_str(),
+                    operation,
+                    after.as_deref(),
+                )?;
                 let Some(last) = page.last() else {
                     break;
                 };
@@ -4245,6 +4924,7 @@ impl Accounts {
                         || format!("{:x}", Sha256::digest(fresh.json()?.as_bytes())) != proof.digest
                     {
                         offline::set_tree_state(
+                            &session.root,
                             session.base.as_str(),
                             operation,
                             "pending",
@@ -4272,7 +4952,7 @@ impl Accounts {
             executor::admit(self)?;
         }
         if operation.offline && operation.target.is_some() {
-            offline::tree_target_proof(session.base.as_str(), operation)?;
+            offline::tree_target_proof(&session.root, session.base.as_str(), operation)?;
             // Never restore these last-moment guards from scheduler read
             // checkpoints. Source If-Match does not condition the target.
             let fresh_parent = self.fresh_tree_destination(session, operation, target_parent)?;
@@ -4296,6 +4976,7 @@ impl Accounts {
             };
             if !empty {
                 offline::set_tree_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "pending",
@@ -4308,6 +4989,7 @@ impl Accounts {
             }
         }
         offline::set_tree_state(
+            &session.root,
             session.base.as_str(),
             operation,
             "pending",
@@ -4333,6 +5015,7 @@ impl Accounts {
                 && status != reqwest::StatusCode::TOO_MANY_REQUESTS
             {
                 offline::set_tree_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "uncertain",
@@ -4342,7 +5025,7 @@ impl Accounts {
             }
             return Err(AccountError::new("directory MOVE failed or is uncertain"));
         }
-        if executor::tree_receipt(operation)? {
+        if executor::tree_receipt(&session.root, operation)? {
             return Err(AccountError::yielded());
         }
         let source_after =
@@ -4385,6 +5068,7 @@ impl Accounts {
             ));
         }
         offline::set_tree_state(
+            &session.root,
             session.base.as_str(),
             operation,
             "uncertain",
@@ -4403,7 +5087,8 @@ impl Accounts {
         if executor::active() {
             executor::admit(self)?;
         }
-        dav::directory_snapshot_once(
+        dav::directory_snapshot_once_in(
+            &session.root,
             &session.base,
             &operation.space,
             path,
@@ -4418,11 +5103,15 @@ impl Accounts {
         operation: &offline::TreeMove,
     ) -> Result<bool, AccountError> {
         use sha2::{Digest, Sha256};
-        offline::tree_target_proof(session.base.as_str(), operation)?;
+        offline::tree_target_proof(&session.root, session.base.as_str(), operation)?;
         let mut after = None;
         loop {
-            let page =
-                offline::tree_proof_page(session.base.as_str(), operation, after.as_deref())?;
+            let page = offline::tree_proof_page(
+                &session.root,
+                session.base.as_str(),
+                operation,
+                after.as_deref(),
+            )?;
             let Some(last) = page.last() else {
                 break;
             };
@@ -4451,6 +5140,7 @@ impl Accounts {
         // That edge alone does not prove its relocated source exists remotely.
         // Gate on the durable MOVE ancestry, independently of dispatcher order.
         if offline::tree_destination_contains(
+            &session.root,
             session.base.as_str(),
             &operation.space,
             &operation.path,
@@ -4468,6 +5158,7 @@ impl Accounts {
             &operation.parents,
         )? {
             offline::set_namespace_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4492,9 +5183,10 @@ impl Accounts {
             && operation.kind == "move-dir-source"
         {
             let Some(destination) =
-                offline::confirmed_directory(session.base.as_str(), dependency)?
+                offline::confirmed_directory(&session.root, session.base.as_str(), dependency)?
             else {
                 offline::set_namespace_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "pending",
@@ -4522,6 +5214,7 @@ impl Accounts {
                     .is_some_and(|entry| entry.is_directory() && entry.id() == destination.id);
             if !confirmed {
                 offline::set_namespace_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "pending",
@@ -4534,9 +5227,10 @@ impl Accounts {
             }
         } else if let Some(dependency) = operation.dependency {
             let Some(destination) =
-                offline::confirmed_destination(session.base.as_str(), dependency)?
+                offline::confirmed_destination(&session.root, session.base.as_str(), dependency)?
             else {
                 offline::set_namespace_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "pending",
@@ -4549,7 +5243,7 @@ impl Accounts {
             };
             #[cfg(feature = "fault-injection")]
             wait_test_window("CIRRUS_TEST_RENAME_CONFIRM_WINDOW")?;
-            let data = offline::StagedSnapshot::open(&destination.staged)?;
+            let data = offline::StagedSnapshot::open_at(&session.root, &destination.staged)?;
             let verified = if destination.space == operation.space
                 && self.verify_parent_identities(
                     session,
@@ -4573,6 +5267,7 @@ impl Accounts {
             if let Err(error) = verified {
                 if !error.network {
                     offline::set_namespace_state(
+                        &session.root,
                         session.base.as_str(),
                         operation,
                         "pending",
@@ -4585,6 +5280,7 @@ impl Accounts {
         }
         if !mkdir && current.is_none() {
             return offline::set_namespace_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4592,19 +5288,10 @@ impl Accounts {
                 Some("target already absent"),
             );
         }
-        let matches = if mkdir {
-            current.is_none()
-        } else {
-            current.is_some_and(|entry| {
-                entry.is_directory()
-                    == matches!(operation.kind.as_str(), "rmdir" | "move-dir-source")
-                    && Some(entry.id()) == operation.base_id.as_deref()
-                    && entry.etag() == operation.base_etag.as_deref()
-                    && operation.base_etag.is_some()
-            })
-        };
+        let matches = executor::namespace_target_matches(operation, current.as_ref());
         if !matches {
             offline::set_namespace_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4615,6 +5302,7 @@ impl Accounts {
         }
         if !mkdir
             && offline::unresolved_beneath(
+                &session.root,
                 session.base.as_str(),
                 &operation.space,
                 &operation.path,
@@ -4631,6 +5319,7 @@ impl Accounts {
                 || !children.is_empty()?
             {
                 offline::set_namespace_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "pending",
@@ -4641,9 +5330,12 @@ impl Accounts {
             }
         }
         let parent_rebase = if !mkdir && !parent.is_empty() {
-            if let Some(pending) =
-                offline::pending_rmdir_base(session.base.as_str(), &operation.space, parent)?
-            {
+            if let Some(pending) = offline::pending_rmdir_base(
+                &session.root,
+                session.base.as_str(),
+                &operation.space,
+                parent,
+            )? {
                 let parent_id = pending
                     .base_id
                     .as_deref()
@@ -4674,6 +5366,7 @@ impl Accounts {
             return Err(AccountError::yielded());
         }
         offline::set_namespace_state(
+            &session.root,
             session.base.as_str(),
             operation,
             "pending",
@@ -4689,15 +5382,14 @@ impl Accounts {
             mkdir,
             operation.base_etag.as_deref(),
         )?;
-        if !matches!(status.as_u16(), 200 | 201 | 204)
-            && !(!mkdir && status == reqwest::StatusCode::NOT_FOUND)
-        {
+        if !matches!(status.as_u16(), 200 | 201 | 204) {
             if status.is_client_error()
                 && status != reqwest::StatusCode::UNAUTHORIZED
                 && status != reqwest::StatusCode::REQUEST_TIMEOUT
                 && status != reqwest::StatusCode::TOO_MANY_REQUESTS
             {
                 offline::set_namespace_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "uncertain",
@@ -4712,7 +5404,14 @@ impl Accounts {
         // Successful response evidence must survive any later local/read
         // failure. The already durable uncertain claim prevents replay even
         // if this uncapped receipt transaction itself fails.
-        executor::namespace_receipt(operation, parent_rebase.as_ref())?;
+        executor::namespace_receipt(
+            &session.root,
+            session.base.as_str(),
+            (&session.account.issuer, &session.account.subject),
+            operation,
+            parent_rebase.as_ref(),
+            status,
+        )?;
         #[cfg(feature = "fault-injection")]
         wait_test_window("CIRRUS_TEST_NAMESPACE_RECEIPT_WINDOW")?;
         let after = self.sync_directory_snapshot(session, &operation.space, parent)?;
@@ -4754,6 +5453,7 @@ impl Accounts {
             None
         };
         offline::confirm_namespace(
+            &session.root,
             session.base.as_str(),
             operation,
             confirmation.as_deref(),
@@ -4761,7 +5461,7 @@ impl Accounts {
                 .as_ref()
                 .map(|(parent, etag)| (*parent, etag.as_str())),
         )?;
-        executor::retire(operation.id)
+        executor::retire(&session.root, operation.id)
     }
 
     fn reuse_local_directory_target(
@@ -4773,7 +5473,7 @@ impl Accounts {
             return Ok(false);
         }
         let instance = session.base.as_str();
-        let target = offline::local_directory_target(instance, operation)?;
+        let target = offline::local_directory_target(&session.root, instance, operation)?;
         let (name, parent) = operation
             .path
             .split_last()
@@ -4784,7 +5484,8 @@ impl Accounts {
             if executor::active() {
                 executor::admit(self)?;
             }
-            dav::directory_snapshot_once(
+            dav::directory_snapshot_once_in(
+                &session.root,
                 &session.base,
                 &operation.space,
                 path,
@@ -4806,6 +5507,7 @@ impl Accounts {
         }
         if !matches {
             offline::set_namespace_state(
+                &session.root,
                 instance,
                 operation,
                 "pending",
@@ -4816,12 +5518,11 @@ impl Accounts {
                 "directory target binding conflict requires attention",
             ));
         }
-        offline::confirm_local_directory_target(instance, operation, &target).map_err(
-            |mut error| {
+        offline::confirm_local_directory_target(&session.root, instance, operation, &target)
+            .map_err(|mut error| {
                 error.retryable_read = true;
                 error
-            },
-        )?;
+            })?;
         Ok(true)
     }
 
@@ -4832,7 +5533,7 @@ impl Accounts {
     pub fn acknowledge(&self, instance: &str, staged: &str) -> Result<(), AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let _guard = self.begin_operation()?;
-        offline::acknowledge(base.as_str(), staged)
+        offline::acknowledge(_guard.storage_root()?, base.as_str(), staged)
     }
 
     fn sync_directory_snapshot(
@@ -4846,8 +5547,9 @@ impl Accounts {
         }
         for attempt in 0..3 {
             self.check_cancelled()?;
-            let observation = offline::begin_snapshot()?;
-            match dav::directory_snapshot(
+            let observation = offline::begin_snapshot_in(&session.root)?;
+            match dav::directory_snapshot_in(
+                &session.root,
                 &session.base,
                 space,
                 path,
@@ -4925,10 +5627,11 @@ impl Accounts {
             let expected = match parent {
                 DirectoryIdentity::Remote(id) if dav::valid_remote_id(id) => id.clone(),
                 DirectoryIdentity::Pending(id) => {
-                    let confirmed = offline::confirmed_directory(session.base.as_str(), *id)?
-                        .ok_or_else(|| {
-                            AccountError::new("parent directory creation is not confirmed")
-                        })?;
+                    let confirmed =
+                        offline::confirmed_directory(&session.root, session.base.as_str(), *id)?
+                            .ok_or_else(|| {
+                                AccountError::new("parent directory creation is not confirmed")
+                            })?;
                     if confirmed.space != space
                         || confirmed.path != path[..=index]
                         || !dav::valid_remote_id(&confirmed.id)
@@ -4966,6 +5669,7 @@ impl Accounts {
             &operation.parents,
         )? {
             offline::set_write_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -4981,11 +5685,15 @@ impl Accounts {
         let mut random = [0u8; 16];
         let mut filled = 0;
         while filled < random.len() {
+            #[cfg(target_os = "linux")]
             let count = rustix::rand::getrandom(
                 &mut random[filled..],
                 rustix::rand::GetRandomFlags::empty(),
             )
             .map_err(|_| AccountError::new("cannot generate conflict name"))?;
+            #[cfg(target_os = "macos")]
+            let count = ownership::file_ops::random(&mut random[filled..])
+                .map_err(|_| AccountError::new("cannot generate conflict name"))?;
             if count == 0 {
                 return Err(AccountError::new("cannot generate conflict name"));
             }
@@ -4999,6 +5707,7 @@ impl Accounts {
         let candidate = format!("{stem} (conflict {suffix}){ext}");
         if candidate.len() > 255 || entries.get(&candidate)?.is_some() {
             offline::set_write_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -5012,6 +5721,7 @@ impl Accounts {
         let source_digest = data.digest()?;
         let body = reqwest::blocking::Body::sized(data.stream()?, data.len());
         offline::set_write_state(
+            &session.root,
             session.base.as_str(),
             operation,
             "pending",
@@ -5037,6 +5747,7 @@ impl Accounts {
                 && status != reqwest::StatusCode::TOO_MANY_REQUESTS
             {
                 offline::set_write_state(
+                    &session.root,
                     session.base.as_str(),
                     operation,
                     "uncertain",
@@ -5065,6 +5776,7 @@ impl Accounts {
             ));
         }
         offline::set_write_state(
+            &session.root,
             session.base.as_str(),
             operation,
             "uncertain",
@@ -5160,19 +5872,21 @@ impl Accounts {
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
         }
-        Ok(offline::pins(base.as_str(), space, true)?
-            .into_iter()
-            .map(|pin| {
-                let status = if !pin.complete {
-                    "incomplete (local state; remote not checked)"
-                } else if !pin.metadata_matches {
-                    "stale (local metadata; remote not checked)"
-                } else {
-                    "available offline (local state; remote not checked)"
-                };
-                (format!("/{}", pin.path.join("/")), status.to_owned())
-            })
-            .collect())
+        Ok(
+            offline::pins(&self.storage_root()?, base.as_str(), space, true)?
+                .into_iter()
+                .map(|pin| {
+                    let status = if !pin.complete {
+                        "incomplete (local state; remote not checked)"
+                    } else if !pin.metadata_matches {
+                        "stale (local metadata; remote not checked)"
+                    } else {
+                        "available offline (local state; remote not checked)"
+                    };
+                    (format!("/{}", pin.path.join("/")), status.to_owned())
+                })
+                .collect(),
+        )
     }
 
     fn pins_inner(
@@ -5180,7 +5894,7 @@ impl Accounts {
         instance: &str,
         binding: Option<&MountBinding>,
     ) -> Result<Vec<(String, String)>, AccountError> {
-        let session = self.read_session(instance)?;
+        let session = self.read_session_bound(instance, binding)?;
         let space = bound_space(&session, binding)?;
         let mut output = Vec::new();
         for offline::Pin {
@@ -5188,14 +5902,20 @@ impl Accounts {
             tree,
             complete,
             metadata_matches,
-        } in offline::pins(session.base.as_str(), space, true)?
+        } in offline::pins(&session.root, session.base.as_str(), space, true)?
         {
             let status = if !complete {
                 "incomplete"
             } else if !metadata_matches {
                 "stale"
             } else {
-                match self.collect_pin_files(session.base.as_str(), binding, &path, true) {
+                match self.collect_pin_files(
+                    &session.root,
+                    session.base.as_str(),
+                    binding,
+                    &path,
+                    true,
+                ) {
                     Ok(current) if current == tree => "available offline",
                     Ok(_) => "stale",
                     Err(error) if error.network => "available offline",
@@ -5223,6 +5943,7 @@ impl Accounts {
         binding: &MountBinding,
         version: &FileVersion,
     ) -> Result<(), AccountError> {
+        self.storage.validate(&binding.root)?;
         if binding.offline {
             if offline::verify_offline_detached(binding, version)? {
                 return Ok(());
@@ -5242,8 +5963,14 @@ impl Accounts {
             if version.instance != binding.instance || version.space != binding.space {
                 return Err(AccountError::new("staged file binding changed"));
             }
-            offline::verify_identity(&binding.instance, &binding.issuer, &binding.subject)?;
+            offline::verify_identity_in(
+                &binding.root,
+                &binding.instance,
+                &binding.issuer,
+                &binding.subject,
+            )?;
             let current = offline::staged_version(
+                &binding.root,
                 &version.instance,
                 &version.space,
                 &version.path,
@@ -5273,6 +6000,17 @@ impl Accounts {
         offset: u64,
         length: u32,
     ) -> Result<Vec<u8>, AccountError> {
+        self.read_range_in(&binding.root, binding, version, offset, length)
+    }
+
+    fn read_range_in(
+        &self,
+        root: &account_storage::StorageRoot,
+        binding: &MountBinding,
+        version: &FileVersion,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, AccountError> {
         if length == 0
             || length > 131_072
             || offset
@@ -5281,6 +6019,10 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid file range"));
         }
+        if root.identity() != binding.root.identity() {
+            return Err(AccountError::new("account storage root changed"));
+        }
+        self.storage.validate(root)?;
         let cache_generation = self.clean_cache_generation();
         if binding.offline {
             self.verify_file(binding, version)?;
@@ -5288,14 +6030,14 @@ impl Accounts {
             self.verify_offline_mount(binding)?;
             return Ok(bytes);
         }
-        let session = self.read_session(&version.instance)?;
-        if bound_space(&session, Some(binding))? != version.space {
-            return Err(AccountError::new(
-                "file version does not match mounted Space",
-            ));
-        }
         if version.id.starts_with("cirrus-staged:") {
+            // Match cached staged reads: the verified mount principal and exact
+            // live snapshot authorize local bytes, not a credential-cache hit.
+            // Missing original ranges still take the authenticated path below.
+            self.check_cancelled()?;
+            self.verify_file(binding, version)?;
             let (current, staged) = offline::staged_version(
+                root,
                 &version.instance,
                 &version.space,
                 &version.path,
@@ -5305,32 +6047,57 @@ impl Accounts {
             if &current != version {
                 return Err(AccountError::new("staged file changed"));
             }
-            let snapshot = offline::StagedSnapshot::open(&staged)?;
+            let snapshot = offline::StagedSnapshot::open_at(root, &staged)?;
             if snapshot.len() != version.size {
                 return Err(AccountError::new("staged file changed"));
             }
             return snapshot.range_with(offset, length, |base, offset, length| {
-                self.read_range(binding, base, offset, length)
+                self.read_range_in(root, binding, base, offset, length)
             });
         }
-        let (_, move_fenced) =
-            offline::tree_remote_path(&version.instance, &version.space, &version.path)?;
-        if move_fenced {
-            return offline::read(version, offset, length);
+        let session = self.read_session_in(root, &version.instance);
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
+            && let Err(error) = &session
+        {
+            eprintln!(
+                "cirrus lab owner read: pid={} thread={:?} boundary=read-session staged={} error={error}",
+                std::process::id(),
+                std::thread::current().id(),
+                version.id.starts_with("cirrus-staged:")
+            );
         }
-        let disk_generation = cache::generation().ok();
+        let session = session?;
+        if bound_space(&session, Some(binding))? != version.space {
+            return Err(AccountError::new(
+                "file version does not match mounted Space",
+            ));
+        }
+        let (_, move_fenced) = offline::tree_remote_path(
+            &session.root,
+            &version.instance,
+            &version.space,
+            &version.path,
+        )?;
+        if move_fenced {
+            return offline::read(&binding.root, version, offset, length);
+        }
+        let disk_generation = cache::generation_in(&session.root).ok();
         if let Ok(Some(bytes)) = cache::read(&session, version, offset, length) {
             self.verify_file(binding, version)?;
             return Ok(bytes);
         }
-        if let Some(origin) =
-            self.moved_cache_version(version, &session.account.issuer, &session.account.subject)?
-            && let Some(bytes) = cache::read(&session, &origin, offset, length)?
+        if let Some(origin) = self.moved_cache_version(
+            &session.root,
+            version,
+            &session.account.issuer,
+            &session.account.subject,
+        )? && let Some(bytes) = cache::read(&session, &origin, offset, length)?
         {
             self.verify_file(binding, version)?;
             return Ok(bytes);
         }
-        match self.read_range_online(version, Some(binding), offset, length) {
+        match self.read_range_online(&session.root, version, Some(binding), offset, length) {
             Ok((bytes, _validated_metadata)) => {
                 // Clean caching is an optimization: failures never invalidate a verified read.
                 // Keep its actual validation scratch owner/allowance alive
@@ -5345,7 +6112,7 @@ impl Accounts {
                 Ok(bytes)
             }
             Err(error) if error.network => {
-                offline::read(version, offset, length).map_err(|_| error)
+                offline::read(&session.root, version, offset, length).map_err(|_| error)
             }
             Err(error) => Err(error),
         }
@@ -5355,11 +6122,13 @@ impl Accounts {
     // only its proven original path, with every other FileVersion field exact.
     fn moved_cache_version(
         &self,
+        storage: &account_storage::StorageRoot,
         version: &FileVersion,
         issuer: &str,
         subject: &str,
     ) -> Result<Option<FileVersion>, AccountError> {
         if !offline::tree_destination_contains(
+            storage,
             &version.instance,
             &version.space,
             &version.path,
@@ -5372,6 +6141,7 @@ impl Accounts {
             .split_last()
             .ok_or_else(|| AccountError::new("invalid moved file path"))?;
         let entries = offline::offline_directory(
+            storage,
             &version.instance,
             &version.space,
             parent,
@@ -5387,7 +6157,7 @@ impl Accounts {
             return Err(AccountError::new("moved cache version changed"));
         }
         let (path, fenced) =
-            offline::tree_remote_path(&version.instance, &version.space, &version.path)?;
+            offline::tree_remote_path(storage, &version.instance, &version.space, &version.path)?;
         if fenced {
             return Ok(None);
         }
@@ -5409,6 +6179,7 @@ impl Accounts {
         }
         if version.id.starts_with("cirrus-staged:") {
             let (current, staged) = offline::staged_version(
+                &binding.root,
                 &version.instance,
                 &version.space,
                 &version.path,
@@ -5418,11 +6189,12 @@ impl Accounts {
             if current != *version {
                 return Err(AccountError::new("offline staged version changed"));
             }
-            return offline::StagedSnapshot::open(&staged)?.range_with(
+            return offline::StagedSnapshot::open_at(&binding.root, &staged)?.range_with(
                 offset,
                 length,
                 |base, offset, length| {
                     self.read_original_local_range(
+                        &binding.root,
                         &binding.issuer,
                         &binding.subject,
                         base,
@@ -5435,7 +6207,8 @@ impl Accounts {
                 },
             );
         }
-        if let Some(bytes) = cache::read_identity(
+        if let Some(bytes) = cache::read_identity_in(
+            &binding.root,
             &binding.issuer,
             &binding.subject,
             version,
@@ -5446,8 +6219,9 @@ impl Accounts {
             return Ok(bytes);
         }
         if let Some(origin) =
-            self.moved_cache_version(version, &binding.issuer, &binding.subject)?
-            && let Some(bytes) = cache::read_identity(
+            self.moved_cache_version(&binding.root, version, &binding.issuer, &binding.subject)?
+            && let Some(bytes) = cache::read_identity_in(
+                &binding.root,
                 &binding.issuer,
                 &binding.subject,
                 &origin,
@@ -5458,13 +6232,14 @@ impl Accounts {
         {
             return Ok(bytes);
         }
-        if let Some(bytes) = offline::confirmed_local_range(version, offset, length)? {
+        if let Some(bytes) = offline::confirmed_local_range(&binding.root, version, offset, length)?
+        {
             return Ok(bytes);
         }
-        if let Some(bytes) = offline::read_moved_local(version, offset, length)? {
+        if let Some(bytes) = offline::read_moved_local(&binding.root, version, offset, length)? {
             return Ok(bytes);
         }
-        offline::read(version, offset, length)
+        offline::read(&binding.root, version, offset, length)
     }
 
     // Only immutable overlay bases use this route. A projected staged head is
@@ -5472,31 +6247,33 @@ impl Accounts {
     // fetch a newer remote representation at its pathname.
     fn read_original_local_range(
         &self,
+        storage: &account_storage::StorageRoot,
         issuer: &str,
         subject: &str,
         version: &FileVersion,
         offset: u64,
         length: u32,
     ) -> Result<Option<Vec<u8>>, AccountError> {
-        offline::verify_identity(&version.instance, issuer, subject)?;
-        let original = offline::tree_content_base(version)?;
+        offline::verify_identity_in(storage, &version.instance, issuer, subject)?;
+        let original = offline::tree_content_base(storage, version)?;
         for candidate in original
             .iter()
             .filter(|original| *original != version)
             .chain(std::iter::once(version))
         {
             if let Some(bytes) =
-                cache::read_identity(issuer, subject, candidate, offset, length, false)?
+                cache::read_identity_in(storage, issuer, subject, candidate, offset, length, false)?
             {
                 return Ok(Some(bytes));
             }
-            if let Some(bytes) = offline::confirmed_local_range(candidate, offset, length)? {
+            if let Some(bytes) = offline::confirmed_local_range(storage, candidate, offset, length)?
+            {
                 return Ok(Some(bytes));
             }
-            if let Some(bytes) = offline::read_moved_local(candidate, offset, length)? {
+            if let Some(bytes) = offline::read_moved_local(storage, candidate, offset, length)? {
                 return Ok(Some(bytes));
             }
-            if let Ok(bytes) = offline::read(candidate, offset, length) {
+            if let Ok(bytes) = offline::read(storage, candidate, offset, length) {
                 return Ok(Some(bytes));
             }
         }
@@ -5505,6 +6282,7 @@ impl Accounts {
 
     fn read_range_online(
         &self,
+        storage: &account_storage::StorageRoot,
         version: &FileVersion,
         binding: Option<&MountBinding>,
         offset: u64,
@@ -5518,13 +6296,17 @@ impl Accounts {
             .filter(|end| *end < version.size)
             .ok_or_else(|| AccountError::new("invalid file range"))?;
         let _permit = self.read_permit()?;
-        let session = self.read_session(&version.instance)?;
+        let session = self.read_session_in(storage, &version.instance)?;
         if bound_space(&session, binding)? != version.space {
             return Err(AccountError::new("file version does not match Space"));
         }
         self.read_with_refresh(&session, |current| {
-            let (remote_path, move_fenced) =
-                offline::tree_remote_path(current.base.as_str(), &version.space, &version.path)?;
+            let (remote_path, move_fenced) = offline::tree_remote_path(
+                &current.root,
+                current.base.as_str(),
+                &version.space,
+                &version.path,
+            )?;
             if move_fenced {
                 return Err(AccountError::new("directory rename requires attention"));
             }
@@ -5532,7 +6314,8 @@ impl Accounts {
                 .split_last()
                 .ok_or_else(|| AccountError::new("invalid file path"))?;
             let verify = || {
-                let entries = dav::directory_snapshot(
+                let entries = dav::directory_snapshot_in(
+                    &current.root,
                     &current.base,
                     &version.space,
                     parent,
@@ -5597,22 +6380,25 @@ impl Accounts {
     fn refresh_rejected_session(
         &self,
         rejected: &ReadSession,
-    ) -> Result<ReadSession, AccountError> {
+    ) -> Result<Arc<ReadSession>, AccountError> {
         let guard = if executor::is_automatic() {
             // Yield/back off instead of waiting behind a foreground account
             // owner at this newly released turn boundary.
             executor::preflight_checkpoint()?;
-            self.begin_operation()?
+            self.begin_operation_in(&rejected.root)?
         } else {
             let lock = self
                 .operation
                 .lock()
                 .map_err(|_| AccountError::new("account state is unavailable"))?;
-            self.operation_with_lock(lock)?
+            self.operation_with_lock_in(lock, &rejected.root)?
         };
+        if guard.storage_root()?.identity() != rejected.root.identity() {
+            return Err(AccountError::new("account session storage root changed"));
+        }
         self.clear_read_session()?;
-        let store = Store::open(guard.connection()?)?;
-        self.persist_pending(&store, rejected.base.as_str())?;
+        let store = Store::open(guard.credential_context()?)?;
+        guard.persist_pending(&store, rejected.base.as_str())?;
         let mut account = store.load(rejected.base.as_str())?;
         if account.issuer != rejected.account.issuer
             || account.subject != rejected.account.subject
@@ -5631,31 +6417,14 @@ impl Accounts {
         executor::preflight_checkpoint()?;
         self.refresh_if_needed(&mut account, &store, &client)?;
         self.check_cancelled()?;
-        let session = ReadSession {
+        let session = Arc::new(ReadSession {
+            root: guard.storage_root()?.clone(),
             base: rejected.base.clone(),
             account,
             client,
-        };
-        *self
-            .read_session
-            .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))? =
-            Some(session.clone());
+        });
+        self.publish_read_session(&guard, Arc::clone(&session))?;
         Ok(session)
-    }
-
-    fn persist_pending(&self, store: &Store, instance: &str) -> Result<(), AccountError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))?;
-        if let Some(account) = pending.get(instance) {
-            store.save(account).map_err(|_| {
-                AccountError::new("account credentials are awaiting keyring persistence")
-            })?;
-            pending.remove(instance);
-        }
-        Ok(())
     }
 
     fn begin_local_operation(
@@ -5667,7 +6436,7 @@ impl Accounts {
             .sync_staging
             .read()
             .map_err(|_| AccountError::new("account state is unavailable"))?;
-        if *active {
+        if let Some(window) = active.as_ref() {
             let cached = self
                 .read_session
                 .lock()
@@ -5675,28 +6444,26 @@ impl Accounts {
             let current = cached
                 .as_ref()
                 .ok_or_else(|| AccountError::new("account session is unavailable"))?;
-            if current.base != session.base
+            if current.root.identity() != session.root.identity()
+                || current.base != session.base
                 || current.account.issuer != session.account.issuer
                 || current.account.subject != session.account.subject
+                || window.root.identity() != session.root.identity()
+                || window.base != session.base
+                || window.account.issuer != session.account.issuer
+                || window.account.subject != session.account.subject
             {
                 return Err(AccountError::new("mounted account identity changed"));
             }
-            Ok(LocalOperation {
-                _sync_window: Some(active),
-                _operation: None,
-            })
+            Ok(LocalOperation::Staging { _lease: active })
         } else {
             drop(active);
-            Ok(LocalOperation {
-                _sync_window: None,
-                _operation: Some(if allow_shared_staging {
+            Ok(LocalOperation::Owned {
+                _operation: if allow_shared_staging {
                     self.begin_shared_staging_operation(session)?
                 } else {
-                    OwnedLocalOperation {
-                        _shared: None,
-                        _exclusive: Some(self.begin_owned_local_operation(session)?),
-                    }
-                }),
+                    OwnedLocalOperation::Exclusive(self.begin_owned_local_operation(session)?)
+                },
             })
         }
     }
@@ -5705,14 +6472,50 @@ impl Accounts {
         &self,
         session: &ReadSession,
     ) -> Result<Operation<'_>, AccountError> {
-        let operation = self.begin_operation()?;
-        let store = Store::open(operation.connection()?)?;
-        self.persist_pending(&store, session.base.as_str())?;
+        let operation = if executor::is_automatic() {
+            let lock = self.operation.try_lock().map_err(|_| {
+                AccountError::retryable_read("another account operation is in progress")
+            })?;
+            self.operation_with_principal_lock_in(lock, &session.root, true)?
+        } else {
+            self.begin_operation_in(&session.root)?
+        };
+        if operation.storage_root()?.identity() != session.root.identity() {
+            return Err(AccountError::new("account session storage root changed"));
+        }
+        #[cfg(feature = "fault-injection")]
+        wait_test_window("CIRRUS_TEST_OWNED_LOCAL_PERSIST_WINDOW")?;
+        let store = Store::open(operation.credential_context()?)?;
+        operation.persist_pending(&store, session.base.as_str())?;
+        #[cfg(feature = "fault-injection")]
+        wait_test_window("CIRRUS_TEST_OWNED_LOCAL_OWNER_WINDOW")?;
+        // Automatic refresh may have retained SH plus the credential bus
+        // owner after a failed save. Persistence above must succeed before
+        // relinquishing that fence, but saving does not turn SH into EX.
+        // Refuse this turn: Drop releases only durably saved credentials;
+        // retry acquires fresh nonblocking EX and revalidates the session.
+        // Never attempt a flock upgrade while holding SH.
+        if !operation
+            .guard
+            .as_ref()
+            .is_some_and(ownership::Guard::is_exclusive)
+        {
+            return Err(AccountError::retryable_read(
+                "saved credentials require fresh exclusive local ownership; retry local operation",
+            ));
+        }
         let account = store.load(session.base.as_str())?;
-        offline::bind_identity(session.base.as_str(), &account.issuer, &account.subject)?;
+        offline::bind_identity_in(
+            &session.root,
+            session.base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
         if account.issuer != session.account.issuer || account.subject != session.account.subject {
             return Err(AccountError::new("mounted account identity changed"));
         }
+        #[cfg(feature = "fault-injection")]
+        wait_test_window("CIRRUS_TEST_OWNED_LOCAL_EXCLUSIVE_WINDOW")?;
         Ok(operation)
     }
 
@@ -5720,53 +6523,130 @@ impl Accounts {
         &self,
         session: &ReadSession,
     ) -> Result<OwnedLocalOperation<'_>, AccountError> {
-        let (shared, exclusive) = if self.has_pending_credentials()? {
-            (None, Some(self.begin_owned_local_operation(session)?))
+        let owner = if self.has_pending_credentials()? {
+            OwnedLocalOperation::Exclusive(self.begin_owned_local_operation(session)?)
         } else {
-            (Some(ownership::acquire_shared(&self.runtime)?), None)
+            OwnedLocalOperation::Shared(ownership::acquire_shared_in(
+                &session.root,
+                &self.runtime,
+                #[cfg(target_os = "macos")]
+                self.keychain.as_ref(),
+            )?)
         };
-        let connection = match (&shared, &exclusive) {
-            (Some(guard), None) => guard.connection(),
-            (None, Some(operation)) => operation.connection()?,
-            _ => return Err(AccountError::new("account ownership is unavailable")),
+        let connection = match &owner {
+            OwnedLocalOperation::Shared(guard) => guard.credential_context(),
+            OwnedLocalOperation::Exclusive(operation) => operation.credential_context()?,
         };
         let store = Store::open(connection)?;
         let account = store.load(session.base.as_str())?;
-        offline::bind_identity(session.base.as_str(), &account.issuer, &account.subject)?;
+        offline::bind_identity_in(
+            &session.root,
+            session.base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
         if account.issuer != session.account.issuer || account.subject != session.account.subject {
             return Err(AccountError::new("mounted account identity changed"));
         }
-        Ok(OwnedLocalOperation {
-            _shared: shared,
-            _exclusive: exclusive,
-        })
+        Ok(owner)
     }
 
     fn begin_operation(&self) -> Result<Operation<'_>, AccountError> {
-        if self.automatic_active.load(Ordering::Acquire) && !executor::is_automatic() {
-            return self.wait_for_automatic_turn();
+        let root = self.storage_root()?;
+        self.begin_operation_in(&root)
+    }
+
+    fn begin_operation_in(
+        &self,
+        root: &account_storage::StorageRoot,
+    ) -> Result<Operation<'_>, AccountError> {
+        if self.automatic_active.load(Ordering::Acquire) != 0 && !executor::is_automatic_for(self) {
+            return self.wait_for_automatic_turn_in(root);
         }
         let lock = self.operation.try_lock().map_err(|_| {
             AccountError::retryable_read("another account operation is in progress")
         })?;
-        self.operation_with_lock(lock)
+        self.operation_with_lock_in(lock, root)
     }
 
-    fn operation_with_lock<'a>(
+    fn operation_with_lock_in<'a>(
         &'a self,
         lock: MutexGuard<'a, ()>,
+        root: &account_storage::StorageRoot,
     ) -> Result<Operation<'a>, AccountError> {
-        let mut retained = self
-            .pending_guard
-            .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))?;
-        if let Some(guard) = retained.as_mut() {
-            guard.reconnect()?;
-        }
-        let guard = match retained.take() {
-            Some(guard) => guard,
-            None => ownership::acquire(&self.runtime)?,
+        self.operation_with_principal_lock_in(lock, root, false)
+    }
+
+    fn operation_with_principal_lock_in<'a>(
+        &'a self,
+        lock: MutexGuard<'a, ()>,
+        root: &account_storage::StorageRoot,
+        local: bool,
+    ) -> Result<Operation<'a>, AccountError> {
+        self.runtime
+            .revalidate()
+            .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
+        let retained = {
+            let mut credentials = self
+                .credentials
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            match &*credentials {
+                CredentialState::Idle => None,
+                CredentialState::Active(_) => {
+                    return Err(AccountError::new("account ownership is unavailable"));
+                }
+                CredentialState::Retained { guard, .. }
+                    if guard.storage_root().identity() != root.identity() =>
+                {
+                    return Err(AccountError::new("retained account ownership root changed"));
+                }
+                CredentialState::Retained { .. } => {
+                    let CredentialState::Retained { pending, guard } =
+                        std::mem::replace(&mut *credentials, CredentialState::Idle)
+                    else {
+                        unreachable!();
+                    };
+                    *credentials = CredentialState::Active(pending);
+                    Some(guard)
+                }
+            }
         };
+        if let Some(guard) = retained {
+            // Reconnect may fail. Operation already owns the guard so Drop
+            // restores pending credentials and that same fence together.
+            let mut operation = Operation {
+                accounts: self,
+                lock: Some(lock),
+                guard: Some(guard),
+            };
+            operation
+                .guard
+                .as_mut()
+                .ok_or_else(|| AccountError::new("account ownership is unavailable"))?
+                .reconnect()?;
+            return Ok(operation);
+        }
+        let guard = if local {
+            ownership::acquire_local_in(
+                root,
+                &self.runtime,
+                #[cfg(target_os = "macos")]
+                self.keychain.as_ref(),
+            )?
+        } else {
+            ownership::acquire_in(
+                root,
+                &self.runtime,
+                #[cfg(target_os = "macos")]
+                self.keychain.as_ref(),
+            )?
+        };
+        *self
+            .credentials
+            .lock()
+            .map_err(|_| AccountError::new("account state is unavailable"))? =
+            CredentialState::Active(HashMap::new());
         Ok(Operation {
             accounts: self,
             lock: Some(lock),
@@ -5775,11 +6655,76 @@ impl Accounts {
     }
 
     fn clear_read_session(&self) -> Result<(), AccountError> {
-        *self
+        let retired = self
             .read_session
             .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))? = None;
+            .map_err(|_| AccountError::new("account state is unavailable"))?
+            .take();
+        drop(retired);
         Ok(())
+    }
+
+    fn invalidate_read_session(&self, expected: &Arc<ReadSession>) -> Result<(), AccountError> {
+        let retired = {
+            let mut cached = self
+                .read_session
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            if cached
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                cached.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    fn publish_read_session(
+        &self,
+        operation: &Operation<'_>,
+        session: Arc<ReadSession>,
+    ) -> Result<(), AccountError> {
+        if operation.storage_root()?.identity() != session.root.identity() {
+            return Err(AccountError::new("account session storage root changed"));
+        }
+        let retired = self
+            .read_session
+            .lock()
+            .map_err(|_| AccountError::new("account state is unavailable"))?
+            .replace(session);
+        drop(retired);
+        Ok(())
+    }
+
+    fn storage_root(&self) -> Result<account_storage::StorageRoot, AccountError> {
+        // Refuse changed default ownership before admitting another hierarchy;
+        // do not take/discard a Guard that may still own unsaved credentials.
+        let retained_root = {
+            let credentials = self
+                .credentials
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            match &*credentials {
+                CredentialState::Retained { guard, .. } => Some(guard.storage_root().clone()),
+                CredentialState::Idle | CredentialState::Active(_) => None,
+            }
+        };
+        if let Some(root) = retained_root {
+            root.revalidate()?;
+        }
+        let cached = self
+            .read_session
+            .lock()
+            .map_err(|_| AccountError::new("account state is unavailable"))?
+            .clone();
+        if let Some(session) = cached {
+            self.storage.validate(&session.root)?;
+        }
+        self.storage.resolve()
     }
 
     fn read_permit(&self) -> Result<ReadPermit<'_>, AccountError> {
@@ -5803,7 +6748,28 @@ impl Accounts {
         Ok(ReadPermit(self))
     }
 
-    fn read_session(&self, instance: &str) -> Result<ReadSession, AccountError> {
+    fn read_session(&self, instance: &str) -> Result<Arc<ReadSession>, AccountError> {
+        let root = self.storage_root()?;
+        self.read_session_in(&root, instance)
+    }
+
+    fn read_session_bound(
+        &self,
+        instance: &str,
+        binding: Option<&MountBinding>,
+    ) -> Result<Arc<ReadSession>, AccountError> {
+        match binding {
+            Some(binding) => self.read_session_in(&binding.root, instance),
+            None => self.read_session(instance),
+        }
+    }
+
+    fn read_session_in(
+        &self,
+        root: &account_storage::StorageRoot,
+        instance: &str,
+    ) -> Result<Arc<ReadSession>, AccountError> {
+        self.storage.validate(root)?;
         self.check_cancelled()?;
         let (base, _) = http::instance_and_ca(instance, None)?;
         let usable = |session: &ReadSession| -> bool {
@@ -5811,7 +6777,8 @@ impl Accounts {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
-            session.base == base
+            session.root.identity() == root.identity()
+                && session.base == base
                 && !session.account.refresh_in_progress
                 && now.is_some_and(|now| session.account.expires_at > now.saturating_add(30))
         };
@@ -5820,15 +6787,39 @@ impl Accounts {
                 .read_session
                 .lock()
                 .map_err(|_| AccountError::new("account state is unavailable"))?;
+            if cached
+                .as_ref()
+                .is_some_and(|session| session.root.identity() != root.identity())
+            {
+                return Err(AccountError::new("account session storage root changed"));
+            }
             if let Some(session) = cached.as_ref().filter(|session| usable(session)) {
+                #[cfg(feature = "fault-injection")]
+                if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some() {
+                    eprintln!(
+                        "cirrus lab owner session: pid={} thread={:?} cache=usable boundary=identity-verify",
+                        std::process::id(),
+                        std::thread::current().id()
+                    );
+                }
                 let session = session.clone();
                 drop(cached);
-                offline::verify_identity(
+                offline::verify_identity_in(
+                    &root,
                     session.base.as_str(),
                     &session.account.issuer,
                     &session.account.subject,
                 )?;
                 return Ok(session);
+            }
+            #[cfg(feature = "fault-injection")]
+            if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some() {
+                eprintln!(
+                    "cirrus lab owner session: pid={} thread={:?} cache=unusable present={} boundary=operation-mutex",
+                    std::process::id(),
+                    std::thread::current().id(),
+                    cached.is_some()
+                );
             }
             match self.operation.try_lock() {
                 Ok(lock) => {
@@ -5848,7 +6839,18 @@ impl Accounts {
                 }
             }
         };
-        let guard = self.operation_with_lock(lock)?;
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some() {
+            eprintln!(
+                "cirrus lab owner session: pid={} thread={:?} boundary=account-owner-acquire",
+                std::process::id(),
+                std::thread::current().id()
+            );
+        }
+        let guard = self.operation_with_lock_in(lock, &root)?;
+        if guard.storage_root()?.identity() != root.identity() {
+            return Err(AccountError::new("account session storage root changed"));
+        }
         let cached = self
             .read_session
             .lock()
@@ -5857,25 +6859,25 @@ impl Accounts {
             .filter(|session| usable(session))
             .cloned();
         if let Some(session) = cached {
-            offline::verify_identity(
+            offline::verify_identity_in(
+                &root,
                 session.base.as_str(),
                 &session.account.issuer,
                 &session.account.subject,
             )?;
             return Ok(session);
         }
-        let store = Store::open(guard.connection()?)?;
-        self.persist_pending(&store, base.as_str())?;
+        let store = Store::open(guard.credential_context()?)?;
+        guard.persist_pending(&store, base.as_str())?;
         let mut account = store.load(base.as_str())?;
         if executor::is_automatic() {
-            offline::verify_identity(base.as_str(), &account.issuer, &account.subject).map_err(
-                |mut error| {
+            offline::verify_identity_in(&root, base.as_str(), &account.issuer, &account.subject)
+                .map_err(|mut error| {
                     error.retryable_read = true;
                     error
-                },
-            )?;
+                })?;
         } else {
-            offline::bind_identity(base.as_str(), &account.issuer, &account.subject)?;
+            offline::bind_identity_in(&root, base.as_str(), &account.issuer, &account.subject)?;
         }
         if account.selected_space.is_some()
             && account.selected_space != account.selected_space_verified
@@ -5894,23 +6896,20 @@ impl Accounts {
         let offline = !account.refresh_in_progress
             && account.expires_at <= now.saturating_add(30)
             && account.selected_space.as_deref().is_some_and(|space| {
-                dav::directory_snapshot(&base, space, &[], &account.access_token, &client)
+                dav::directory_snapshot_in(root, &base, space, &[], &account.access_token, &client)
                     .is_err_and(|error| error.network)
             });
         if !offline {
             self.refresh_if_needed(&mut account, &store, &client)?;
         }
         self.check_cancelled()?;
-        let session = ReadSession {
+        let session = Arc::new(ReadSession {
+            root: guard.storage_root()?.clone(),
             base,
             account,
             client,
-        };
-        *self
-            .read_session
-            .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))? =
-            Some(session.clone());
+        });
+        self.publish_read_session(&guard, Arc::clone(&session))?;
         Ok(session)
     }
 
@@ -5929,11 +6928,16 @@ impl Accounts {
     /// # Errors
     /// Returns an error if the account state is unavailable.
     pub fn has_pending_credentials(&self) -> Result<bool, AccountError> {
-        Ok(!self
-            .pending
+        let credentials = self
+            .credentials
             .lock()
-            .map_err(|_| AccountError::new("account state is unavailable"))?
-            .is_empty())
+            .map_err(|_| AccountError::new("account state is unavailable"))?;
+        Ok(match &*credentials {
+            CredentialState::Idle => false,
+            CredentialState::Active(pending) | CredentialState::Retained { pending, .. } => {
+                !pending.is_empty()
+            }
+        })
     }
 
     fn check_cancelled(&self) -> Result<(), AccountError> {
@@ -5947,10 +6951,14 @@ impl Accounts {
 
     fn save_refresh(&self, store: &Store, account: &AccountData) -> Result<(), AccountError> {
         if store.save(account).is_err() {
-            self.pending
+            let mut credentials = self
+                .credentials
                 .lock()
-                .map_err(|_| AccountError::new("account state is unavailable"))?
-                .insert(account.instance.clone(), account.clone());
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            let CredentialState::Active(pending) = &mut *credentials else {
+                return Err(AccountError::new("account ownership is unavailable"));
+            };
+            pending.insert(account.instance.clone(), account.clone());
             return Err(AccountError::new(
                 "account credentials are awaiting keyring persistence",
             ));

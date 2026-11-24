@@ -14,11 +14,12 @@ fn directory(
     space: &str,
     path: &[String],
 ) -> Result<DirectorySnapshot, AccountError> {
-    let observation = offline::begin_snapshot().map_err(|mut error| {
+    let observation = offline::begin_snapshot_in(&session.root).map_err(|mut error| {
         error.retryable_read = true;
         error
     })?;
-    let entries = dav::directory_snapshot_once(
+    let entries = dav::directory_snapshot_once_in(
+        &session.root,
         &session.base,
         space,
         path,
@@ -89,7 +90,9 @@ impl Accounts {
         session: &ReadSession,
         operation: &offline::PendingWrite,
     ) -> Result<(), AccountError> {
-        let Some(source) = offline::incoming_file_source(session.base.as_str(), operation)? else {
+        let Some(source) =
+            offline::incoming_file_source(&session.root, session.base.as_str(), operation)?
+        else {
             return Ok(());
         };
         let (name, parent) = source
@@ -114,6 +117,7 @@ impl Accounts {
             });
         if !matches {
             offline::set_write_state(
+                &session.root,
                 session.base.as_str(),
                 operation,
                 "pending",
@@ -139,6 +143,7 @@ impl Accounts {
             return Err(AccountError::new("original content account changed"));
         }
         if let Some(bytes) = self.read_original_local_range(
+            &session.root,
             &session.account.issuer,
             &session.account.subject,
             version,
@@ -147,8 +152,12 @@ impl Accounts {
         )? {
             return Ok(bytes);
         }
-        let (path, fenced) =
-            offline::tree_remote_path(&version.instance, &version.space, &version.path)?;
+        let (path, fenced) = offline::tree_remote_path(
+            &session.root,
+            &version.instance,
+            &version.space,
+            &version.path,
+        )?;
         if fenced {
             return Err(AccountError::new(
                 "original content locator requires attention",
@@ -194,10 +203,15 @@ impl Accounts {
         path: &[String],
         bounded: bool,
     ) -> Result<bool, AccountError> {
-        let names = offline::overlay::protected_bases(session.base.as_str(), space, path)?;
+        let names = offline::overlay::protected_bases_in(
+            &session.root,
+            session.base.as_str(),
+            space,
+            path,
+        )?;
         let mut originals = std::collections::BTreeMap::new();
         for name in &names {
-            let root = offline::overlay::Overlay::load(name)?;
+            let root = offline::overlay::Overlay::load_at(&session.root, name)?;
             if !offline::overlay::prepare_base(
                 &root,
                 |version, offset, length| {
@@ -213,7 +227,7 @@ impl Accounts {
         if !originals.is_empty() {
             crate::wait_test_window("CIRRUS_TEST_DIRTY_PROTECTED_WINDOW")?;
         }
-        offline::overlay::verify_protected(&names, &originals, bounded)
+        offline::overlay::verify_protected_in(&session.root, &names, &originals, bounded)
     }
 
     /// Advances one successful upload using at most eight verification HTTP requests.
@@ -224,7 +238,7 @@ impl Accounts {
         verification: &mut offline::UploadVerification,
     ) -> Result<bool, AccountError> {
         let operation = &verification.operation;
-        let data = offline::StagedSnapshot::open(&operation.staged)?;
+        let data = offline::StagedSnapshot::open_at(&session.root, &operation.staged)?;
         if data.len() != verification.size {
             return Err(AccountError::new(
                 "staged upload digest changed; outcome remains uncertain",
@@ -327,10 +341,11 @@ impl Accounts {
             let expected = match &operation.parents[index] {
                 DirectoryIdentity::Remote(id) if dav::valid_remote_id(id) => id.clone(),
                 DirectoryIdentity::Pending(id) => {
-                    let confirmed = offline::confirmed_directory(session.base.as_str(), *id)?
-                        .ok_or_else(|| {
-                            AccountError::new("parent directory creation is not confirmed")
-                        })?;
+                    let confirmed =
+                        offline::confirmed_directory(&session.root, session.base.as_str(), *id)?
+                            .ok_or_else(|| {
+                                AccountError::new("parent directory creation is not confirmed")
+                            })?;
                     if confirmed.space != operation.space
                         || confirmed.path != operation.path[..=index]
                     {
@@ -374,7 +389,7 @@ impl Accounts {
                 "uploaded file changed during verification; outcome remains uncertain",
             ));
         }
-        offline::confirm_write(session.base.as_str(), operation, &version)?;
+        offline::confirm_write(&session.root, session.base.as_str(), operation, &version)?;
         Ok(true)
     }
 
@@ -384,6 +399,8 @@ impl Accounts {
         verification: &mut offline::UploadVerification,
         bounded: bool,
     ) -> Result<WriteTurnOutcome, AccountError> {
+        verification.check_root(&session.root)?;
+        verification.check_progress(session.base.as_str())?;
         loop {
             match self.verify_upload_step(session, verification) {
                 Ok(true) => return Ok(WriteTurnOutcome::Yielded),
@@ -408,6 +425,7 @@ impl Accounts {
                     }
                     verification.discard()?;
                     offline::set_write_state(
+                        &session.root,
                         session.base.as_str(),
                         &verification.operation,
                         "uncertain",

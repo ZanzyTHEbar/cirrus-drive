@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.machinery import SourceFileLoader
@@ -85,6 +86,8 @@ def child(root, runtime, container):
     second_mounted = False
     enumeration_fd = None
     credential_bus_pid = None
+    owner_file_helpers = []
+    owner_cleanup_mounts = []
     lost_response = [False]
     uncertain_puts = [0]
     fail_verification = [False]
@@ -190,6 +193,7 @@ def child(root, runtime, container):
     auth_token = ["cirrus-lab-token"]
     auth_refresh = ["unused-lab-token"]
     auth_rotations = [0]
+    auth_expired = [False]
     auth_reject_graph = [False]
     auth_reject_dav = [False]
     auth_reject_get = [True]
@@ -226,6 +230,40 @@ def child(root, runtime, container):
         with diagnostic_lock:
             diagnostic_sequence[0] += 1
             diagnostic_events.append(dict(sequence=diagnostic_sequence[0],time_ns=time.time_ns(),monotonic_ns=time.monotonic_ns(),thread=threading.get_native_id(),event=event,**fields))
+
+    def owner_snapshot(phase):
+        # No subprocess or FUSE stat/read here: this snapshot must also work
+        # while a fixture child is stuck closing an inherited FUSE descriptor.
+        directory=os.environ.get('CIRRUS_TEST_AUTO_DIAGNOSTICS_DIR')
+        if not directory:return
+        output=Path(directory)/root.name;output.mkdir(mode=0o700,parents=True,exist_ok=True)
+        def read(path):
+            try:return Path(path).read_text()[:16384]
+            except OSError as error:return f'{type(error).__name__}:{error.errno}'
+        owned={os.getpid()}
+        for process in (daemon,keyring,second_daemon):
+            if process:owned.add(process.pid)
+        processes={}
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdecimal():continue
+            try:
+                stat=read(proc/'stat');fields=stat.rsplit(')',1)[1].split()
+                processes[int(proc.name)]=(int(fields[1]),proc,stat)
+            except (IndexError,ValueError):pass
+        for _ in range(4):owned.update(pid for pid,(parent,_,_) in processes.items() if parent in owned)
+        data={'phase':phase,'monotonic_ns':time.monotonic_ns(),'locks':read('/proc/locks'),'processes':{},'python_threads':{str(t):traceback.format_stack(frame) for t,frame in sys._current_frames().items()}}
+        for pid in sorted(owned):
+            if pid not in processes:continue
+            parent,proc,stat=processes[pid]
+            row={'parent':parent,'stat':stat,'cmdline':read(proc/'cmdline').replace('\0',' '),'threads':{},'fds':{}}
+            for task in (proc/'task').glob('*'):row['threads'][task.name]={name:read(task/name) for name in ('comm','wchan','syscall')}
+            for fd in (proc/'fd').glob('*'):
+                try:row['fds'][fd.name]={'path':os.readlink(fd),'info':read(proc/'fdinfo'/fd.name)}
+                except OSError:pass
+            data['processes'][str(pid)]=row
+        path=output/(phase+'.json')
+        with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as file:json.dump(data,file,indent=2)
+        print(f'DIAGNOSTIC owner snapshot={path}',flush=True)
 
     def diagnostic_checkpoint(phase):
         try:diagnostic_checkpoint_inner(phase)
@@ -299,9 +337,23 @@ def child(root, runtime, container):
                     auth_refresh_entered.set()
                     assert auth_refresh_continue.wait(timeout=12), "refresh ownership inspection not released"
                 valid = form.get("refresh_token") == [auth_refresh[0]] and not auth_revoked[0]
+                if valid and os.environ.get('CIRRUS_TEST_RETAINED_SH_OWNER'):
+                    # Match the existing real Secret Service rotation lab:
+                    # lock the collection at the token-response boundary.
+                    diagnostic_event('owner-lock-collection-begin')
+                    lock_done=threading.Event()
+                    def inspect_lock():
+                        if not lock_done.wait(timeout=1):owner_snapshot('owner-lock-stalled')
+                    inspector=threading.Thread(target=inspect_lock);inspector.start()
+                    prefix=['gdbus','call','--session','--dest','org.freedesktop.secrets','--object-path','/org/freedesktop/secrets','--method']
+                    alias=fixture.require(fixture.run(prefix+['org.freedesktop.Secret.Service.ReadAlias','default']),'finding real collection').stdout.split("'")[1]
+                    fixture.require(fixture.run(prefix+['org.freedesktop.Secret.Service.Lock',"[objectpath '"+alias+"']"]),'locking real collection after durable refresh fence')
+                    lock_done.set();inspector.join(timeout=2)
+                    diagnostic_event('owner-lock-collection-end')
                 if valid:
                     auth_token[0] = os.urandom(24).hex()
                     auth_refresh[0] = os.urandom(24).hex()
+                    auth_expired[0] = False
                 body = json.dumps(dict(access_token=auth_token[0], refresh_token=auth_refresh[0],
                                        token_type="Bearer", expires_in=3600) if valid else dict(error="invalid_grant")).encode()
                 self.send_response(200 if valid else 400)
@@ -313,6 +365,12 @@ def child(root, runtime, container):
             if self.headers.get("Authorization") != "Bearer " + auth_token[0]:
                 self.send_error(403)
                 return
+            if os.environ.get('CIRRUS_TEST_RETAINED_SH_OWNER') and auth_expired[0]:
+                # The disposable issuer has expired this access token. Its
+                # refresh reachability probe must receive the same real 401,
+                # not depend on another upstream Graph listing round trip.
+                self.send_error(401)
+                return
             if os.environ.get("CIRRUS_TEST_OFFLINE_AUTOMATIC"):
                 if self.command in ("PUT","DELETE","MKCOL","MOVE"):
                     offline_auto_headers.append((self.command,unquote(self.path),self.headers.get("If-Match"),self.headers.get("If-None-Match")))
@@ -323,7 +381,7 @@ def child(root, runtime, container):
                 offline_tree_mutations.append((self.command, unquote(self.path)))
             if os.environ.get("CIRRUS_TEST_OFFLINE_MOUNT") and self.command in ("PUT", "DELETE", "MOVE", "MKCOL"):
                 offline_mount_mutations.append((self.command, unquote(self.path)))
-                if os.environ.get("CIRRUS_TEST_OFFLINE_LOCAL_DIRECTORY_REPLACE"):
+                if os.environ.get("CIRRUS_TEST_OFFLINE_LOCAL_DIRECTORY_REPLACE") or os.environ.get('CIRRUS_TEST_PIN_LOCAL_CREATES'):
                     local_reuse_headers.append((self.command,unquote(self.path),self.headers.get("If-None-Match")))
             if os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_OUTGOING") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_INCOMING"):
                 if self.command=="DELETE":outgoing_delete_headers.append((unquote(self.path),self.headers.get("If-Match")))
@@ -363,6 +421,7 @@ def child(root, runtime, container):
                     auth_reject_get[0] = False
                     auth_get_entered.set()
                     assert auth_get_continue.wait(timeout=12), "receipt inspection not released"
+                    if os.environ.get('CIRRUS_TEST_RETAINED_SH_OWNER'):auth_expired[0]=True
                     self.send_error(401)
                     return
                 if self.command == "GET" and ((self.path.endswith("/auth-persistent") and auth_persistent[0]) or
@@ -571,6 +630,19 @@ def child(root, runtime, container):
                     reconcile_xml_sizes.append(len(body))
                     if reconcile_truncated[0]:
                         body = body[:-32]  # Valid records, but no complete closing multistatus.
+                if self.command == "PROPFIND" and status == 207 and (os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("ownership-plan","fragment-union") or os.environ.get('CIRRUS_TEST_PIN_OWNER_AGREEMENT')):
+                    # A real DAV boundary with optional checksums omitted. IDs,
+                    # ETags and bytes are still the actual server resources.
+                    xml=ET.fromstring(body)
+                    for propstat in xml.iter():
+                        if propstat.tag.rsplit('}',1)[-1]!='propstat':continue
+                        status_node=next((node for node in propstat if node.tag.rsplit('}',1)[-1]=='status'),None)
+                        if status_node is None or ' 200 ' not in (status_node.text or ''):continue
+                        for parent in propstat:
+                            if parent.tag.rsplit('}',1)[-1]!='prop':continue
+                            for element in list(parent):
+                                if element.tag.rsplit('}',1)[-1] in ('checksums','checksum'):parent.remove(element)
+                    body=ET.tostring(xml,encoding='utf-8',xml_declaration=True)
                 if namespace_truncated[0] and self.command == "PROPFIND" and self.path.rstrip("/").endswith("/storage-snapshot"):
                     body = body[:-32]
                 if self.path.endswith("/dirty-large") and self.command == "PUT":
@@ -963,6 +1035,11 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_AUTO_PRIORITY"):
             os.environ["CIRRUS_TEST_PRIORITY_TRACE"] = "1"
             os.environ["CIRRUS_TEST_PRIORITY_WAIT_WINDOW"] = str(root / "priority-wait")
+        if os.environ.get('CIRRUS_TEST_RETAINED_SH_OWNER'):
+            os.environ['CIRRUS_TEST_LOCAL_TREE_SESSION_WINDOW']=str(root/'owner-session')
+            os.environ['CIRRUS_TEST_OWNED_LOCAL_PERSIST_WINDOW']=str(root/'owner-before-persist')
+            os.environ['CIRRUS_TEST_OWNED_LOCAL_OWNER_WINDOW']=str(root/'owner-persisted')
+            os.environ['CIRRUS_TEST_OWNED_LOCAL_EXCLUSIVE_WINDOW']=str(root/'owner-exclusive')
         if os.environ.get("CIRRUS_TEST_AUTO_WRITE_CONTENTION"):
             os.environ["CIRRUS_TEST_BLOCKER_TRACE"] = "1"
             os.environ["CIRRUS_TEST_AUTO_STATE_RESERVED_WINDOW"] = str(root / "auto-state-held")
@@ -1995,6 +2072,390 @@ def child(root, runtime, container):
         account["selected_space_verified"] = space
         fixture.require(cli("--mount", url, mountpoint), "mounting lab")
         mounted = True
+        if os.environ.get("CIRRUS_TEST_STORAGE_SAFEGUARDS"):
+            # BEGIN OPTIONAL G8 STORAGE SAFEGUARDS
+            database = runtime / "home/.local/state/cirrus-drive/state.db"
+            staging = database.parent / "staging"
+            target = mountpoint / "atomic-target.bin"
+            old_bytes = b"A" * 4096
+            current_bytes = b"B" * 4096
+            pressure_selections = {}
+
+            def pressure_status():
+                return json.loads(fixture.require(cli("--storage-status"), "observing real pressure accounting").stdout)
+
+            def pressure_policy(budget, reserve=0):
+                view = json.loads(fixture.require(cli("--set-storage-limits", budget, reserve), "setting opt-in admission policy").stdout)
+                assert view["limits"] == {"budget_bytes": budget, "free_space_reserve_bytes": reserve}
+                assert view["hard_global_limit"] is False and view["automatic_reclamation"] == "persisted-clean-cache-only"
+                return view
+
+            def pressure_snapshot():
+                with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+                    tables = ("operation_journal", "operation_parents", "dirty_roots", "dirty_bases", "pins", "files", "chunks", "pin_copies", "pin_copy_files", "pin_copy_chunks")
+                    rows = {table: sorted(db.execute("SELECT * FROM " + table).fetchall(), key=repr) for table in tables}
+                return rows, {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in staging.iterdir() if path.is_file()}
+
+            def pressure_exports(phase, expected):
+                rows = [json.loads(line) for line in fixture.require(cli("--retained-staged", url), "listing exact pressure recovery selections").stdout.splitlines()]
+                current = [row for row in rows if row["path"] == [target.name] and row["state"] == "pending"]
+                former = [row for row in rows if row["path"] == [target.name] and row["state"] == "resolved"]
+                assert len(current) == len(former) == 1, (current, former)
+                receipt = []
+                for label, row, body in (("current", current[0], expected), ("detached", former[0], old_bytes)):
+                    destination = runtime / ("g8-" + phase + "-" + label)
+                    fixture.require(cli("--export-staged", url, row["id"], row["selector"], destination), "exporting exact pressure " + label)
+                    assert destination.read_bytes() == body and stat.S_IMODE(destination.stat().st_mode) == 0o600
+                    receipt.append({"kind": label, "id": row["id"], "selector": row["selector"], "state": row["state"], "size": destination.stat().st_size, "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()})
+                pins = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/folder/nested.bin"), "selecting pressure-protected pin").stdout.splitlines()]
+                assert len(pins) == 1
+                destination = runtime / ("g8-" + phase + "-pin")
+                fixture.require(cli("--export-retained", url, space, "/folder/nested.bin", "/folder/nested.bin", pins[0]["selector"], destination), "exporting exact pressure pin")
+                assert destination.read_bytes() == contents["folder/nested.bin"]
+                receipt.append({"kind": "pin", "selector": pins[0]["selector"], "size": destination.stat().st_size, "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()})
+                fixed = (former[0]["id"], former[0]["selector"], pins[0]["selector"])
+                if pressure_selections:
+                    assert fixed == pressure_selections["fixed"], "pressure changed recovery selection"
+                pressure_selections["fixed"] = fixed
+                if phase == "budget-refused": pressure_selections["current"] = current[0]["selector"]
+                if phase == "reserve-refused": assert current[0]["selector"] == pressure_selections["current"]
+                print("DIAGNOSTIC storage safeguards exports: " + json.dumps({"phase": phase, "exports": receipt}, sort_keys=True), flush=True)
+
+            def pressure_refuses(writer, payload):
+                try: os.pwrite(writer.fileno(), payload, 0)
+                except OSError as error: assert error.errno == errno.ENOSPC, error
+                else: raise AssertionError("configured pressure acknowledged a refused write")
+                os.fsync(writer.fileno())
+
+            limits = json.loads(fixture.require(cli("--storage-limits"), "showing default opt-out policy").stdout)
+            assert limits["limits"] is None and limits["hard_global_limit"] is False
+            fixture.require(cli("--pin-space", url, space, "/folder/nested.bin"), "pinning protected pressure original")
+            # A normal temp-replacement save creates a genuine resolved,
+            # detached edit, not a fabricated recovery row or orphan object.
+            with open(target, "w+b", buffering=0) as old:
+                assert old.write(old_bytes) == len(old_bytes); os.fsync(old.fileno())
+                with open(mountpoint / ".g8-save", "w+b", buffering=0) as temporary:
+                    assert temporary.write(current_bytes) == len(current_bytes); os.fsync(temporary.fileno())
+                    os.replace(mountpoint / ".g8-save", target)
+                assert os.pread(old.fileno(), len(old_bytes), 0) == old_bytes
+                assert os.fstat(old.fileno()).st_nlink == 0
+            assert read_file(target) == current_bytes
+            pressure_exports("before", current_bytes)
+            # Populate actual disposable persisted ranges, independently of pin
+            # chunks and both immutable current/detached staged snapshots.
+            assert read_file(mountpoint / "file.bin") == contents["file.bin"]
+            before = pressure_status()
+            assert before["clean_payload_bytes"] >= len(contents["file.bin"]) and before["pin_payload_bytes"] >= len(contents["folder/nested.bin"])
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+                state_room = db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0] * 3
+            with open(target, "r+b", buffering=0) as writer:
+                pressure_policy(before["immutable_admission_charge_bytes"] + state_room + 4 * 1024 * 1024)
+                assert os.pwrite(writer.fileno(), b"accepted", 0) == 8; os.fsync(writer.fileno())
+                current_bytes = b"accepted" + current_bytes[8:]
+                assert os.pread(writer.fileno(), len(current_bytes), 0) == current_bytes
+                baseline = pressure_status()
+                protected = pressure_snapshot()
+                pressure_policy(1)
+                pressure_refuses(writer, b"X" * 65536)
+                after = pressure_status()
+                assert after["immutable_admission_charge_bytes"] > 1 and after["storage_limits"]["limits"]["budget_bytes"] == 1
+                assert baseline["clean_payload_bytes"] > 0 and after["clean_payload_bytes"] == after["clean_ranges"] == 0
+                assert after["pin_payload_bytes"] == baseline["pin_payload_bytes"]
+                assert pressure_snapshot() == protected
+                assert os.pread(writer.fileno(), len(current_bytes), 0) == current_bytes
+                pressure_exports("budget-refused", current_bytes)
+                print("PASS: storage safeguards admitted write then below-usage budget ENOSPC reclaims real clean cache only; dirty/detached/pin rows and immutable bytes exact", flush=True)
+                print("DIAGNOSTIC storage safeguards accounting: " + json.dumps({"baseline": baseline, "after_budget_refusal": after}, sort_keys=True), flush=True)
+
+                filesystem = os.statvfs(database.parent)
+                reserve = filesystem.f_blocks * filesystem.f_frsize + 1
+                pressure_policy(after["immutable_admission_charge_bytes"] + state_room + 4 * 1024 * 1024, reserve)
+                protected = pressure_snapshot()
+                pressure_refuses(writer, b"Y" * 4096)
+                assert pressure_snapshot() == protected and os.pread(writer.fileno(), len(current_bytes), 0) == current_bytes
+                pressure_exports("reserve-refused", current_bytes)
+                print("PASS: storage safeguards configured impossible free-space reserve refuses without disk fill or changing acknowledged dirty/recovery/pin bytes", flush=True)
+                fixture.require(cli("--disable-storage-limits"), "disabling opt-in policy without deleting retained data")
+                assert json.loads(fixture.require(cli("--storage-limits"), "showing disabled policy").stdout)["limits"] is None
+                assert os.pwrite(writer.fileno(), b"disabled", 0) == 8; os.fsync(writer.fileno())
+                current_bytes = b"disabled" + current_bytes[8:]
+                assert os.pread(writer.fileno(), len(current_bytes), 0) == current_bytes
+                pressure_policy(1)
+            fixture.require(cli("--unmount-space", url, space), "unmounting pressure fixture"); mounted = False
+            fixture.require(cli("--stop"), "cold stopping pressure fixture"); daemon.wait(timeout=10)
+            server.shutdown(); server.server_close(); thread.join(timeout=5); server = thread = None
+            fixture.stop_process(keyring); keyring = None
+            owner = fixture.require(fixture.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner", "org.freedesktop.secrets"]), "checking cold storage keyring outage")
+            assert owner.stdout.strip() == "(false,)"
+            with socket.socket() as probe:
+                probe.settimeout(2)
+                assert probe.connect_ex(("127.0.0.1", port)) == errno.ECONNREFUSED
+            daemon = start()
+            cold = pressure_status()
+            assert cold["storage_limits"]["limits"] == {"budget_bytes": 1, "free_space_reserve_bytes": 0}
+            assert cold["immutable_admission_charge_bytes"] > 1 and cold["storage_limits"]["hard_global_limit"] is False
+            assert cold["pin_payload_bytes"] == baseline["pin_payload_bytes"]
+            pressure_exports("cold", current_bytes)
+            fixture.require(cli("--disable-storage-limits"), "disabling persisted policy without keyring or DAV")
+            final = pressure_status()
+            assert final["storage_limits"]["limits"] is None and final["staging_byte_limit"] == 4 * 1024 * 1024 * 1024
+            with diagnostic_lock:
+                assert not any(row["event"] == "upstream-start" and row["method"] in ("PUT", "DELETE", "MOVE", "MKCOL") for row in diagnostic_events), "local pressure workflow unexpectedly mutated server"
+            print("PASS: storage safeguards disable restores write; below-usage policy survives cold restart; exact current/detached/pin selector exports and policy disable need no keyring/network; not a hard global quota", flush=True)
+            # END OPTIONAL G8 STORAGE SAFEGUARDS
+            return
+        if os.environ.get("CIRRUS_TEST_OFFLINE_LIFECYCLE"):
+            # BEGIN OPTIONAL G6 LIFECYCLE
+            # Reuse the cold writable flow without its separate SQL-identity,
+            # auth-interference, peer and RO qualification rounds.
+            database = runtime / "home/.local/state/cirrus-drive/state.db"
+            fixture.require(cli("--pin-space", url, space, "/file.bin"), "pinning lifecycle original")
+            fixture.require(cli("--ls", url), "saving lifecycle root evidence")
+            fixture.require(cli("--ls", url, "/folder"), "saving lifecycle complete parent")
+            assert read_file(mountpoint / "file.bin") == contents["file.bin"]
+            # A naturally unpinned, unread original, not deleted test data.
+            with open(mountpoint / "overwrite.bin", "r+b", buffering=0) as partial:
+                assert os.pwrite(partial.fileno(), b"LOC", 0) == 3
+                os.fsync(partial.fileno())
+
+            def lifecycle_rows():
+                with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+                    return {
+                        "identity": db.execute("SELECT issuer,subject FROM account_identities WHERE instance=?", (url,)).fetchall(),
+                        "activation": db.execute("SELECT issuer,subject FROM sync_spaces WHERE instance=? AND space=?", (url,space)).fetchall(),
+                        "journal": db.execute("SELECT * FROM operation_journal ORDER BY id").fetchall(),
+                    }
+
+            original_identity = lifecycle_rows()["identity"]
+            assert original_identity and original_identity == lifecycle_rows()["activation"]
+            with diagnostic_lock:
+                assert any(row["event"] == "upstream-end" and row.get("status") == 200 for row in diagnostic_events)
+            fixture.require(cli("--unmount-space", url, space), "unmounting lifecycle online setup")
+            mounted = False
+            fixture.require(cli("--stop"), "stopping lifecycle online daemon")
+            daemon.wait(timeout=10)
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+            server = thread = None
+            fixture.stop_process(keyring); keyring = None
+            with diagnostic_lock:
+                offline_sequence = diagnostic_sequence[0]
+
+            def lifecycle_outage():
+                owner = fixture.require(fixture.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                    "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner",
+                    "org.freedesktop.secrets"]), "checking absent real Secret Service owner")
+                assert owner.stdout.strip() == "(false,)", owner.stdout
+                with socket.socket() as probe:
+                    probe.settimeout(2)
+                    assert probe.connect_ex(("127.0.0.1", port)) == errno.ECONNREFUSED, "offline endpoint still listening"
+
+            def lifecycle_mount():
+                result = fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "mounting cold local lifecycle")
+                assert "remote not checked" in result.stdout and "fsync is local only" in result.stdout
+                owners = [json.loads(line) for line in fixture.require(cli("--mounts"), "checking local lifecycle mount ownership").stdout.splitlines()]
+                owner = next(row for row in owners if row["space_id"] == space)
+                assert owner["offline_writable"] is True and owner["offline_read_only"] is False
+                assert json.loads(fixture.require(cli("--sync-status", url, space), "checking disabled lifecycle worker").stdout)["worker_enabled_here"] is False
+
+            lifecycle_outage()
+            daemon = start()
+            lifecycle_mount(); mounted = True
+            assert read_file(mountpoint / "file.bin") == contents["file.bin"]
+            check_io_error(mountpoint / "unavailable.bin")
+            with open(mountpoint / "overwrite.bin", "rb", buffering=0) as partial:
+                assert os.pread(partial.fileno(), 3, 0) == b"LOC"
+                try: os.pread(partial.fileno(), 3, 3)
+                except OSError as error: assert error.errno == errno.EIO, error
+                else: raise AssertionError("missing offline original was synthesized")
+                assert os.pread(partial.fileno(), 3, 0) == b"LOC"
+            print("PASS: offline lifecycle cold retained reads with absent keyring/closed endpoint; natural missing original EIO preserves local prefix", flush=True)
+
+            expected = b"EDIT" + contents["file.bin"][4:]
+            with open(mountpoint / "file.bin", "r+b", buffering=0) as writer:
+                assert os.pwrite(writer.fileno(), b"EDIT", 0) == 4
+                os.fsync(writer.fileno())
+                assert os.pread(writer.fileno(), 64, 0) == expected[:64]
+                assert os.pread(writer.fileno(), 1, len(expected)) == b""
+            os.mkdir(mountpoint / "lifecycle-notes")
+            with open(mountpoint / "lifecycle-notes/draft", "xb", buffering=0) as writer:
+                assert writer.write(b"accepted while disconnected") == 27
+                os.fsync(writer.fileno())
+            before_refusal = lifecycle_rows()
+            try:
+                with open(mountpoint / "delete-dir/unobserved-child", "xb", buffering=0): pass
+            except OSError as error: assert error.errno == errno.EIO, error
+            else: raise AssertionError("unobserved offline parent admitted create")
+            try: os.rmdir(mountpoint / "lifecycle-notes")
+            except OSError as error: assert error.errno == errno.ENOTEMPTY, error
+            else: raise AssertionError("offline rmdir hid accepted child")
+            assert lifecycle_rows() == before_refusal
+            assert read_file(mountpoint / "lifecycle-notes/draft") == b"accepted while disconnected"
+            assert read_file(mountpoint / "file.bin") == expected
+            lifecycle_outage()
+            fixture.require(cli("--unmount-space", url, space), "unmounting accepted offline lifecycle edits"); mounted = False
+            fixture.require(cli("--stop"), "clean stopping accepted offline lifecycle edits"); daemon.wait(timeout=10)
+            daemon = start(); lifecycle_mount(); mounted = True
+            assert read_file(mountpoint / "file.bin") == expected
+            assert read_file(mountpoint / "lifecycle-notes/draft") == b"accepted while disconnected"
+            print("PASS: offline lifecycle local fsync/EOF and unsafe namespace refusals preserve edits across clean restart", flush=True)
+
+            diagnostic_checkpoint("g6-before-owned-crash")
+            daemon.kill(); daemon.wait(timeout=10); mounted = False
+            daemon = start()
+            assert cli("--mount-offline-writable-space", url, space, mountpoint).returncode != 0, "stale owned record bypassed recovery"
+            fixture.require(cli("--recover-mount", mountpoint), "recovering exact lifecycle crashed mount")
+            lifecycle_mount(); mounted = True
+            assert read_file(mountpoint / "file.bin") == expected
+            assert read_file(mountpoint / "lifecycle-notes/draft") == b"accepted while disconnected"
+            with open(mountpoint / "overwrite.bin", "r+b", buffering=0) as partial:
+                assert os.pread(partial.fileno(), 3, 0) == b"LOC"
+                try: os.pread(partial.fileno(), 3, 3)
+                except OSError as error: assert error.errno == errno.EIO, error
+                else: raise AssertionError("restart fabricated missing original")
+                # Explicitly discard the unknown suffix, not pretend to read it.
+                os.ftruncate(partial.fileno(), 3)
+                assert os.pwrite(partial.fileno(), b"!", 3) == 1
+                os.fsync(partial.fileno())
+            assert read_file(mountpoint / "overwrite.bin") == b"LOC!"
+            lifecycle_outage()
+            assert lifecycle_rows()["identity"] == original_identity == lifecycle_rows()["activation"]
+            with diagnostic_lock:
+                assert diagnostic_sequence[0] == offline_sequence, "offline lifecycle received network traffic"
+            print("PASS: offline lifecycle owned crash/recover/remount retains acknowledged bytes and honest missing original without keyring/network", flush=True)
+            fixture.require(cli("--unmount-space", url, space), "unmounting recovered lifecycle before reconnect"); mounted = False
+            fixture.require(cli("--stop"), "stopping recovered lifecycle before fresh authentication"); daemon.wait(timeout=10)
+            # Unlock the same real persisted keyring, never rewrite credentials.
+            keyring = fixture.keyring_start()
+            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever); thread.start()
+            daemon = start()
+            fixture.require(cli("--sync-space", url, space), "authenticating retained principal and Space then syncing offline lifecycle")
+            for path, body in (("file.bin", expected), ("overwrite.bin", b"LOC!"), ("lifecycle-notes/draft", b"accepted while disconnected")):
+                status, _, actual = lab.upstream(container, "GET", base + "/" + path)
+                assert status == 200 and actual == body, (path, status, actual)
+            assert lab.upstream(container, "GET", base + "/unavailable.bin")[2] == contents["unavailable.bin"]
+            assert lab.upstream(container, "GET", base + "/delete-dir/unobserved-child")[0] == 404
+            assert lifecycle_rows()["identity"] == original_identity == lifecycle_rows()["activation"]
+            with diagnostic_lock:
+                reconnect_events = [dict(row) for row in diagnostic_events if row["sequence"] > offline_sequence]
+            mutations = [row for row in reconnect_events if row["event"] == "upstream-start" and row["method"] in ("PUT", "DELETE", "MOVE", "MKCOL")]
+            graph = [row for row in reconnect_events if row["event"] == "upstream-end" and row["method"] == "GET" and row["path"] == "/graph/v1.0/me/drives" and row["status"] == 200]
+            assert mutations and graph and graph[0]["sequence"] < mutations[0]["sequence"]
+            assert sum(row["method"] == "PUT" for row in mutations) == 3 and sum(row["method"] == "MKCOL" for row in mutations) == 1, mutations
+            fixture.require(cli("--sync-space", url, space), "checking offline lifecycle no mutation replay")
+            with diagnostic_lock:
+                later = [row for row in diagnostic_events if row["sequence"] > reconnect_events[-1]["sequence"] and row["event"] == "upstream-start" and row["method"] in ("PUT", "DELETE", "MOVE", "MKCOL")]
+            assert not later, later
+            print("PASS: offline lifecycle fresh original-principal authenticated Graph precedes one mkdir/three PUTs; independent server GET exact bytes and repeat sync sends no mutation", flush=True)
+            # END OPTIONAL G6 LIFECYCLE
+            return
+        if os.environ.get("CIRRUS_TEST_COMMON_WORKFLOW"):
+            # One online workspace flow, before the default pin/offline and
+            # fault scenarios. Original common-operation assertions below stay
+            # intact; reuse their real mounted-write/save idioms here.
+            assert read_file(mountpoint / "file.bin") == contents["file.bin"]
+            assert read_file(mountpoint / "folder/nested.bin") == contents["folder/nested.bin"]
+            assert "folder" in os.listdir(mountpoint)
+            status, _, body = lab.upstream(container, "POST", "/graph/v1.0/drives",
+                json.dumps({"name": "Common workspace independent", "driveType": "project"}).encode(),
+                [("Content-Type", "application/json")])
+            assert status == 201
+            project = json.loads(body)["id"]
+            project_base = "/dav/spaces/" + quote(project, safe="")
+            assert project != space
+            assert lab.upstream(container, "PUT", project_base + "/peer", b"independent original")[0] == 201
+            reservation_mount.mkdir(mode=0o700)
+            fixture.require(cli("--mount-space", url, project, reservation_mount), "mounting independent workspace")
+            second_mounted = True
+            # Both mounts belong to this daemon, not a second writer/process.
+            owner_cleanup_mounts.extend([
+                (daemon, cli, ("--unmount-space", url, project), reservation_mount),
+                (daemon, cli, ("--unmount-space", url, space), mountpoint)])
+            assert read_file(reservation_mount / "peer") == b"independent original"
+            assert not (mountpoint / "peer").exists()
+            assert not (reservation_mount / "file.bin").exists()
+            print("PASS: common workspace initial on-demand reads and independent RW Space mounts", flush=True)
+
+            # Same assertions as the default mounted regular-file edit flow.
+            with open(mountpoint / "fuse-created", "w+b", buffering=0) as file:
+                assert file.write(b"mounted data") == 12
+                file.seek(0)
+                assert file.read() == b"mounted data"
+                with open(mountpoint / "fuse-created", "rb", buffering=0) as reader:
+                    assert reader.read() == b"mounted data"
+                    file.truncate(7)
+                    reader.seek(0)
+                    assert reader.read() == b"mounted"
+                    os.fsync(file.fileno())
+            with open(mountpoint / "fuse-created", "ab", buffering=0) as file:
+                assert file.write(b" edit") == 5
+            assert read_file(mountpoint / "fuse-created") == b"mounted edit"
+            with open(reservation_mount / "fuse-created", "wb", buffering=0) as file:
+                assert file.write(b"independent edit") == 16
+                os.fsync(file.fileno())
+            assert read_file(mountpoint / "fuse-created") == b"mounted edit"
+            assert read_file(reservation_mount / "fuse-created") == b"independent edit"
+            os.mkdir(mountpoint / "workspace")
+            os.rename(mountpoint / "fuse-created", mountpoint / "workspace/notes")
+            assert not (mountpoint / "fuse-created").exists()
+            assert read_file(mountpoint / "workspace/notes") == b"mounted edit"
+            assert not (reservation_mount / "workspace").exists()
+
+            # Default atomic-temp save idiom, including the retained old reader.
+            with open(mountpoint / ".atomic-temp", "w+b", buffering=0) as temporary:
+                temporary.write(b"atomic saved")
+                os.fsync(temporary.fileno())
+                with open(mountpoint / "atomic-target.bin", "rb", buffering=0) as target:
+                    os.replace(mountpoint / ".atomic-temp", mountpoint / "atomic-target.bin")
+                    assert target.read() == contents["atomic-target.bin"]
+                    assert os.fstat(target.fileno()).st_nlink == 0
+                temporary.write(b" through open handle")
+                os.fsync(temporary.fileno())
+            assert read_file(mountpoint / "atomic-target.bin") == b"atomic saved through open handle"
+            assert not (mountpoint / ".atomic-temp").exists()
+            print("PASS: common workspace create/write/append/truncate/mkdir/rename and temp replacement save", flush=True)
+
+            vim = shutil.which("vim")
+            assert vim, "installed Vim required for this opt-in qualification"
+            command = [vim, "-Nu", "NONE", "-i", "NONE", "-es", "-c", "%s/before/after/", "-c", "wq",
+                       str(mountpoint / "vim-default.txt")]
+            result = subprocess.run(command, capture_output=True, timeout=60)
+            print(f"DIAGNOSTIC common Vim: command={command!r} exit={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}", flush=True)
+            assert result.returncode == 0, "Vim save failed; no settings workaround permitted"
+            assert read_file(mountpoint / "vim-default.txt") == b"after\n"
+            assert not (mountpoint / "vim-default.txt~").exists()
+            try:
+                os.chmod(mountpoint / "workspace/notes", 0o644)
+            except OSError as error:
+                assert error.errno == errno.EOPNOTSUPP, error
+                print(f"PASS: common workspace unsupported chmod reports errno={error.errno}", flush=True)
+            else:
+                raise AssertionError("unsupported chmod unexpectedly succeeded")
+            assert stat.S_IMODE(os.stat(mountpoint / "workspace/notes").st_mode) == 0o600
+            fixture.require(cli("--sync-space", url, space), "syncing workspace saves")
+            fixture.require(cli("--sync-space", url, project), "syncing independent workspace")
+            for remote_base, path, expected in (
+                (base, "/workspace/notes", b"mounted edit"),
+                (base, "/atomic-target.bin", b"atomic saved through open handle"),
+                (base, "/vim-default.txt", b"after\n"),
+                (project_base, "/fuse-created", b"independent edit"),
+                (project_base, "/peer", b"independent original")):
+                status, _, body = lab.upstream(container, "GET", remote_base + path)
+                assert status == 200 and body == expected, (remote_base, path, status, body)
+            assert lab.upstream(container, "GET", base + "/fuse-created")[0] == 404
+            assert lab.upstream(container, "GET", project_base + "/workspace/notes")[0] == 404
+            print("PASS: common workspace Vim save and both Space syncs independently GET exact server bytes", flush=True)
+            os.unlink(mountpoint / "workspace/notes")
+            os.rmdir(mountpoint / "workspace")
+            assert not (mountpoint / "workspace").exists()
+            fixture.require(cli("--sync-space", url, space), "syncing workspace deletion")
+            assert lab.upstream(container, "GET", base + "/workspace/notes")[0] == 404
+            assert lab.upstream(container, "PROPFIND", base + "/workspace", headers=[("Depth", "0")])[0] == 404
+            assert read_file(reservation_mount / "fuse-created") == b"independent edit"
+            assert lab.upstream(container, "GET", project_base + "/fuse-created")[2] == b"independent edit"
+            print("PASS: common workspace unlink/empty-rmdir sync removes server objects without touching independent Space", flush=True)
+            return
         if os.environ.get("CIRRUS_TEST_AUTO_BUS"):
             database=runtime/"home/.local/state/cirrus-drive/state.db"
             status,_,body=lab.upstream(container,"POST","/graph/v1.0/drives",json.dumps({"name":"Credential bus peer","driveType":"project"}).encode(),[("Content-Type","application/json")]);assert status==201
@@ -2254,6 +2715,664 @@ def child(root, runtime, container):
             network_stop=time.monotonic()-started;assert network_stop<35,network_stop
             offline_auto_graph_hold[0]=False;offline_auto_graph_continue.set()
             print(f"PASS: default automatic offline writable mount/cold edits without keyring/proxy; safe Retry; real stalled Secret Service shared ownership/local save/unmount/stop ({keyring_unmount:.3f}s/{keyring_stop:.3f}s); wrong issuer/subject retained/fenced; original restore auto-confirms both Spaces without manual sync/reactivation/remount/restart, verified in-flight successor and exact post-confirmation edit; real deleted Space no upload, lost response cold non-replay; blocked network offline unmount {network_unmount:.3f}s, stop drain {network_stop:.3f}s (not a 2s network contract)",flush=True)
+            return
+        if os.environ.get('CIRRUS_TEST_PIN_OWNER_AGREEMENT'):
+            database=runtime/'home/.local/state/cirrus-drive/state.db'
+            baseline=os.environ['CIRRUS_TEST_PIN_OWNER_AGREEMENT']=='baseline'
+            original=bytes(range(251))*3134;expected=b'LOC'+original[3:]
+            assert lab.upstream(container,'MKCOL',base+'/owners')[0]==201
+            assert lab.upstream(container,'PUT',base+'/owners/leaf',b'B'*len(original))[0]==201
+            assert lab.upstream(container,'PUT',base+'/owners-unrelated',b'unrelated owner')[0]==201
+            fixture.require(cli('--unmount-space',url,space),'quiescing owner agreement setup');mounted=False
+            # This legitimate older root capture has a different full version
+            # of the same resource. Its bytes must not poison A's agreement.
+            fixture.require(cli('--pin-space',url,space,'/'),'pinning independent older B representation')
+            assert lab.upstream(container,'PUT',base+'/owners/leaf',original)[0]==204
+            fixture.require(cli('--pin-space',url,space,'/owners'),'pinning exact A ancestor owner')
+            fixture.require(cli('--pin-space',url,space,'/owners/leaf'),'pinning exact A leaf owner')
+            fixture.require(cli('--pin-space',url,space,'/owners-unrelated'),'pinning unrelated owner')
+            status,_,body=lab.upstream(container,'POST','/graph/v1.0/drives',json.dumps({'name':'Owner agreement peer','driveType':'project'}).encode(),[('Content-Type','application/json')]);assert status==201
+            project=json.loads(body)['id'];project_base='/dav/spaces/'+quote(project,safe='')
+            assert lab.upstream(container,'PUT',project_base+'/owners',b'independent Space bytes')[0]==201
+            reservation_mount.mkdir(mode=0o700)
+            fixture.require(cli('--mount-space',url,project,reservation_mount),'activating owner peer');second_mounted=True
+            fixture.require(cli('--unmount-space',url,project),'quiescing owner peer');second_mounted=False
+            fixture.require(cli('--pin-space',url,project,'/owners'),'pinning other Space')
+            fixture.require(cli('--evict-space',url,space,'/'),'evicting owner agreement clean cache')
+            account_copy=json.loads(fixture.require(fixture.run(['secret-tool','lookup','application','cirrus-drive','instance',url]),'retaining disposable owner credentials').stdout)
+            fixture.require(cli('--stop'),'stopping online owner setup');daemon.wait(timeout=10)
+            server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+            fixture.stop_process(keyring);keyring=None
+            daemon=start()
+            def owner_mount():
+                nonlocal mounted,second_mounted
+                fixture.require(cli('--mount-offline-writable-space',url,space,mountpoint),'mounting owner A offline');mounted=True
+                fixture.require(cli('--mount-offline-space',url,project,reservation_mount),'mounting independent owner peer');second_mounted=True
+            def owner_stop():
+                nonlocal mounted,second_mounted
+                fixture.require(cli('--unmount-space',url,space),'unmounting owner primary');mounted=False
+                fixture.require(cli('--unmount-space',url,project),'unmounting owner peer');second_mounted=False
+                fixture.require(cli('--stop'),'stopping owner byte caches');daemon.wait(timeout=10)
+            def owner_restart():
+                nonlocal daemon
+                owner_stop();daemon=start();owner_mount()
+            def owner_state():
+                with sqlite3.connect(database) as db:
+                    return {table:db.execute('SELECT * FROM '+table+' ORDER BY rowid').fetchall() for table in ('pins','files','chunks','dirty_roots','dirty_bases','operation_journal','operation_parents','pin_copies','pin_copy_files','pin_copy_chunks')}
+            def owner_refusal(message):
+                saved=owner_state();result=cli('--unpin-space',url,space,'/owners')
+                assert result.returncode!=0 and message in result.stderr,result
+                assert owner_state()==saved,'owner refusal changed pins/recovery or promoted ambiguous bytes'
+            def staged_export(label,content):
+                rows=[json.loads(line) for line in fixture.require(cli('--retained-staged',url),'listing owner recovery').stdout.splitlines()]
+                selected=max((row for row in rows if row['path']==['owners','leaf']),key=lambda row:row['id'])
+                output=runtime/('owners-staged-'+label)
+                fixture.require(cli('--export-staged',url,selected['id'],selected['selector'],output),'exporting owner interpretation')
+                assert hashlib.sha256(output.read_bytes()).digest()==hashlib.sha256(content).digest()
+            owner_mount();before=list(offline_mount_mutations)
+            with open(mountpoint/'owners/leaf','r+b',buffering=0) as dirty:dirty.write(b'LOC');os.fsync(dirty.fileno())
+            with sqlite3.connect(database) as db:
+                rows=db.execute("SELECT root,version FROM files WHERE space=? AND path='[\"owners\",\"leaf\"]' ORDER BY root",(space,)).fetchall()
+                versions={root:json.loads(version) for root,version in rows}
+                assert versions['["owners"]']==versions['["owners","leaf"]'] and not versions['["owners"]']['checksums']
+                assert versions['[]']['etag']!=versions['["owners"]']['etag']
+                assert db.execute('SELECT count(*) FROM dirty_bases').fetchone()==(0,)
+                bad_root='["owners","leaf"]'
+                rowid,body,digest=db.execute('SELECT rowid,body,digest FROM chunks WHERE space=? AND root=? AND offset=0',(space,bad_root)).fetchone()
+                changed=body[:65536]+bytes([body[65536]^1])+body[65537:]
+                # Deliberate disposable fault: payload AND its stored SHA agree,
+                # but two legitimate hashless owners contradict each other.
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(changed,hashlib.sha256(changed).hexdigest(),rowid))
+                b_row,b_body=db.execute("SELECT rowid,body FROM chunks WHERE space=? AND root='[]' AND path='[\"owners\",\"leaf\"]' AND offset=0",(space,)).fetchone()
+                b_bad=bytes([b_body[0]^1])+b_body[1:]
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(b_bad,hashlib.sha256(b_bad).hexdigest(),b_row))
+            if baseline:
+                fixture.require(cli('--unpin-space',url,space,'/owners'),'baseline arbitrary owner capture and unpin')
+                owner_restart()
+                staged_export('baseline-wrong',b'LOC'+changed[3:]+original[len(changed):])
+                assert read_file(reservation_mount/'owners')==b'independent Space bytes'
+                assert offline_mount_mutations==before
+                owner_stop()
+                print('PASS BASELINE BUG: real overlapping hashless A owners, one precisely rehashed contradictory chunk; arbitrary first owner promoted wrong original to dirty_bases, unpin deleted good owner, cold exact recovery export contains wrong byte; other Space intact/no network',flush=True)
+                return
+            owner_refusal('owners disagree')
+            saved=owner_state();owner_restart();assert owner_state()==saved,'cold restart changed disagreeing owners or recovery roots'
+            owner_refusal('owners disagree')
+            rows=[json.loads(line) for line in fixture.require(cli('--retained-staged',url),'listing unresolved original authority').stdout.splitlines()]
+            selected=max((row for row in rows if row['path']==['owners','leaf']),key=lambda row:row['id'])
+            output=runtime/'owners-unprotected-export'
+            refused=cli('--export-staged',url,selected['id'],selected['selector'],output)
+            assert refused.returncode!=0 and 'exact original content base is unavailable locally' in refused.stderr and not output.exists(),refused
+            assert owner_state()==saved,'failed export promoted an arbitrary pin owner'
+            # Emergency inspection/export remains available for each owner;
+            # disagreement is not permission to silently select one as base.
+            for pin_root,content,label in (('/owners',original,'good'),('/owners/leaf',changed+original[len(changed):],'contradictory')):
+                rows=[json.loads(line) for line in fixture.require(cli('--retained-files',url,space,pin_root),'listing individual owner').stdout.splitlines()]
+                selected=next(row for row in rows if row['path']==['owners','leaf'])
+                output=runtime/('owners-pin-'+label)
+                fixture.require(cli('--export-retained',url,space,pin_root,'/owners/leaf',selected['selector'],output),'exporting individual disagreeing owner')
+                assert output.read_bytes()==content
+            fixture.require(cli('--unpin-space',url,space,'/owners-unrelated'),'unpinning unrelated data despite A ambiguity')
+            with sqlite3.connect(database) as db:db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(body,'0'*64,rowid))
+            owner_refusal('integrity check failed')
+            with sqlite3.connect(database) as db:
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(body,digest,rowid))
+                file_row=db.execute('SELECT rowid,* FROM files WHERE space=? AND root=?',(space,bad_root)).fetchone()
+                db.execute('DELETE FROM files WHERE rowid=?',(file_row[0],))
+            owner_refusal('owner is incomplete')
+            with sqlite3.connect(database) as db:
+                db.execute('INSERT INTO files(rowid,instance,space,root,path,version,verified_complete) VALUES(?,?,?,?,?,?,?)',file_row)
+                # Alternate segmentation is not supported by this schema. A
+                # complete payload with rehashed half blocks must be refused.
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(body[:65536],hashlib.sha256(body[:65536]).hexdigest(),rowid))
+                db.execute('INSERT INTO chunks VALUES(?,?,?,?,?,?,?)',(url,space,bad_root,'["owners","leaf"]',65536,body[65536:],hashlib.sha256(body[65536:]).hexdigest()))
+            owner_refusal('owner is incomplete')
+            with sqlite3.connect(database) as db:
+                db.execute('DELETE FROM chunks WHERE space=? AND root=? AND offset=65536',(space,bad_root))
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(body,digest,rowid))
+                last_id,last_offset,last_body,last_digest=db.execute('SELECT rowid,offset,body,digest FROM chunks WHERE space=? AND root=? ORDER BY offset DESC LIMIT 1',(space,bad_root)).fetchone()
+                last_bad=bytes([last_body[0]^1])+last_body[1:]
+                db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(last_bad,hashlib.sha256(last_bad).hexdigest(),last_id))
+            # Agreement is per required block: a later contradictory block
+            # may leave only independently agreed prefix progress, never a
+            # wrong original reference or successful pin deletion.
+            saved=owner_state();result=cli('--unpin-space',url,space,'/owners')
+            assert result.returncode!=0 and 'owners disagree' in result.stderr,result
+            after=owner_state()
+            for table in saved:
+                if table!='dirty_bases':assert after[table]==saved[table],table
+            with sqlite3.connect(database) as db:
+                refs=[(offset,json.loads(obj)) for version,offset,obj in db.execute('SELECT version,offset,object FROM dirty_bases ORDER BY offset') if json.loads(version)==versions['["owners"]']]
+            assert refs and last_offset not in [offset for offset,_ in refs]
+            for offset,obj in refs:
+                payload=(database.parent/'staging'/obj['name']).read_bytes()
+                assert payload==original[offset:offset+obj['size']] and obj['blocks']==[hashlib.sha256(payload).hexdigest()]
+            with sqlite3.connect(database) as db:db.execute('UPDATE chunks SET body=?,digest=? WHERE rowid=?',(last_body,last_digest,last_id))
+            fixture.require(cli('--unpin-space',url,space,'/owners'),'protecting agreeing exact A owners before unpin')
+            owner_restart();staged_export('agreed-cold',expected)
+            protected=owner_state()
+            # Independently durable originals already verified must not be
+            # overwritten, or reproven from now-contradictory remaining pins.
+            with sqlite3.connect(database) as db:db.execute('UPDATE chunks SET body=?,digest=? WHERE space=? AND root=? AND offset=0',(changed,hashlib.sha256(changed).hexdigest(),space,bad_root))
+            fixture.require(cli('--unpin-space',url,space,'/owners/leaf'),'removing owner after independent original protection')
+            assert owner_state()['dirty_bases']==protected['dirty_bases']
+            owner_restart();staged_export('independent-cold',expected)
+            assert read_file(mountpoint/'owners/leaf')==expected and read_file(reservation_mount/'owners')==b'independent Space bytes'
+            assert offline_mount_mutations==before
+            keyring=fixture.keyring_start()
+            fixture.require(fixture.run(['secret-tool','store','--label=cirrus-owner-lab','application','cirrus-drive','instance',url],input=json.dumps(account_copy)),'restoring owner principal')
+            server=ThreadingHTTPServer(('127.0.0.1',port),Handler);server.socket=context.wrap_socket(server.socket,server_side=True)
+            thread=threading.Thread(target=server.serve_forever);thread.start()
+            for _ in range(4):
+                synced=cli('--sync-space',url,space)
+                if synced.returncode==0:break
+                with sqlite3.connect(database) as db:assert 'successful uploads await safe read-back retry' in synced.stderr and db.execute('SELECT 1 FROM upload_verifications').fetchone(),synced
+            fixture.require(synced,'confirming agreed owner upload')
+            assert lab.upstream(container,'GET',base+'/owners/leaf')[2]==expected
+            assert offline_mount_mutations==before+[('PUT',unquote(base)+'/owners/leaf')]
+            stable=list(offline_mount_mutations);fixture.require(cli('--sync-space',url,space),'checking agreed owner non-replay');assert offline_mount_mutations==stable
+            owner_stop()
+            print('PASS: all exact hashless active owners must agree before local capture; rehashed contradiction/corruption/missing file/noncanonical segmentation refuse unchanged across cold restart; individual exports available, unrelated/different-version/other-Space pins excluded; matching owners protect, independent bases never replaced, cold exact recovery and one PUT/non-replay',flush=True)
+            return
+        if os.environ.get('CIRRUS_TEST_REPIN_DIRTY_GUARD'):
+            database=runtime/'home/.local/state/cirrus-drive/state.db'
+            transform=os.environ.get('CIRRUS_TEST_PIN_TRANSFORM')
+            if transform:
+                os.environ['CIRRUS_TEST_BASE_CAPTURE_COMMIT_ABORT']=str(root/'transform-capture-abort')
+                os.environ['CIRRUS_TEST_BASE_CAPTURE_COMMITTED_ERROR']=str(root/'transform-capture-unknown')
+            baseline=os.environ['CIRRUS_TEST_REPIN_DIRTY_GUARD']=='baseline'
+            captured=os.environ['CIRRUS_TEST_REPIN_DIRTY_GUARD']=='captured'
+            original=bytes(range(251))*3134;replacement=b'B'*len(original)
+            expected=b'LOC'+original[3:]
+            assert lab.upstream(container,'MKCOL',base+'/repin-guard')[0]==201
+            assert lab.upstream(container,'PUT',base+'/repin-guard/item',original)[0]==201
+            assert lab.upstream(container,'PUT',base+'/repin-race',original)[0]==201
+            if transform:
+                assert lab.upstream(container,'MKCOL',base+'/transform-source')[0]==201
+                assert lab.upstream(container,'PUT',base+'/transform-source/kept',b'source survives transformation')[0]==201
+            status,_,body=lab.upstream(container,'POST','/graph/v1.0/drives',json.dumps({'name':'Repin independent','driveType':'project'}).encode(),[('Content-Type','application/json')]);assert status==201
+            project=json.loads(body)['id'];project_base='/dav/spaces/'+quote(project,safe='')
+            assert lab.upstream(container,'PUT',project_base+'/repin-guard',b'independent Space pin')[0]==201
+            reservation_mount.mkdir(mode=0o700)
+            fixture.require(cli('--mount-space',url,project,reservation_mount),'activating repin peer Space');second_mounted=True
+            fixture.require(cli('--unmount-space',url,project),'quiescing repin peer');second_mounted=False
+            fixture.require(cli('--unmount-space',url,space),'quiescing repin primary');mounted=False
+            fixture.require(cli('--pin-space',url,space,'/repin-guard'),'pinning directory original A')
+            fixture.require(cli('--pin-space',url,space,'/repin-race'),'pinning staging race original')
+            if transform:fixture.require(cli('--pin-space',url,space,'/transform-source'),'pinning transformation source')
+            fixture.require(cli('--pin-space',url,project,'/repin-guard'),'pinning independent Space original')
+            fixture.require(cli('--evict-space',url,space,'/'),'evicting clean repin cache')
+            if transform:account_copy=json.loads(fixture.require(fixture.run(['secret-tool','lookup','application','cirrus-drive','instance',url]),'retaining disposable transformation principal').stdout)
+            fixture.require(cli('--stop'),'restarting repin setup');daemon.wait(timeout=10)
+            os.environ['CIRRUS_TEST_OFFLINE_WRITE_OWNED_WINDOW']=str(root/'repin-write-owned')
+            os.environ['CIRRUS_TEST_OFFLINE_WRITE_OWNED_SPACE']=space
+            os.environ['CIRRUS_TEST_PIN_DOWNLOAD_WINDOW']=str(root/'repin-download')
+            daemon=start()
+            def repin_mount():
+                nonlocal mounted,second_mounted
+                fixture.require(cli('--mount-offline-writable-space',url,space,mountpoint),'mounting retained repin originals');mounted=True
+                fixture.require(cli('--mount-offline-space',url,project,reservation_mount),'mounting repin peer offline');second_mounted=True
+            def repin_stop():
+                nonlocal mounted,second_mounted
+                fixture.require(cli('--unmount-space',url,space),'unmounting repin primary');mounted=False
+                fixture.require(cli('--unmount-space',url,project),'unmounting repin peer');second_mounted=False
+                fixture.require(cli('--stop'),'stopping repin byte caches');daemon.wait(timeout=10)
+            def repin_state():
+                with sqlite3.connect(database) as db:
+                    return {table:db.execute('SELECT * FROM '+table+' ORDER BY rowid').fetchall() for table in ('pins','files','chunks','pin_copies','pin_copy_files','pin_copy_chunks','dirty_roots','dirty_bases','operation_journal','operation_parents')}
+            def close_resolved():
+                try:os.close(descriptor)
+                except OSError as error:assert error.errno==errno.EIO,error # acknowledged journal handle cannot flush again
+            repin_mount();before=list(offline_mount_mutations)
+            descriptor=os.open(mountpoint/'repin-guard/item',os.O_RDWR)
+            assert os.pwrite(descriptor,b'LOC',0)==3;os.fsync(descriptor)
+            with sqlite3.connect(database) as db:assert db.execute('SELECT count(*) FROM dirty_bases').fetchone()==(0,)
+            assert lab.upstream(container,'PUT',base+'/repin-guard/item',replacement)[0]==204
+            # The automatic executor checks the actual remote version before
+            # base preparation; manual sync intentionally prepares a conflict
+            # copy first and therefore cannot reproduce this uncovered root.
+            conflict_runtime=runtime/'repin-conflict-peer';conflict_runtime.mkdir(mode=0o700)
+            conflict_env=dict(os.environ,XDG_RUNTIME_DIR=str(conflict_runtime),CIRRUS_TEST_AUTO_SYNC='1')
+            with (root/'repin-conflict-peer.log').open('w') as log:
+                second_daemon=subprocess.Popen([str(fixture.BINARY)],env=conflict_env,stdout=subprocess.DEVNULL,stderr=log)
+            ticks=Path(f'/proc/{second_daemon.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+            print(f'OWNED repin conflict peer: root={root} runtime={conflict_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}',flush=True)
+            deadline=time.monotonic()+100
+            while True:
+                with sqlite3.connect(database) as db:
+                    state=db.execute("SELECT state FROM operation_journal WHERE space=? AND path='[\"repin-guard\",\"item\"]' AND op_type='write'",(space,)).fetchone()
+                if state==('conflict',):break
+                assert second_daemon.poll() is None and time.monotonic()<deadline,state;time.sleep(.1)
+            fixture.require(fixture.run([str(fixture.BINARY),'--stop'],env=conflict_env),'stopping actual automatic version preflight peer');second_daemon.wait(timeout=10)
+            with sqlite3.connect(database) as db:
+                operation,token,state=db.execute("SELECT id,staged_file,state FROM operation_journal WHERE space=? AND path='[\"repin-guard\",\"item\"]' AND op_type='write'",(space,)).fetchone()
+                assert state=='conflict' and db.execute('SELECT count(*) FROM dirty_bases').fetchone()==(0,)
+            assert offline_mount_mutations==before,'version conflict sent a destructive request'
+            if captured:
+                blocked=cli('--pin-space',url,space,'/repin-guard')
+                assert blocked.returncode!=0 and 'unresolved operations' in blocked.stderr,blocked
+                body=bytearray()
+                while len(body)<len(original):
+                    part=os.pread(descriptor,min(131072,len(original)-len(body)),len(body));assert part
+                    body.extend(part)
+                assert bytes(body)==expected
+            fixture.require(cli('--acknowledge',url,token),'acknowledging actual A/B conflict without asserting remote outcome')
+            retained=[json.loads(line) for line in fixture.require(cli('--retained-staged',url),'listing resolved A recovery').stdout.splitlines()]
+            selected=next(row for row in retained if row['id']==operation)
+            saved=repin_state()
+            with sqlite3.connect(database) as db:assert db.execute('SELECT state FROM operation_journal WHERE id=?',(operation,)).fetchone()==('resolved',)
+            if transform:
+                # Actual deletion/observations, not a fabricated empty proof.
+                # A's partial root remains resolved and unmaterialized.
+                close_resolved();repin_stop();daemon=start()
+                assert lab.upstream(container,'DELETE',base+'/repin-guard/item')[0]==204
+                fixture.require(cli('--ls',url),'saving current replacement parent')
+                fixture.require(cli('--ls',url,'/repin-guard'),'saving actual empty target')
+                fixture.require(cli('--evict-space',url,space,'/'),'evicting transformation cache')
+                fixture.require(cli('--stop'),'stopping transformation observations');daemon.wait(timeout=10)
+                server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+                fixture.stop_process(keyring);keyring=None
+                daemon=start();repin_mount()
+                output=runtime/'before-transform-export'
+                # Emergency staged export deliberately consumes only durable
+                # bases, not active pins; it is not a materializing read.
+                assert cli('--export-staged',url,selected['id'],selected['selector'],output).returncode!=0 and not output.exists()
+                files=[json.loads(line) for line in fixture.require(cli('--retained-files',url,space,'/repin-guard'),'selecting exact A pin').stdout.splitlines()]
+                a_file=next(row for row in files if row['path']==['repin-guard','item'])
+                pin_output=runtime/'before-transform-pin'
+                fixture.require(cli('--export-retained',url,space,'/repin-guard','/repin-guard/item',a_file['selector'],pin_output),'verifying sole active original A')
+                assert pin_output.read_bytes()==original
+                with sqlite3.connect(database) as db:
+                    assert db.execute('SELECT count(*) FROM dirty_bases').fetchone()==(0,),'export unexpectedly captured original'
+                    original_version=json.loads(db.execute("SELECT version FROM files WHERE space=? AND root='[\"repin-guard\"]' AND path='[\"repin-guard\",\"item\"]'",(space,)).fetchone()[0])
+                    assert json.loads(db.execute('SELECT base FROM dirty_roots WHERE root=?',(token,)).fetchone()[0])==original_version
+                os.mkdir(mountpoint/'transform-local')
+                with open(mountpoint/'transform-local/kept','xb',buffering=0) as writer:writer.write(b'source survives transformation');os.fsync(writer.fileno())
+                held=os.open(mountpoint/'transform-local/kept',os.O_RDONLY)
+                if transform!='baseline':
+                    def refuse_transform(label):
+                        saved=repin_state()
+                        try:os.rename(mountpoint/'transform-local',mountpoint/'repin-guard')
+                        except OSError as error:assert error.errno in (errno.ENOSPC,errno.EIO),(label,error)
+                        else:raise AssertionError('unsafe transformation succeeded: '+label)
+                        now=repin_state()
+                        for table in saved:
+                            if table!='dirty_bases':assert now[table]==saved[table],(label,table)
+                        if label!='pressure':assert os.pread(held,100,0)==b'source survives transformation'
+                        return saved,now
+                    usage=json.loads(fixture.require(cli('--storage-status'),'sizing transformation pressure').stdout)
+                    fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes'],0),'denying transformation capture headroom')
+                    saved,now=refuse_transform('pressure');assert now==saved
+                    fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes']+128*1024*1024,0),'restoring transformation headroom')
+                    assert os.pread(held,100,0)==b'source survives transformation'
+                    with sqlite3.connect(database) as db:
+                        rowid,chunk=db.execute("SELECT rowid,body FROM chunks WHERE space=? AND root='[\"repin-guard\"]' AND offset=0",(space,)).fetchone()
+                        db.execute('UPDATE chunks SET body=? WHERE rowid=?',(bytes([chunk[0]^1])+chunk[1:],rowid))
+                    saved,now=refuse_transform('corrupt actual source');assert now==saved
+                    with sqlite3.connect(database) as db:db.execute('UPDATE chunks SET body=? WHERE rowid=?',(chunk,rowid))
+                    (root/'transform-capture-abort').touch(mode=0o600)
+                    saved,now=refuse_transform('capture rollback');assert now==saved
+                    (root/'transform-capture-unknown').touch(mode=0o600)
+                    saved,now=refuse_transform('capture outcome unknown')
+                    assert len(now['dirty_bases'])>len(saved['dirty_bases'])
+                os.rename(mountpoint/'transform-local',mountpoint/'repin-guard')
+                assert os.pread(held,100,0)==b'source survives transformation';os.close(held)
+                assert read_file(mountpoint/'repin-guard/kept')==b'source survives transformation'
+                copies=[json.loads(line) for line in fixture.require(cli('--pin-copies',url),'listing displaced original copy').stdout.splitlines()]
+                copy=next(row for row in copies if row['space']==space and row['root']==['repin-guard'])
+                entries=[json.loads(line) for line in fixture.require(cli('--pin-copy-entries',url,space,copy['id']),'selecting retained original A copy').stdout.splitlines()]
+                entry=next(row for row in entries if row['path']==['repin-guard','item'])
+                copy_output=runtime/'displaced-original-A'
+                fixture.require(cli('--export-pin-copy',url,space,copy['id'],'/repin-guard/item',entry['selector'],copy_output),'exporting retained A after active owner removal')
+                assert copy_output.read_bytes()==original
+                with sqlite3.connect(database) as db:
+                    assert not db.execute("SELECT 1 FROM files WHERE space=? AND path='[\"repin-guard\",\"item\"]'",(space,)).fetchone()
+                repin_stop();daemon=start();repin_mount()
+                output=runtime/'after-transform-export'
+                result=cli('--export-staged',url,selected['id'],selected['selector'],output)
+                if transform=='baseline':
+                    assert result.returncode!=0 and not output.exists(),result
+                    assert 'exact original content base is unavailable locally' in result.stderr,result
+                else:
+                    fixture.require(result,'cold exporting resolved A after active ownership transformation')
+                    assert output.read_bytes()==expected
+                assert read_file(reservation_mount/'repin-guard')==b'independent Space pin'
+                assert offline_mount_mutations==before
+                if transform!='baseline':
+                    assert read_file(mountpoint/'repin-guard/kept')==b'source survives transformation'
+                    keyring=fixture.keyring_start()
+                    fixture.require(fixture.run(['secret-tool','store','--label=cirrus-transform','application','cirrus-drive','instance',url],input=json.dumps(account_copy)),'restoring transformation principal')
+                    server=ThreadingHTTPServer(('127.0.0.1',port),Handler);server.socket=context.wrap_socket(server.socket,server_side=True)
+                    thread=threading.Thread(target=server.serve_forever);thread.start()
+                    assert lab.upstream(container,'PUT',base+'/repin-guard/intruder',b'new remote target')[0]==201
+                    cli('--sync-space',url,space)
+                    with sqlite3.connect(database) as db:assert db.execute("SELECT state FROM operation_journal WHERE space=? AND path='[\"repin-guard\"]' AND op_type='mkdir'",(space,)).fetchone()==('conflict',)
+                    assert offline_mount_mutations==before,'changed replacement target caused a stale mutation'
+                    cli('--sync-space',url,space);assert offline_mount_mutations==before,'replacement conflict replayed'
+                    assert lab.upstream(container,'GET',base+'/repin-guard/intruder')[2]==b'new remote target'
+                    assert lab.upstream(container,'GET',base+'/repin-guard/kept')[0]==404
+                repin_stop()
+                print('PASS'+(' BASELINE BUG: ' if transform=='baseline' else ': ')+'real resolved partial A, actual emptied target, offline local-tree replacement; cold recovery '+('lost despite retained capture' if transform=='baseline' else 'exact; pressure/corrupt/rollback/unknown capture refuse before publication, changed remote target conflicts without replay')+'; retained copy and independent Space intact; protection without network/keyring',flush=True)
+                return
+            result=cli('--pin-space',url,space,'/repin-guard') if baseline or captured else None
+            if captured:
+                fixture.require(result,'retrying B repin after real A capture and conflict acknowledgement')
+                close_resolved();repin_stop()
+                server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+                fixture.stop_process(keyring);keyring=None
+                daemon=start();repin_mount()
+                output=runtime/'repin-captured-A-export'
+                fixture.require(cli('--export-staged',url,selected['id'],selected['selector'],output),'cold exporting captured A after B publication')
+                assert hashlib.sha256(output.read_bytes()).digest()==hashlib.sha256(expected).digest()
+                assert read_file(mountpoint/'repin-guard/item')==replacement
+                assert read_file(reservation_mount/'repin-guard')==b'independent Space pin'
+                current=repin_state()
+                for table in ('dirty_roots','dirty_bases','operation_journal','operation_parents','pin_copies','pin_copy_files','pin_copy_chunks'):assert current[table]==saved[table],table
+                assert offline_mount_mutations==before
+                repin_stop()
+                print('PASS: real conflict-handle reads independently capture A originals; after acknowledgement retry directory repin B succeeds; cold offline resolved A export exact SHA/B pin/peer Space intact, no mutation replay',flush=True)
+                return
+            if baseline:
+                fixture.require(result,'baseline replacing sole A pin with B')
+                close_resolved();repin_stop()
+                server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+                fixture.stop_process(keyring);keyring=None
+                daemon=start();repin_mount()
+                output=runtime/'repin-baseline-export'
+                failed=cli('--export-staged',url,selected['id'],selected['selector'],output)
+                assert failed.returncode!=0 and 'exact original content base is unavailable locally' in failed.stderr and not output.exists(),failed
+                assert read_file(mountpoint/'repin-guard/item')==replacement
+                assert read_file(reservation_mount/'repin-guard')==b'independent Space pin'
+                assert offline_mount_mutations==before
+                repin_stop()
+                print('PASS BASELINE BUG: real A partial edit/version conflict/acknowledge resolved, directory repin B deletes sole A; cold offline retained export EIO, independent Space intact, no dirty base capture or mutation replay',flush=True)
+                return
+            usage=json.loads(fixture.require(cli('--storage-status'),'measuring repin pressure').stdout)
+            fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes'],0),'denying repin scratch headroom')
+            result=cli('--pin-space',url,space,'/repin-guard')
+            assert result.returncode!=0,result
+            assert repin_state()==saved,'pressure refusal changed originals'
+            fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes']+128*1024*1024,0),'restoring charged repin scratch and cold namespace headroom')
+            assert not (database.parent/'state-storage.reservation').exists()
+            assert not list(database.parent.glob('.pin-download-*')),'denied download scratch was not retired'
+            # Start a real peer download before a different local staging turn.
+            # Its final publication must not wait into the State/account cycle.
+            peer_runtime=runtime/'repin-peer';peer_runtime.mkdir(mode=0o700)
+            peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime))
+            with (root/'repin-peer.log').open('w') as log:
+                second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+            def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
+            deadline=time.monotonic()+10
+            while peer_cli('--status').returncode!=0:
+                assert second_daemon.poll() is None and time.monotonic()<deadline;time.sleep(.02)
+            ticks=Path(f'/proc/{second_daemon.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+            print(f'OWNED repin peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}',flush=True)
+            downloading=root/'repin-download';writing=root/'repin-write-owned'
+            downloading.touch(mode=0o600);results=[];writes=[]
+            pinner=threading.Thread(target=lambda:results.append(peer_cli('--pin-space',url,space,'/repin-guard')));pinner.start()
+            writer=None
+            try:
+                deadline=time.monotonic()+15
+                while not downloading.with_suffix('.waiting').exists() and pinner.is_alive() and time.monotonic()<deadline:time.sleep(.02)
+                assert downloading.with_suffix('.waiting').exists(),results
+                writing.touch(mode=0o600)
+                with open(mountpoint/'repin-race','r+b',buffering=0) as race:
+                    writer=threading.Thread(target=lambda:writes.append(os.pwrite(race.fileno(),b'RACE',0)));writer.start()
+                    try:
+                        deadline=time.monotonic()+10
+                        while not writing.with_suffix('.waiting').exists() and writer.is_alive() and time.monotonic()<deadline:time.sleep(.02)
+                        assert writing.with_suffix('.waiting').exists(),writes
+                        stable=repin_state();downloading.unlink();pinner.join(timeout=25)
+                        assert not pinner.is_alive() and len(results)==1,results
+                        assert results[0].returncode!=0 and 'another account operation' in results[0].stderr,results
+                        assert repin_state()==stable,'repin crossed admitted staging turn'
+                    finally:writing.unlink(missing_ok=True);writer.join(timeout=20)
+                    assert not writer.is_alive() and writes==[4];os.fsync(race.fileno())
+            finally:
+                downloading.unlink(missing_ok=True);writing.unlink(missing_ok=True);pinner.join(timeout=30)
+            fixture.require(peer_cli('--stop'),'stopping repin peer');second_daemon.wait(timeout=10)
+            fixture.require(cli('--pin-space',url,space,'/repin-guard'),'automatically protecting resolved A before publishing B')
+            protected=repin_state()
+            for table in ('dirty_roots','operation_journal','operation_parents','pin_copies','pin_copy_files','pin_copy_chunks'):assert all(row in protected[table] for row in saved[table]),table
+            assert protected['dirty_bases'],'resolved A original gaps were not independently captured'
+            fixture.require(cli('--pin',url,'/repin-guard'),'implicit retry preserves independently protected A')
+            assert repin_state()['dirty_bases']==protected['dirty_bases'],'protected retry allocated duplicate originals'
+            assert not (database.parent/'state-storage.reservation').exists()
+            assert not list(database.parent.glob('.pin-download-*')),'download scratch was not retired'
+            close_resolved()
+            repin_stop()
+            server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+            fixture.stop_process(keyring);keyring=None
+            daemon=start();repin_mount()
+            output=runtime/'repin-original-A-cold-export'
+            fixture.require(cli('--export-staged',url,selected['id'],selected['selector'],output),'cold exporting automatically protected resolved A')
+            assert hashlib.sha256(output.read_bytes()).digest()==hashlib.sha256(expected).digest()
+            assert read_file(mountpoint/'repin-guard/item')==replacement
+            current=repin_state()
+            for table in ('pin_copies','pin_copy_files','pin_copy_chunks'):assert current[table]==saved[table],table
+            for table in ('dirty_roots','operation_journal','operation_parents'):assert all(row in current[table] for row in saved[table]),table
+            assert read_file(reservation_mount/'repin-guard')==b'independent Space pin'
+            assert read_file(mountpoint/'repin-race')==b'RACE'+original[4:]
+            assert offline_mount_mutations==before
+            repin_stop()
+            print('PASS: resolved A partial recovery automatically protected locally before explicit/implicit directory repin B; pressure fail-closed, charged named download releases State for capture; peer download/staging fence no deadlock or lost acknowledgement; cold A recovery export exact SHA/B pin/independent Space, no capture duplication or mutation replay',flush=True)
+            return
+        if os.environ.get('CIRRUS_TEST_UNPIN_DIRTY_GUARD'):
+            database=runtime/'home/.local/state/cirrus-drive/state.db'
+            original=bytes(range(251))*3134
+            expected=b'LOC'+original[3:]
+            for name in ('guard-live','guard-detached','guard-full','guard-hole','guard-unrelated','guard-missing'):
+                assert lab.upstream(container,'PUT',base+'/'+name,original)[0]==201
+            assert lab.upstream(container,'MKCOL',base+'/guard-origin')[0]==201
+            assert lab.upstream(container,'PUT',base+'/guard-origin/item',original)[0]==201
+            status,_,body=lab.upstream(container,'POST','/graph/v1.0/drives',json.dumps({'name':'Unpin independent','driveType':'project'}).encode(),[('Content-Type','application/json')]);assert status==201
+            project=json.loads(body)['id'];project_base='/dav/spaces/'+quote(project,safe='')
+            assert lab.upstream(container,'PUT',project_base+'/guard-live',b'independent Space pin')[0]==201
+            reservation_mount.mkdir(mode=0o700)
+            fixture.require(cli('--mount-space',url,project,reservation_mount),'activating independent unpin Space');second_mounted=True
+            fixture.require(cli('--unmount-space',url,project),'quiescing independent unpin Space');second_mounted=False
+            fixture.require(cli('--unmount-space',url,space),'quiescing unpin setup');mounted=False
+            for name in ('guard-live','guard-detached','guard-full','guard-hole','guard-unrelated','guard-origin'):
+                fixture.require(cli('--pin-space',url,space,'/'+name),'pinning exact unpin original')
+            fixture.require(cli('--pin-space',url,project,'/guard-live'),'pinning same-name independent original')
+            fixture.require(cli('--evict-space',url,space,'/'),'evicting clean cache before disabling credentials')
+            account_copy=json.loads(fixture.require(fixture.run(['secret-tool','lookup','application','cirrus-drive','instance',url]),'retaining disposable unpin credentials').stdout)
+            fixture.require(cli('--stop'),'stopping online unpin setup');daemon.wait(timeout=10)
+            server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
+            fixture.stop_process(keyring);keyring=None
+            os.environ['CIRRUS_TEST_OFFLINE_WRITE_OWNED_WINDOW']=str(root/'guard-write-owned')
+            os.environ['CIRRUS_TEST_OFFLINE_WRITE_OWNED_SPACE']=space
+            os.environ['CIRRUS_TEST_BASE_CAPTURE_COMMIT_ABORT']=str(root/'unpin-capture-commit-abort')
+            os.environ['CIRRUS_TEST_BASE_CAPTURE_COMMITTED_ERROR']=str(root/'unpin-capture-committed-error')
+            daemon=start()
+            def guard_mount():
+                nonlocal mounted,second_mounted
+                fixture.require(cli('--mount-offline-writable-space',url,space,mountpoint),'mounting unpin originals offline');mounted=True
+                fixture.require(cli('--mount-offline-space',url,project,reservation_mount),'mounting independent unpin pin offline');second_mounted=True
+            def guard_restart():
+                nonlocal daemon,mounted,second_mounted
+                fixture.require(cli('--unmount-space',url,space),'unmounting unpin primary');mounted=False
+                fixture.require(cli('--unmount-space',url,project),'unmounting unpin peer');second_mounted=False
+                fixture.require(cli('--stop'),'stopping unpin byte caches');daemon.wait(timeout=10)
+                daemon=start();guard_mount()
+            guard_mount();before=list(offline_mount_mutations)
+            with open(mountpoint/'guard-live','r+b',buffering=0) as live:
+                live.write(b'LOC');os.fsync(live.fileno())
+            if os.environ['CIRRUS_TEST_UNPIN_DIRTY_GUARD']=='baseline':
+                fixture.require(cli('--unpin-space',url,space,'/guard-live'),'baseline removing sole original pin')
+                guard_restart()
+                with open(mountpoint/'guard-live','rb',buffering=0) as live:
+                    assert os.pread(live.fileno(),3,0)==b'LOC'
+                    try:os.pread(live.fileno(),3,5*131072)
+                    except OSError as error:assert error.errno==errno.EIO
+                    else:raise AssertionError('baseline unexpectedly protected untouched original')
+                retained=[json.loads(line) for line in fixture.require(cli('--retained-staged',url),'listing stranded baseline edit').stdout.splitlines()]
+                selected=max((row for row in retained if row['path']==['guard-live']),key=lambda row:row['id'])
+                output=runtime/'baseline-unpin-export'
+                assert cli('--export-staged',url,selected['id'],selected['selector'],output).returncode!=0 and not output.exists()
+                assert read_file(reservation_mount/'guard-live')==b'independent Space pin'
+                assert offline_mount_mutations==before
+                fixture.require(cli('--unmount-space',url,space),'unmounting stranded baseline edit');mounted=False
+                fixture.require(cli('--unmount-space',url,project),'unmounting baseline peer');second_mounted=False
+                fixture.require(cli('--stop'),'stopping unpin baseline');daemon.wait(timeout=10)
+                print('PASS BASELINE BUG: offline sole-pin unpin succeeds but cold partial edit untouched bytes and exact export fail EIO; acknowledged LOC root retained, independent Space intact, no fabricated corruption/network',flush=True)
+                return
+            def guard_state():
+                with sqlite3.connect(database) as db:
+                    return {table:db.execute('SELECT * FROM '+table+' ORDER BY rowid').fetchall() for table in ('pins','files','chunks','dirty_roots','dirty_bases','operation_journal','operation_parents')}
+            def refuses_unpin(name):
+                saved=guard_state();result=cli('--unpin-space',url,space,'/'+name)
+                assert result.returncode!=0,result
+                assert guard_state()==saved,'refused unpin changed retained ownership or bytes'
+            os.rename(mountpoint/'guard-origin',mountpoint/'guard-relocated')
+            with open(mountpoint/'guard-relocated/item','r+b',buffering=0) as alias:
+                alias.write(b'ALS');os.fsync(alias.fileno())
+            detached=os.open(mountpoint/'guard-detached',os.O_RDWR)
+            os.pwrite(detached,b'DET',0);os.fsync(detached);os.unlink(mountpoint/'guard-detached')
+            assert os.fstat(detached).st_nlink==0
+            with sqlite3.connect(database) as db:
+                assert db.execute("SELECT 1 FROM operation_journal WHERE space=? AND path='[\"guard-detached\"]' AND op_type='write' AND state='resolved'",(space,)).fetchone()
+            full=b'full replacement has no original gaps'*1000
+            with open(mountpoint/'guard-full','wb',buffering=0) as writer:writer.write(full);os.fsync(writer.fileno())
+            hole=original[:17]+bytes(len(original)+71-17)
+            with open(mountpoint/'guard-hole','r+b',buffering=0) as writer:
+                writer.truncate(17);writer.truncate(len(hole));os.fsync(writer.fileno())
+            with open(mountpoint/'guard-missing','r+b',buffering=0) as writer:writer.write(b'UNK');os.fsync(writer.fileno())
+            usage=json.loads(fixture.require(cli('--storage-status'),'sizing unpin pressure').stdout)
+            fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes'],0),'denying capture headroom')
+            refuses_unpin('guard-live')
+            fixture.require(cli('--set-storage-limits',usage['immutable_admission_charge_bytes']+128*1024*1024,0),'restoring capture and cold namespace headroom')
+            staging=database.parent/'staging'
+            objects={p.name for p in staging.iterdir()}
+            charged=json.loads(fixture.require(cli('--storage-status'),'measuring pre-rollback capture charge').stdout)['observed_staging_charge_bytes']
+            (root/'unpin-capture-commit-abort').touch(mode=0o600)
+            refuses_unpin('guard-live')
+            assert {p.name for p in staging.iterdir()}>objects,'rolled-back capture did not retain a charged durable candidate'
+            assert json.loads(fixture.require(cli('--storage-status'),'measuring retained capture orphan').stdout)['observed_staging_charge_bytes']>charged
+            prior=guard_state()
+            (root/'unpin-capture-committed-error').touch(mode=0o600)
+            result=cli('--unpin-space',url,space,'/guard-live')
+            assert result.returncode!=0 and 'outcome unknown' in result.stderr,result
+            after=guard_state()
+            for table in ('pins','files','chunks','dirty_roots','operation_journal','operation_parents'):assert after[table]==prior[table],table
+            assert len(after['dirty_bases'])>len(prior['dirty_bases']),'unknown-result continuation lacked durable original reference'
+            # Corrupt/missing actual disposable pin bytes, never journal rows.
+            # Cache/another Space cannot supply authoritative replacement A.
+            with sqlite3.connect(database) as db:
+                rowid,body=db.execute("SELECT rowid,body FROM chunks WHERE space=? AND root='[\"guard-live\"]' AND offset=131072",(space,)).fetchone()
+                db.execute('UPDATE chunks SET body=? WHERE rowid=?',(bytes([body[0]^1])+body[1:],rowid))
+            refuses_unpin('guard-live')
+            with sqlite3.connect(database) as db:db.execute('UPDATE chunks SET body=? WHERE rowid=?',(body,rowid))
+            preserved=guard_state()
+            with sqlite3.connect(database) as db:
+                row=db.execute('SELECT * FROM chunks WHERE rowid=?',(rowid,)).fetchone();db.execute('DELETE FROM chunks WHERE rowid=?',(rowid,))
+            refuses_unpin('guard-live')
+            with sqlite3.connect(database) as db:db.execute('INSERT INTO chunks VALUES(?,?,?,?,?,?,?)',row)
+            # Restore ordering only for this exact corruption-control row;
+            # state tables compare by rowid, so compare key-sorted chunks here.
+            assert sorted(guard_state()['chunks'])==sorted(preserved['chunks'])
+            before_unrelated=guard_state()
+            fixture.require(cli('--unpin-space',url,space,'/guard-unrelated'),'unpinning unrelated same-Space data')
+            fixture.require(cli('--unpin-space',url,space,'/guard-full'),'unpinning hole-free truncated replacement')
+            assert guard_state()['dirty_roots']==before_unrelated['dirty_roots'] and guard_state()['operation_journal']==before_unrelated['operation_journal']
+            assert guard_state()['dirty_bases']==before_unrelated['dirty_bases'],'hole-free/unrelated removal captured unnecessary originals'
+            peer_runtime=runtime/'guard-peer';peer_runtime.mkdir(mode=0o700)
+            peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime))
+            with (root/'guard-peer.log').open('w') as log:
+                second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+            def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
+            deadline=time.monotonic()+10
+            while peer_cli('--status').returncode!=0:
+                assert second_daemon.poll() is None and time.monotonic()<deadline;time.sleep(.02)
+            ticks=Path(f'/proc/{second_daemon.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+            print(f'OWNED unpin peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}',flush=True)
+            marker=root/'guard-write-owned';marker.touch(mode=0o600)
+            outcome=[]
+            with open(mountpoint/'guard-live','r+b',buffering=0) as live:
+                writer=threading.Thread(target=lambda:outcome.append(os.pwrite(live.fileno(),b'RACE',3)));writer.start()
+                try:
+                    deadline=time.monotonic()+10
+                    while not marker.with_suffix('.waiting').exists() and writer.is_alive() and time.monotonic()<deadline:time.sleep(.02)
+                    assert marker.with_suffix('.waiting').exists(),outcome
+                    saved=guard_state();result=peer_cli('--unpin-space',url,space,'/guard-live')
+                    assert result.returncode!=0 and 'another account operation' in result.stderr,result
+                    assert guard_state()==saved,'peer unpin crossed an admitted local staging turn'
+                finally:marker.unlink(missing_ok=True);writer.join(timeout=20)
+                assert not writer.is_alive() and outcome==[4];os.fsync(live.fileno())
+            expected=b'LOCRACE'+original[7:]
+            fixture.require(peer_cli('--stop'),'stopping exact unpin peer');second_daemon.wait(timeout=10)
+            saved=guard_state()
+            fixture.require(cli('--unpin-space',url,space,'/guard-live'),'automatically protecting live original gaps offline')
+            fixture.require(cli('--unpin-space',url,space,'/guard-detached'),'automatically protecting resolved/detached originals offline')
+            fixture.require(cli('--unpin-space',url,space,'/guard-relocated'),'protecting canonical moved-tree originals from relocated active pin')
+            fixture.require(cli('--unpin-space',url,space,'/guard-hole'),'protecting truncated original boundary without filling reextension holes')
+            with sqlite3.connect(database) as db:
+                assert [offset for version,offset in db.execute('SELECT version,offset FROM dirty_bases ORDER BY offset') if json.loads(version)['path']==['guard-hole']]==[0],'truncation/reextension captured nonexistent original tail'
+            for table in ('dirty_roots','operation_journal','operation_parents'):assert guard_state()[table]==saved[table],table
+            # No pre-protection reads. The detached FD now consumes durable
+            # originals after both pins have already been removed.
+            detached_body=bytearray()
+            while len(detached_body)<len(original):
+                part=os.pread(detached,min(131072,len(original)-len(detached_body)),len(detached_body))
+                assert part,'detached retained read ended early'
+                detached_body.extend(part)
+            assert bytes(detached_body)==b'DET'+original[3:];os.close(detached)
+            guard_restart()
+            assert read_file(mountpoint/'guard-live')==expected
+            assert read_file(mountpoint/'guard-full')==full
+            assert read_file(mountpoint/'guard-hole')==hole
+            assert read_file(mountpoint/'guard-relocated/item')==b'ALS'+original[3:]
+            assert read_file(reservation_mount/'guard-live')==b'independent Space pin'
+            with open(mountpoint/'guard-missing','rb',buffering=0) as missing:
+                assert os.pread(missing.fileno(),3,0)==b'UNK'
+                try:os.pread(missing.fileno(),3,5*131072)
+                except OSError as error:assert error.errno==errno.EIO
+                else:raise AssertionError('never-pinned original was fabricated')
+            def guard_exports(label):
+                retained=[]
+                while True:
+                    page=[json.loads(line) for line in fixture.require(cli('--retained-staged',url,len(retained)),'listing every retained unpin interpretation').stdout.splitlines()]
+                    if not page:break
+                    retained.extend(page)
+                for name,body in (('guard-live',expected),('guard-detached',b'DET'+original[3:]),('guard-relocated/item',b'ALS'+original[3:]),('guard-hole',hole)):
+                    selected=max((row for row in retained if row['path']==name.split('/')),key=lambda row:row['id'])
+                    output=runtime/('guard-export-'+label+'-'+name.replace('/','-'))
+                    fixture.require(cli('--export-staged',url,selected['id'],selected['selector'],output),'exporting exact retained unpin bytes')
+                    assert hashlib.sha256(output.read_bytes()).digest()==hashlib.sha256(body).digest()
+            guard_exports('pin-retained')
+            # Already-removed pins are idempotent; captured blocks are shared
+            # across every historical interpretation, not captured repeatedly.
+            fixture.require(cli('--unpin-space',url,space,'/guard-live'),'unpinning independently protected live original')
+            fixture.require(cli('--unpin-space',url,space,'/guard-detached'),'unpinning independently protected detached original')
+            assert offline_mount_mutations==before,'offline unpin fetched or mutated remotely'
+            guard_restart();assert read_file(mountpoint/'guard-live')==expected;guard_exports('unpinned-cold')
+            keyring=fixture.keyring_start()
+            fixture.require(fixture.run(['secret-tool','store','--label=cirrus-unpin-lab','application','cirrus-drive','instance',url],input=json.dumps(account_copy)),'restoring disposable unpin principal')
+            server=ThreadingHTTPServer(('127.0.0.1',port),Handler);server.socket=context.wrap_socket(server.socket,server_side=True)
+            thread=threading.Thread(target=server.serve_forever);thread.start()
+            for _ in range(6):
+                synced=cli('--sync-space',url,space)
+                if synced.returncode==0:break
+                with sqlite3.connect(database) as db:
+                    if 'successful uploads await safe read-back retry' in synced.stderr:
+                        assert db.execute('SELECT 1 FROM upload_verifications LIMIT 1').fetchone(),'retry lacked a successful upload continuation'
+                    else:
+                        assert 'namespace conflict or uncertain outcome' in synced.stderr and db.execute("SELECT 1 FROM mutation_receipts WHERE kind='namespace'").fetchone(),synced
+            fixture.require(synced,'confirming guarded unpin exact uploads')
+            assert lab.upstream(container,'GET',base+'/guard-live')[2]==expected
+            assert lab.upstream(container,'GET',base+'/guard-full')[2]==full
+            assert lab.upstream(container,'GET',base+'/guard-hole')[2]==hole
+            assert lab.upstream(container,'GET',base+'/guard-detached')[0]==404
+            assert lab.upstream(container,'GET',base+'/guard-relocated/item')[2]==b'ALS'+original[3:]
+            assert offline_mount_mutations.count(('MOVE',unquote(base)+'/guard-origin'))==1
+            assert offline_mount_mutations.count(('DELETE',unquote(base)+'/guard-detached'))==1
+            assert offline_mount_mutations.count(('PUT',unquote(base)+'/guard-live'))==1
+            fixture.require(cli('--unpin',url,'/guard-unrelated'),'checking selected-Space unpin shares the guarded path without self-deadlock')
+            stable=list(offline_mount_mutations);fixture.require(cli('--sync-space',url,space),'confirming guarded unpin non-replay');assert offline_mount_mutations==stable
+            fixture.require(cli('--unmount-space',url,space),'unmounting guarded edit');mounted=False
+            fixture.require(cli('--unmount-space',url,project),'unmounting guarded peer');second_mounted=False
+            fixture.require(cli('--stop'),'stopping unpin qualification');daemon.wait(timeout=10)
+            print('PASS: credential/network-free unpin automatically captures live/resolved-detached original gaps; low headroom/real SQLite COMMIT rollback/unknown result retain pin and roots, charged orphan retained; unrelated/hole-free unpin, real peer staging fence/no cycle; no pre-protection reads, cache-free cold exact SHA/read/export, never-pinned EIO, same-principal upload once/non-replay, independent Space',flush=True)
             return
         if os.environ.get("CIRRUS_TEST_OFFLINE_LOCAL_DIRECTORY_REPLACE"):
             database=runtime/"home/.local/state/cirrus-drive/state.db"
@@ -2586,9 +3705,16 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_RENAME") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_REPLACE") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_CHAIN") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_CONSUMERS") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_OUTGOING") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_INCOMING"):
             replace_remote=bool(os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_REPLACE"))
             split_pin=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="source-split"
-            inverse_pin=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="destination-split"
-            focused_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("1","source-split","destination-split")
-            loss_source="loss-parent/tree-uncertain" if split_pin else "tree-uncertain"
+            overlap_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("source-overlap","source-overlap-baseline")
+            general_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="ownership-plan"
+            union_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="fragment-union"
+            local_union=(union_pins or os.environ.get('CIRRUS_TEST_PIN_DISPLACEMENT')=='nested-source') and bool(os.environ.get('CIRRUS_TEST_PIN_LOCAL_CREATES'))
+            nested_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("nested-source","nested-source-baseline") or general_pins or union_pins
+            extra_source_pin=overlap_pins or nested_pins
+            paired_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="paired-ancestors" or overlap_pins or nested_pins
+            inverse_pin=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT")=="destination-split" or paired_pins
+            focused_pins=os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("1","source-split") or inverse_pin
+            loss_source="loss-source/tree-uncertain" if paired_pins else ("loss-parent/tree-uncertain" if split_pin else "tree-uncertain")
             outgoing=bool(os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_OUTGOING"))
             incoming=bool(os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_INCOMING"))
             consumers=bool(os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY_CONSUMERS")) or outgoing or incoming
@@ -2614,6 +3740,8 @@ def child(root, runtime, container):
             if chain_remote:os.environ["CIRRUS_TEST_TREE_PREFLIGHT_WINDOW"]=str(preflight_window)
             directories=("/dir-source","/dir-source/nested","/dir-dest","/dir-empty","/remote-target-empty","/nonempty-target","/unknown-source","/unknown-parent","/stale-parent","/conflict-source","/conflict-source/nested","/changed-source","/changed-source/nested","/dest-conflict-source")
             if inverse_pin:directories+=("/inverse-conflict","/inverse-conflict/target","/inverse-source-change","/inverse-source-change/target")
+            if nested_pins:directories+=("/dir-source/nested/deep","/conflict-source/nested/deep","/changed-source/nested/deep")
+            if general_pins or union_pins:directories+=("/dir-source/nested/deep/inner","/conflict-source/nested/deep/inner","/changed-source/nested/deep/inner")
             for path in directories:assert lab.upstream(container,"MKCOL",base+path)[0]==201,path
             if mixed_graph:
                 assert lab.upstream(container,"MKCOL",base+"/mixed-outside")[0]==201
@@ -2642,6 +3770,15 @@ def child(root, runtime, container):
             if replace_remote:remote["pin-displace-source/file"]=b"separate pinned replacement source"
             if inverse_pin:
                 remote.update({"dir-dest/sibling":b"destination ancestor original sibling","inverse-conflict/sibling":b"target conflict sibling","inverse-source-change/sibling":b"source conflict sibling"})
+                if paired_pins:remote.update({"conflict-source/sibling":b"source ancestor conflict sibling","changed-source/sibling":b"source ancestor changed sibling"})
+                if nested_pins:
+                    for path in ("dir-source/nested/dirty","dir-source/nested/pinned","conflict-source/nested/file","changed-source/nested/file"):
+                        parent,name=path.rsplit('/',1);remote[parent+"/deep/"+name]=remote.pop(path)
+                    remote["dir-source/nested/kept"]=b"moving source sibling outside nested pin"
+                    if union_pins:
+                        for parent in ('dir-source','conflict-source','changed-source'):
+                            remote[parent+'/nested/deep/zero']=b''
+                        for parent in ('conflict-source','changed-source'):remote[parent+'/nested/kept']=b'separate source fragment'
             if incoming:
                 assert lab.upstream(container,"MKCOL",base+"/incoming-outside")[0]==201
                 remote[dirty_origin]=original
@@ -2665,6 +3802,7 @@ def child(root, runtime, container):
             fixture.require(cli("--sync-space",url,space),"confirming an unpinned local root before tree rename")
             fixture.require(cli("--ls",url,"/dir-source"),"saving current source after prior confirmed child")
             fixture.require(cli("--unmount-space",url,space),"quiescing tree view for remaining pin observations");mounted=False
+            if replace_remote:fixture.require(cli("--pin-space",url,space,"/dir-source"),"refreshing full source capture after confirmed child for replacement proof agreement")
             for path in ("/dir-dest","/dir-empty","/remote-target-empty","/nonempty-target","/stale-parent"):
                 fixture.require(cli("--ls",url,path),"saving complete tree parent/empty proof "+path)
             if replace_remote:
@@ -2674,7 +3812,7 @@ def child(root, runtime, container):
             assert lab.upstream(container,"PUT",base+"/stale-parent/new-child",b"newer parent version")[0]==201
             fixture.require(cli("--ls",url),"saving newer parent without refreshing its child listing")
             with sqlite3.connect(database) as db:
-                assert db.execute("PRAGMA user_version").fetchone()==(17,)
+                assert db.execute("PRAGMA user_version").fetchone()==(19,)
                 target_row=db.execute("SELECT self_id,self_etag,updated,entries,issuer,subject FROM snapshots WHERE space=? AND path='[\"dir-dest\",\"local-target\"]'",(space,)).fetchone() if replace_remote else None
                 original_rows=db.execute("SELECT path,entries,updated,self_id,self_etag,issuer,subject FROM snapshots WHERE space=? AND path IN ('[\"dir-source\"]','[\"dir-source\",\"nested\"]') ORDER BY path",(space,)).fetchall()
                 assert len(original_rows)==2
@@ -2684,8 +3822,17 @@ def child(root, runtime, container):
                 assert lab.upstream(container,"MKCOL",project_base+"/loss-parent")[0]==201
                 assert lab.upstream(container,"PUT",project_base+"/loss-parent/sibling",b"other Space ancestor sibling")[0]==201
                 if inverse_pin:assert lab.upstream(container,"MKCOL",project_base+"/loss-parent/target")[0]==201
+            if paired_pins:
+                assert lab.upstream(container,"MKCOL",project_base+"/loss-source")[0]==201
+                assert lab.upstream(container,"PUT",project_base+"/loss-source/sibling",b"independent source ancestor sibling")[0]==201
             assert lab.upstream(container,"MKCOL",project_base+"/"+loss_source)[0]==201
-            assert lab.upstream(container,"PUT",project_base+"/"+loss_source+"/kept",b"uncertain MOVE retains bytes")[0]==201
+            if nested_pins:assert lab.upstream(container,"MKCOL",project_base+"/"+loss_source+"/deep")[0]==201
+            if general_pins or union_pins:assert lab.upstream(container,"MKCOL",project_base+"/"+loss_source+"/deep/inner")[0]==201
+            loss_file=loss_source+("/deep/kept" if nested_pins else "/kept")
+            assert lab.upstream(container,"PUT",project_base+"/"+loss_file,b"uncertain MOVE retains bytes")[0]==201
+            if union_pins:
+                assert lab.upstream(container,'PUT',project_base+'/'+loss_source+'/kept',b'separate source fragment')[0]==201
+                assert lab.upstream(container,'PUT',project_base+'/'+loss_source+'/deep/zero',b'')[0]==201
             assert lab.upstream(container,"PUT",project_base+"/independent",b"other Space remains intact")[0]==201
             if incoming:assert lab.upstream(container,"PUT",project_base+"/incoming-loss",b"uncertain incoming original")[0]==201
             if replace_remote:
@@ -2695,7 +3842,7 @@ def child(root, runtime, container):
             reservation_mount.mkdir(mode=0o700)
             fixture.require(cli("--mount-space",url,project,reservation_mount),"mounting second tree Space");second_mounted=True
             fixture.require(cli("--unmount-space",url,project),"quiescing peer tree view before pin setup");second_mounted=False
-            for path in (("/loss-parent" if split_pin else "/tree-uncertain"),"/independent"):fixture.require(cli("--pin-space",url,project,path),"pinning second Space")
+            for path in (("/loss-source" if paired_pins else ("/loss-parent" if split_pin else "/tree-uncertain")),"/independent"):fixture.require(cli("--pin-space",url,project,path),"pinning second Space")
             if incoming:fixture.require(cli("--pin-space",url,project,"/incoming-loss"),"pinning incoming lost-MOVE original")
             if replace_remote:
                 fixture.require(cli("--select-space",url,project),"selecting second replacement Space")
@@ -2709,6 +3856,30 @@ def child(root, runtime, container):
                         fixture.require(cli("--pin-space",url,space,path),"pinning complete inverse source/ancestor "+path)
                     fixture.require(cli("--pin-space",url,space,"/dir-dest/local-target"),"pinning real inverse overlapping target refusal control")
                     fixture.require(cli("--pin-space",url,project,"/loss-parent"),"pinning uncertain inverse destination ancestor")
+                    if overlap_pins:
+                        for path in ("/dir-source/nested","/conflict-source/nested","/changed-source/nested"):
+                            fixture.require(cli("--pin-space",url,space,path),"pinning independent exact source capture "+path)
+                        fixture.require(cli("--pin-space",url,project,"/"+loss_source),"pinning independent uncertain exact source capture")
+                    if nested_pins:
+                        for path in ("/dir-source/nested/deep","/conflict-source/nested/deep","/changed-source/nested/deep"):
+                            fixture.require(cli("--pin-space",url,space,path),"pinning independent strictly nested source "+path)
+                        fixture.require(cli("--pin-space",url,project,"/"+loss_source+"/deep"),"pinning independent uncertain strictly nested source")
+                    if general_pins:
+                        for parent in ("/dir-source/nested","/conflict-source/nested","/changed-source/nested"):
+                            for path in (parent,parent+"/deep/inner",parent+("/deep/pinned" if parent=='/dir-source/nested' else "/deep/file")):
+                                fixture.require(cli("--pin-space",url,space,path),"pinning independent overlapping source owner "+path)
+                        for path in ("/"+loss_source,"/"+loss_source+"/deep/inner","/"+loss_source+"/deep/kept","/loss-parent/target"):
+                            fixture.require(cli("--pin-space",url,project,path),"pinning independent uncertain owner "+path)
+                        for path in ("/inverse-conflict/target","/inverse-source-change/target"):
+                            fixture.require(cli("--pin-space",url,space,path),"pinning independent displaced exact target "+path)
+                        for which in (space,project):fixture.require(cli("--pin-space",url,which,"/"),"pinning common source/destination ancestor with immutable sibling captures")
+                    if union_pins:
+                        for parent in ('/dir-source','/conflict-source','/changed-source'):
+                            fixture.require(cli('--pin-space',url,space,parent+'/nested/kept'),'pinning independent sibling file fragment')
+                            fixture.require(cli('--unpin-space',url,space,parent),'removing disposable setup containing pin; fragments must cover source alone')
+                        fixture.require(cli('--pin-space',url,project,'/'+loss_source+'/kept'),'pinning independent lost-MOVE sibling fragment')
+                        fixture.require(cli('--unpin-space',url,project,'/loss-source'),'removing disposable independent setup containing pin')
+                        fixture.require(cli('--pin-space',url,space,'/dir-source/nested/deep/dirty'),'pinning agreeing duplicate only for hashless disagreement control')
                 elif not split_pin:fixture.require(cli("--pin-space",url,space,"/"),"pinning common ancestor capture before displacement")
                 else:
                     fixture.require(cli("--pin-space",url,space,"/dir-source"),"pinning complete source ancestor including confirmed sibling")
@@ -2774,7 +3945,12 @@ def child(root, runtime, container):
                     conflict_file="conflict-moved/file" if split_pin else "conflict-moved/nested/file"
                     def capture_state():
                         with sqlite3.connect(database) as db:return {table:db.execute("SELECT * FROM "+table+" ORDER BY rowid").fetchall() for table in ("pins","files","chunks","pin_copies","pin_copy_files","pin_copy_chunks","sqlite_sequence","operation_journal","operation_parents","directory_moves","tree_targets","tree_proofs","dirty_roots","snapshots")}
-                    def copies():return [json.loads(line) for line in fixture.require(cli("--pin-copies",url),"listing independent pin copy IDs").stdout.splitlines()]
+                    def copies():
+                        result=[]
+                        while True:
+                            page=[json.loads(line) for line in fixture.require(cli("--pin-copies",url,len(result)),"listing every independent pin copy ID").stdout.splitlines()]
+                            if not page:return result
+                            result.extend(page)
                     def copy_entries(copy):
                         entries=[]
                         while True:
@@ -2791,134 +3967,535 @@ def child(root, runtime, container):
                         unmount_both();fixture.require(cli("--stop"),"stopping retained pin copy views");daemon.wait(timeout=10)
                         daemon=start();mount_both()
                     if inverse_pin:
-                        incoming="dir-source";target="dir-dest/local-target"
+                        incoming="dir-source/nested" if paired_pins else "dir-source"
+                        target="dir-dest/local-target"
+                        incoming_key=json.dumps(incoming.split('/'),separators=(',',':'))
+                        dirty_source="dir-source/nested/"+("deep/dirty" if nested_pins else "dirty")
+                        dirty_source_key=json.dumps(dirty_source.split('/'),separators=(',',':'))
+                        pinned_source=dirty_source.rsplit('/',1)[0]+"/pinned"
+                        extra_root=incoming+"/deep" if nested_pins else incoming
+                        extra_key=json.dumps(extra_root.split('/'),separators=(',',':'))
+                        file_fragment_key=json.dumps((incoming+'/kept').split('/'),separators=(',',':'))
+                        moved_dirty=target+("/deep/dirty" if nested_pins else ("/dirty" if paired_pins else "/nested/dirty"))
+                        moved_pinned=target+("/deep/pinned" if nested_pins else ("/pinned" if paired_pins else "/nested/pinned"))
+                        expected=b"PAIR!"+original[5:] if paired_pins and not local_union else original
+                        conflict_incoming="conflict-source/nested" if paired_pins else "conflict-source"
+                        changed_incoming="changed-source/nested" if paired_pins else "changed-source"
+                        conflict_file="inverse-conflict/target/"+("deep/file" if nested_pins else ("file" if paired_pins else "nested/file"))
+                        changed_file="inverse-source-change/target/"+("deep/file" if nested_pins else ("file" if paired_pins else "nested/file"))
+                        def affected_owners(state,which,origin,dest):
+                            a=origin.split('/');b=dest.split('/')
+                            return [row for row in state['pins'] if row[1]==which and any(json.loads(row[2])[:len(p)]==p or p[:len(json.loads(row[2]))]==json.loads(row[2]) for p in (a,b))]
+                        # Agreeing target overlap is now supported. A captured
+                        # target with a different ID must still fail atomically.
+                        with sqlite3.connect(database) as db:
+                            target_dirs=db.execute("SELECT directories FROM pins WHERE space=? AND root=?",(space,json.dumps(target.split('/'),separators=(',',':')))).fetchone()[0]
+                            dirs=json.loads(target_dirs);dirs[0][1]='different-target-identity'
+                            db.execute("UPDATE pins SET directories=? WHERE space=? AND root=?",(json.dumps(dirs,separators=(',',':')),space,json.dumps(target.split('/'),separators=(',',':'))))
                         saved=capture_state()
                         refuses(incoming,target,errno.EBUSY)
-                        assert capture_state()==saved,"overlapping inverse target pin partially published"
-                        fixture.require(cli("--unpin-space",url,space,"/"+target),"removing only independently pinned inverse target control")
+                        assert capture_state()==saved,"disagreeing inverse target pin partially published"
+                        with sqlite3.connect(database) as db:db.execute("UPDATE pins SET directories=? WHERE space=? AND root=?",(target_dirs,space,json.dumps(target.split('/'),separators=(',',':'))))
+                        if not general_pins:fixture.require(cli("--unpin-space",url,space,"/"+target),"removing only independently pinned inverse target control")
+                        if union_pins:
+                            empty_observation=capture_state();refuses('dir-empty',target,errno.EBUSY)
+                            assert capture_state()==empty_observation,'observation-only empty source was promoted to pinned coverage without any source fragment'
+                        if os.environ.get("CIRRUS_TEST_PIN_DISPLACEMENT") in ("source-overlap-baseline","nested-source-baseline"):
+                            with open(mountpoint/dirty_source,"r+b",buffering=0) as held:
+                                held.write(b"PAIR!");os.fsync(held.fileno())
+                                source_fd=os.open(mountpoint/incoming,os.O_RDONLY|os.O_DIRECTORY)
+                                target_fd=os.open(mountpoint/target,os.O_RDONLY|os.O_DIRECTORY)
+                                try:
+                                    inodes=(os.fstat(source_fd).st_ino,os.fstat(target_fd).st_ino)
+                                    saved=capture_state();refuses(incoming,target,errno.EBUSY)
+                                    assert capture_state()==saved and not copies(),"overlap refusal changed active/capture/journal/dirty state"
+                                    assert (os.fstat(source_fd).st_ino,os.fstat(target_fd).st_ino)==inodes and os.fstat(target_fd).st_nlink>0
+                                    assert os.pread(held.fileno(),5,0)==b"PAIR!" and read_file(mountpoint/dirty_source)==expected
+                                finally:os.close(source_fd);os.close(target_fd)
+                            unmount_both();fixture.require(cli("--stop"),"stopping exact source overlap baseline");daemon.wait(timeout=10)
+                            print("PASS BASELINE: real cold dirty source with ancestor+"+("strictly nested" if nested_pins else "exact-root")+" pins and disjoint destination ancestor refuses EBUSY; all active/captured/version/chunk/journal/proof/dirty/sequence rows and held identities unchanged, no remote mutation",flush=True)
+                            assert offline_mount_mutations==before
+                            return
+                        if local_union and os.environ.get('CIRRUS_TEST_PIN_LOCAL_CREATES')=='baseline':
+                            os.mkdir(mountpoint/(incoming+'/new-local'))
+                            os.mkdir(mountpoint/(incoming+'/new-local/inner'))
+                            local_bytes=b'new offline bytes\x00remain separate from remote captures'*37
+                            with open(mountpoint/(incoming+'/new-local/inner/file'),'x+b',buffering=0) as held_local:
+                                held_local.write(local_bytes);os.fsync(held_local.fileno())
+                                baseline=capture_state();refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==baseline and not copies()
+                                if not union_pins:assert any(owner[1]==space and incoming.split('/')[:len(json.loads(owner[2]))]==json.loads(owner[2]) for owner in baseline['pins']),'containing baseline had no containing pin'
+                                assert os.pread(held_local.fileno(),len(local_bytes),0)==local_bytes
+                            cold_copies()
+                            assert read_file(mountpoint/(incoming+'/new-local/inner/file'))==local_bytes
+                            assert offline_mount_mutations==before
+                            unmount_both();fixture.require(cli('--stop'),'stopping local-create union baseline');daemon.wait(timeout=10)
+                            print('PASS BASELINE: '+('fragmented' if union_pins else 'containing-source')+' verified coverage plus genuinely new offline nested mkdir/file refuses EBUSY; journal/parents/roots/captures unchanged, held bytes and cold recovery preserved; no network',flush=True)
+                            return
                         with open(mountpoint/(incoming+"/uncovered-local"),"xb",buffering=0) as writer:
                             writer.write(b"not in source pin");os.fsync(writer.fileno())
+                        # A genuine create is supported now, but not a
+                        # replacement over retained local delete history.
+                        os.unlink(mountpoint/(incoming+'/uncovered-local'))
+                        with open(mountpoint/(incoming+'/uncovered-local'),'xb',buffering=0) as writer:
+                            writer.write(b'local replacement is not a pristine create');os.fsync(writer.fileno())
                         uncovered=capture_state();refuses(incoming,target,errno.EBUSY)
-                        assert capture_state()==uncovered,"uncovered incoming local child partially published inverse pin"
+                        assert capture_state()==uncovered,"unsupported local history partially published inverse pin"
                         os.unlink(mountpoint/(incoming+"/uncovered-local"))
+                        local_bytes=b'new offline bytes\x00remain separate from remote captures'*37
+                        def create_local(view,source):
+                            os.mkdir(view/(source+'/new-local'))
+                            os.mkdir(view/(source+'/new-local/inner'))
+                            for suffix in ('/new-local/inner/file','/deep/new-leaf'):
+                                with open(view/(source+suffix),'xb',buffering=0) as writer:
+                                    writer.write(local_bytes);os.fsync(writer.fileno())
+                        if local_union:create_local(mountpoint,incoming)
+                        held_new_fd=os.open(mountpoint/(incoming+'/new-local/inner/file'),os.O_RDWR) if local_union else None
+                        if local_union and not union_pins:
+                            with sqlite3.connect(database) as db:
+                                missing_path=json.dumps((incoming+'/kept').split('/'),separators=(',',':'))
+                                missing_file=db.execute('SELECT rowid,* FROM files WHERE space=? AND root=\'["dir-source"]\' AND path=?',(space,missing_path)).fetchone()
+                                missing_chunks=db.execute('SELECT rowid,* FROM chunks WHERE space=? AND root=\'["dir-source"]\' AND path=?',(space,missing_path)).fetchall()
+                                missing_manifest=db.execute('SELECT manifest FROM pins WHERE space=? AND root=\'["dir-source"]\'',(space,)).fetchone()[0]
+                                db.execute('DELETE FROM files WHERE rowid=?',(missing_file[0],))
+                                db.execute('DELETE FROM chunks WHERE space=? AND root=\'["dir-source"]\' AND path=?',(space,missing_path))
+                                db.execute('UPDATE pins SET manifest=? WHERE space=? AND root=\'["dir-source"]\'',(json.dumps([v for v in json.loads(missing_manifest) if v['path']!=json.loads(missing_path)],separators=(',',':')),space))
+                            gap=capture_state();refuses(incoming,target,errno.EBUSY)
+                            assert capture_state()==gap,'uncaptured original remote leaf was hidden by pristine local additions'
+                            with sqlite3.connect(database) as db:
+                                db.execute('INSERT INTO files(rowid,instance,space,root,path,version,verified_complete) VALUES(?,?,?,?,?,?,?)',missing_file)
+                                db.executemany('INSERT INTO chunks(rowid,instance,space,root,path,offset,body,digest) VALUES(?,?,?,?,?,?,?,?)',missing_chunks)
+                                db.execute('UPDATE pins SET manifest=? WHERE space=? AND root=\'["dir-source"]\'',(missing_manifest,space))
                         with open(mountpoint/(target+"/pending-child"),"xb",buffering=0) as writer:
                             writer.write(b"target is not empty");os.fsync(writer.fileno())
                         nonempty=capture_state();refuses(incoming,target,errno.ENOTEMPTY)
                         assert capture_state()==nonempty,"nonempty inverse target partially published"
                         os.unlink(mountpoint/(target+"/pending-child"))
                         with sqlite3.connect(database) as db:
-                            missing=db.execute("SELECT rowid,* FROM chunks WHERE space=? AND root='[\"dir-source\"]' ORDER BY rowid LIMIT 1",(space,)).fetchone()
+                            missing=db.execute("SELECT rowid,* FROM chunks WHERE space=? AND root=? AND path=? ORDER BY rowid LIMIT 1",(space,extra_key if union_pins else '["dir-source"]',dirty_source_key)).fetchone()
                             assert missing is not None
                             db.execute("DELETE FROM chunks WHERE rowid=?",(missing[0],))
                         corrupt=capture_state()
                         refuses(incoming,target,errno.EIO)
                         assert capture_state()==corrupt,"missing incoming chunk partially published inverse merge"
                         with sqlite3.connect(database) as db:db.execute("INSERT INTO chunks(rowid,instance,space,root,path,offset,body,digest) VALUES(?,?,?,?,?,?,?,?)",missing)
+                        if extra_source_pin:
+                            with sqlite3.connect(database) as db:
+                                manifest=db.execute("SELECT manifest FROM pins WHERE space=? AND root=?",(space,extra_key)).fetchone()[0]
+                                encoded=db.execute("SELECT version FROM files WHERE space=? AND root=? AND path=?",(space,extra_key,dirty_source_key)).fetchone()[0]
+                                if general_pins or union_pins:assert not json.loads(encoded)['checksums'],'hashless DAV control did not reach real pin observations'
+                                versions=json.loads(manifest);version=json.loads(encoded);version['etag']='"overlap-different-version"'
+                                for entry in versions:
+                                    if entry['path']==version['path']:entry['etag']=version['etag']
+                                db.execute("UPDATE pins SET manifest=? WHERE space=? AND root=?",(json.dumps(versions,separators=(',',':')),space,extra_key))
+                                db.execute("UPDATE files SET version=? WHERE space=? AND root=? AND path=?",(json.dumps(version,separators=(',',':')),space,extra_key,dirty_source_key))
+                            disagreement=capture_state();refuses(incoming,target,errno.EBUSY)
+                            assert capture_state()==disagreement,"disagreeing overlap version was selected or partially published"
+                            with sqlite3.connect(database) as db:
+                                db.execute("UPDATE pins SET manifest=? WHERE space=? AND root=?",(manifest,space,extra_key))
+                                db.execute("UPDATE files SET version=? WHERE space=? AND root=? AND path=?",(encoded,space,extra_key,dirty_source_key))
+                                chunk=db.execute("SELECT rowid,body,digest FROM chunks WHERE space=? AND root=? AND path=? ORDER BY offset LIMIT 1",(space,extra_key,dirty_source_key)).fetchone()
+                                altered=bytes([chunk[1][0]^1])+chunk[1][1:]
+                                db.execute("UPDATE chunks SET body=?,digest=? WHERE rowid=?",(altered,hashlib.sha256(altered).hexdigest(),chunk[0]))
+                            checksums=[part for value in json.loads(encoded)['checksums'] for part in value.split()]
+                            supported=any(part.partition(':')[0].upper().replace('-','') in ('SHA256','SHA1','MD5') for part in checksums)
+                            disagreement=capture_state();refuses(incoming,target,errno.EIO if supported else errno.EBUSY)
+                            assert capture_state()==disagreement,"self-consistent but different overlap chunks were selected or partially published"
+                            print("OVERLAP DISAGREEMENT: metadata mismatch EBUSY; rehashed differing chunk refused by "+("advertised whole-file hash (EIO)" if supported else "cross-owner verified digest comparison (EBUSY)"),flush=True)
+                            with sqlite3.connect(database) as db:db.execute("UPDATE chunks SET body=?,digest=? WHERE rowid=?",(chunk[1],chunk[2],chunk[0]))
+                            if general_pins or union_pins:
+                                with sqlite3.connect(database) as db:
+                                    offset=db.execute('SELECT offset FROM chunks WHERE rowid=?',(chunk[0],)).fetchone()[0]
+                                    db.execute('UPDATE chunks SET offset=? WHERE rowid=?',(offset+1,chunk[0]))
+                                misaligned=capture_state();refuses(incoming,target,errno.EIO)
+                                assert capture_state()==misaligned,'noncanonical chunk boundary partially published'
+                                with sqlite3.connect(database) as db:
+                                    db.execute('UPDATE chunks SET offset=? WHERE rowid=?',(offset,chunk[0]))
+                                    dirs=db.execute('SELECT directories FROM pins WHERE space=? AND root=?',(space,extra_key)).fetchone()[0]
+                                    duplicate=json.loads(dirs);duplicate.append(duplicate[0])
+                                    db.execute('UPDATE pins SET directories=? WHERE space=? AND root=?',(json.dumps(duplicate,separators=(',',':')),space,extra_key))
+                                duplicated=capture_state();refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==duplicated,'duplicate captured directory membership partially published'
+                                with sqlite3.connect(database) as db:db.execute('UPDATE pins SET directories=? WHERE space=? AND root=?',(dirs,space,extra_key))
+                            if union_pins:
+                                with sqlite3.connect(database) as db:
+                                    absent=db.execute('SELECT rowid,* FROM pins WHERE space=? AND root=?',(space,file_fragment_key)).fetchone()
+                                    db.execute('DELETE FROM pins WHERE rowid=?',(absent[0],))
+                                gap=capture_state();refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==gap,'missing fragment was synthesized from names, raw cache or dirty bytes'
+                                with sqlite3.connect(database) as db:
+                                    db.execute('INSERT INTO pins(rowid,instance,space,root,is_dir,directories,manifest) VALUES(?,?,?,?,?,?,?)',absent)
+                                    proof_path=json.dumps((incoming+'/deep/inner').split('/'),separators=(',',':'))
+                                    captured_dirs=db.execute('SELECT directories FROM pins WHERE space=? AND root=?',(space,extra_key)).fetchone()[0]
+                                    db.execute('UPDATE pins SET directories=? WHERE space=? AND root=?',(json.dumps([entry for entry in json.loads(captured_dirs) if entry[0]!=json.loads(proof_path)],separators=(',',':')),space,extra_key))
+                                gap=capture_state();refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==gap,'uncaptured empty directory was inferred from complete listing alone'
+                                with sqlite3.connect(database) as db:
+                                    db.execute('UPDATE pins SET directories=? WHERE space=? AND root=?',(captured_dirs,space,extra_key))
+                                    observation=db.execute('SELECT rowid,* FROM snapshots WHERE space=? AND path=?',(space,proof_path)).fetchone()
+                                    db.execute('DELETE FROM snapshots WHERE rowid=?',(observation[0],))
+                                gap=capture_state();refuses(incoming,target,errno.EIO)
+                                assert capture_state()==gap,'missing complete empty-directory proof was inferred from pin metadata'
+                                with sqlite3.connect(database) as db:
+                                    db.execute('INSERT INTO snapshots(rowid,instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?)',observation)
+                                    zero_path=json.dumps((incoming+'/deep/zero').split('/'),separators=(',',':'))
+                                    zero=db.execute('SELECT rowid,* FROM files WHERE space=? AND root=? AND path=?',(space,extra_key,zero_path)).fetchone()
+                                    manifest=db.execute('SELECT manifest FROM pins WHERE space=? AND root=?',(space,extra_key)).fetchone()[0]
+                                    db.execute('DELETE FROM files WHERE rowid=?',(zero[0],))
+                                    db.execute('UPDATE pins SET manifest=? WHERE space=? AND root=?',(json.dumps([file for file in json.loads(manifest) if file['path']!=json.loads(zero_path)],separators=(',',':')),space,extra_key))
+                                gap=capture_state();refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==gap,'uncovered zero-sized leaf was ignored'
+                                with sqlite3.connect(database) as db:
+                                    db.execute('INSERT INTO files(rowid,instance,space,root,path,version,verified_complete) VALUES(?,?,?,?,?,?,?)',zero)
+                                    db.execute('UPDATE pins SET manifest=? WHERE space=? AND root=?',(manifest,space,extra_key))
+                                fixture.require(cli('--unpin-space',url,space,'/'+dirty_source),'removing only disposable duplicate control; two source fragments remain')
+                        if paired_pins and not local_union:
+                            with open(mountpoint/dirty_source,"r+b",buffering=0) as writer:
+                                writer.write(b"PAIR!");os.fsync(writer.fileno())
                         saved=capture_state()
                         usage=json.loads(fixture.require(cli("--storage-status"),"sizing inverse capture allowance").stdout)
+                        rollback_inodes=(os.stat(mountpoint/incoming).st_ino,os.stat(mountpoint/target).st_ino)
                         fixture.require(cli("--set-storage-limits",usage["immutable_admission_charge_bytes"],0),"denying inverse whole ancestor capture")
                         refuses(incoming,target,errno.ENOSPC)
                         assert capture_state()==saved,"pressure partially published inverse capture/pins/journal"
                         fixture.require(cli("--set-storage-limits",usage["immutable_admission_charge_bytes"]+512*1024*1024,0),"restoring inverse admission allowance")
+                        if local_union:assert os.pread(held_new_fd,len(local_bytes),0)==local_bytes and os.fstat(held_new_fd).st_ino==os.stat(mountpoint/(incoming+'/new-local/inner/file')).st_ino
+                        assert (os.stat(mountpoint/incoming).st_ino,os.stat(mountpoint/target).st_ino)==rollback_inodes
                         (root/"pin-copy-commit-abort").touch(mode=0o600)
                         try:
                             refuses(incoming,target,errno.EIO)
                             assert capture_state()==saved,"COMMIT rejection partially published inverse capture/pins/journal"
+                            if local_union:assert os.pread(held_new_fd,len(local_bytes),0)==local_bytes and os.fstat(held_new_fd).st_ino==os.stat(mountpoint/(incoming+'/new-local/inner/file')).st_ino
+                            assert (os.stat(mountpoint/incoming).st_ino,os.stat(mountpoint/target).st_ino)==rollback_inodes
                         finally:(root/"pin-copy-commit-abort").unlink(missing_ok=True)
+                        if paired_pins:
+                            # A separate OS process owns the actual State flock,
+                            # not an in-process mock of reservation admission.
+                            import select
+                            lock=database.parent/"state-storage.lock"
+                            peer=subprocess.Popen([sys.executable,"-u","-c","import fcntl,sys; f=open(sys.argv[1],'rb'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); print('held',flush=True); sys.stdin.buffer.read(1)",str(lock)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                            try:
+                                assert select.select([peer.stdout],[],[],5)[0] and peer.stdout.readline()==b"held\n"
+                                ticks=Path(f"/proc/{peer.pid}/stat").read_text().rsplit(')',1)[1].split()[19]
+                                print(f"OWNED paired pin State peer: root={root} runtime={runtime} container={container} pid={peer.pid} start_ticks={ticks}",flush=True)
+                                owners=[line for line in Path('/proc/locks').read_text().splitlines() if line.split()[5].endswith(':'+str(lock.stat().st_ino))]
+                                assert any(line.split()[4]==str(peer.pid) for line in owners),owners
+                                refuses(incoming,target,errno.EBUSY)
+                                assert capture_state()==saved,"peer State contention partially published paired capture/merge"
+                            finally:
+                                peer.stdin.close()
+                                try:peer.wait(timeout=5)
+                                except subprocess.TimeoutExpired:peer.kill();peer.wait(timeout=5);raise
+                                peer.stdout.close();peer.stderr.close()
+                            assert peer.returncode==0
+                            # Filling untouched dirty-base ranges itself needs
+                            # State admission; verify full bytes after release.
+                            assert read_file(mountpoint/dirty_source)==expected
                         source_fd=os.open(mountpoint/incoming,os.O_RDONLY|os.O_DIRECTORY)
                         target_fd=os.open(mountpoint/target,os.O_RDONLY|os.O_DIRECTORY)
-                        with os.scandir(mountpoint/"dir-dest") as parent_entries, os.scandir(mountpoint/incoming) as source_entries, open(mountpoint/"dir-source/nested/dirty","rb",buffering=0) as held:
+                        with os.scandir(mountpoint/"dir-dest") as parent_entries, os.scandir(mountpoint/incoming) as source_entries, open(mountpoint/dirty_source,"rb",buffering=0) as held:
                             parent_first=next(parent_entries).name;source_first=next(source_entries).name
                             source_inode=os.fstat(source_fd).st_ino;target_inode=os.fstat(target_fd).st_ino
                             try:
                                 os.rename(mountpoint/incoming,mountpoint/target)
                                 assert os.stat(mountpoint/target).st_ino==source_inode and os.fstat(source_fd).st_ino==source_inode
                                 assert os.fstat(target_fd).st_ino==target_inode and os.fstat(target_fd).st_nlink==0
-                                assert os.pread(held.fileno(),16,0)==original[:16]
+                                assert os.pread(held.fileno(),16,0)==expected[:16]
+                                if local_union:
+                                    assert os.pread(held_new_fd,len(local_bytes),0)==local_bytes
+                                    assert os.fstat(held_new_fd).st_ino==os.stat(mountpoint/(target+'/new-local/inner/file')).st_ino
+                                    assert read_file(mountpoint/(target+'/new-local/inner/file'))==local_bytes
                                 assert {parent_first,*[entry.name for entry in parent_entries]}=={"local-target","sibling"}
-                                assert {source_first,*[entry.name for entry in source_entries]}=={"nested","synced",*[f"entry-{index:02}" for index in range(40)]}
-                            finally:os.close(source_fd);os.close(target_fd)
+                                assert {source_first,*[entry.name for entry in source_entries]}==(({"deep","kept"}|({'new-local'} if local_union else set())) if nested_pins else ({"dirty","pinned"} if paired_pins else {"nested","synced",*[f"entry-{index:02}" for index in range(40)]}))
+                            finally:
+                                os.close(source_fd);os.close(target_fd)
+                                if held_new_fd is not None:os.close(held_new_fd)
                         assert offline_mount_mutations==before,"inverse offline rename contacted network"
-                        retained=copies();assert len(retained)==1,retained
-                        capture=retained[0];assert capture["root"]==["dir-dest"] and capture["space"]==space
+                        original_owners=affected_owners(saved,space,incoming,target)
+                        if union_pins:
+                            assert len(original_owners)==3 and {owner[2] for owner in original_owners}=={extra_key,file_fragment_key,'["dir-dest"]'}
+                            assert not any(incoming.split('/')[:len(json.loads(owner[2]))]==json.loads(owner[2]) for owner in saved['pins'] if owner[1]==space),'union acceptance still had a containing source capture'
+                        retained=copies();assert len(retained)==len(original_owners) and {tuple(copy['root']) for copy in retained}=={tuple(json.loads(row[2])) for row in original_owners},retained
+                        capture=next(copy for copy in retained if copy["root"]==["dir-dest"]);assert capture["space"]==space
+                        source_capture=next((copy for copy in retained if copy["root"]==["dir-source"]),None)
+                        overlap_capture=next((copy for copy in retained if copy["root"]==extra_root.split('/')),None) if extra_source_pin else None
+                        assert len({copy['id'] for copy in retained})==len(original_owners)
+                        archived=capture_state()
+                        for copy in retained:
+                            old_root=json.dumps(copy['root'],separators=(',',':'))
+                            old_pin=next(row for row in original_owners if row[2]==old_root)
+                            stored=next(row for row in archived['pin_copies'] if str(row[0])==str(copy['id']))
+                            assert stored[1:7]==old_pin,'whole original pin metadata changed in recovery copy'
+                            for table,archive in (("files","pin_copy_files"),("chunks","pin_copy_chunks")):
+                                expected_rows={row[:2]+(str(copy['id']),)+row[3:] for row in saved[table] if row[1]==space and row[2]==old_root}
+                                assert {row for row in archived[archive] if row[1]==space and row[2]==str(copy['id'])}==expected_rows,"whole overlapping owner was not independently copied"
+                            if general_pins:
+                                listed=copy_entries(copy)
+                                assert {(tuple(row['path']),row['id']) for row in listed if row['kind']=='directory'}=={(tuple(p),None if not p and not identity else identity) for p,identity in json.loads(old_pin[4])},'recovery ID did not expose whole original directory identities and explicit Space-root sentinel'
+                                captured_paths={tuple(file['path']) for file in json.loads(old_pin[5])}
+                                if tuple(dirty_source.split('/')) in captured_paths:export_copy(copy,dirty_source.split('/'),original,'every-original-'+str(copy['id']))
+                                elif tuple(pinned_source.split('/')) in captured_paths:export_copy(copy,pinned_source.split('/'),pinned,'every-original-'+str(copy['id']))
+                                elif copy['root']==['dir-dest']:export_copy(copy,['dir-dest','sibling'],b'destination ancestor original sibling','every-original-'+str(copy['id']))
+                        if extra_source_pin:
+                            assert overlap_capture
+                            export_copy(overlap_capture,dirty_source.split('/'),original,"overlap-original")
+                        if union_pins:
+                            file_capture=next(copy for copy in retained if copy['root']==(incoming+'/kept').split('/'))
+                            export_copy(file_capture,(incoming+'/kept').split('/'),b'moving source sibling outside nested pin','fragment-file-original')
+                        if paired_pins and not union_pins:
+                            assert source_capture and source_capture["id"]!=capture["id"]
+                            export_copy(source_capture,dirty_source.split('/'),original,"paired-source-original")
+                            export_copy(source_capture,["dir-source","entry-00"],b"cookie entry","paired-source-sibling")
                         old_entries=copy_entries(capture)
                         assert any(row["kind"]=="directory" and row["path"]==["dir-dest","local-target"] and row["id"]==capture["target_id"] for row in old_entries)
                         assert not any(row["path"][:2]==["dir-dest","local-target"] and row["kind"]=="file" for row in old_entries)
                         export_copy(capture,["dir-dest","sibling"],b"destination ancestor original sibling","inverse-before")
                         charged=json.loads(fixture.require(cli("--storage-status"),"checking charged whole inverse ancestor").stdout)
-                        assert charged["pin_payload_bytes"]==usage["pin_payload_bytes"]+len(b"destination ancestor original sibling"),(usage,charged)
-                        def inverse_active():
+                        archive_charge=sum(len(row[5]) for row in saved['chunks'] if row[1]==space and row[2] in {owner[2] for owner in original_owners})
+                        incoming_charge=sum(len(row[5]) for row in saved['chunks'] if row[1]==space and (json.loads(row[2])[:len(incoming.split('/'))]==incoming.split('/') if union_pins else row[2]=='["dir-source"]') and json.loads(row[3])[:len(incoming.split('/'))]==incoming.split('/'))
+                        assert charged["pin_payload_bytes"]==usage["pin_payload_bytes"]+archive_charge+(incoming_charge if union_pins or not paired_pins else 0),(usage,charged)
+                        assert charged['pins']==usage['pins']+len(original_owners)-(1 if general_pins else 0),(usage,charged)
+                        def inverse_active(confirmed_local=False):
                             with sqlite3.connect(database) as db:
+                                for untouched in (owner for owner in saved['pins'] if owner not in original_owners):
+                                    actual=db.execute("SELECT * FROM pins WHERE instance=? AND space=? AND root=?",untouched[:3]).fetchone()
+                                    assert actual==untouched,('unrelated original owner changed',untouched[:3],actual)
                                 row=db.execute("SELECT directories,manifest FROM pins WHERE space=? AND root='[\"dir-dest\"]'",(space,)).fetchone()
-                                assert row and not db.execute("SELECT 1 FROM pins WHERE space=? AND root='[\"dir-source\"]'",(space,)).fetchone()
+                                assert row
+                                source_active=db.execute("SELECT directories,manifest FROM pins WHERE space=? AND root='[\"dir-source\"]'",(space,)).fetchone()
+                                assert bool(source_active)==(paired_pins and not union_pins)
+                                if paired_pins:assert not db.execute("SELECT 1 FROM pins WHERE space=? AND root=?",(space,incoming_key)).fetchone()
                                 old=next(row for row in saved["pins"] if row[1]==space and row[2]=='["dir-dest"]')
-                                source_pin=next(row for row in saved["pins"] if row[1]==space and row[2]=='["dir-source"]')
+                                if union_pins:
+                                    original_source=next(row for row in saved['snapshots'] if row[1]==space and row[2]==incoming_key)
+                                    union_dirs=[(incoming.split('/'),original_source[5])]+[entry for owner in original_owners if json.loads(owner[2])[:len(incoming.split('/'))]==incoming.split('/') for entry in json.loads(owner[4])]
+                                    union_files=[file for owner in original_owners if json.loads(owner[2])[:len(incoming.split('/'))]==incoming.split('/') for file in json.loads(owner[5])]
+                                    assert {tuple(p) for p,_ in union_dirs}=={tuple((incoming+suffix).split('/')) for suffix in ('','/deep','/deep/inner')}
+                                    assert {tuple(file['path']) for file in union_files}=={tuple((incoming+suffix).split('/')) for suffix in ('/kept','/deep/dirty','/deep/pinned','/deep/zero')}
+                                    source_dirs,source_versions=union_dirs,union_files
+                                else:
+                                    source_pin=next(row for row in saved["pins"] if row[1]==space and row[2]=='["dir-source"]')
+                                    source_dirs,source_versions=json.loads(source_pin[4]),json.loads(source_pin[5])
+                                if union_pins or local_union:
+                                    operation=db.execute("SELECT id FROM operation_journal WHERE space=? AND path=? AND op_type='move-tree'",(space,incoming_key)).fetchone()[0]
+                                    proofs=db.execute('SELECT path,self_id,self_etag,generation,digest,entries FROM tree_proofs WHERE operation_id=?',(operation,)).fetchall()
+                                    assert {tuple(json.loads(proof[0])) for proof in proofs}=={tuple(path[len(incoming.split('/')):]) for path,_ in source_dirs if path[:len(incoming.split('/'))]==incoming.split('/')}
+                                    for relative,identity,etag,generation,digest,listing in proofs:
+                                        original=next(row for row in saved['snapshots'] if row[1]==space and json.loads(row[2])==incoming.split('/')+json.loads(relative))
+                                        assert (identity,etag,generation)==(original[5],original[6],original[4]) and json.loads(listing)==json.loads(original[3])
+                                        assert digest==hashlib.sha256(listing.encode()).hexdigest(),'incoming coverage was not bound to the retained complete source listing proof'
                                 expected_dirs=[entry for entry in json.loads(old[4]) if entry[0]!=["dir-dest","local-target"]]
-                                expected_dirs += [[["dir-dest","local-target"]+path[1:],identity] for path,identity in json.loads(source_pin[4])]
-                                expected_files=json.loads(old[5])+[dict(v,path=["dir-dest","local-target"]+v["path"][1:]) for v in json.loads(source_pin[5])]
+                                source_path=incoming.split('/')
+                                expected_dirs += [[["dir-dest","local-target"]+path[len(source_path):],identity] for path,identity in source_dirs if path[:len(source_path)]==source_path]
+                                expected_files=json.loads(old[5])+[dict(v,path=["dir-dest","local-target"]+v["path"][len(source_path):]) for v in source_versions if v["path"][:len(source_path)]==source_path]
+                                if paired_pins and not union_pins:
+                                    assert json.loads(source_active[0])==[row for row in source_dirs if row[0][:len(source_path)]!=source_path]
+                                    assert json.loads(source_active[1])==[v for v in source_versions if v["path"][:len(source_path)]!=source_path]
                                 assert json.loads(row[0])==sorted(expected_dirs,key=lambda e:e[0])
                                 assert json.loads(row[1])==sorted(expected_files,key=lambda v:v["path"]),"inverse merge changed exact metadata beyond path"
+                                if local_union:
+                                    move_parents=json.loads(db.execute('SELECT destination_parents FROM operation_parents WHERE operation_id=?',(operation,)).fetchone()[0])
+                                    for original in saved['operation_journal']:
+                                        original_path=json.loads(original[3])
+                                        if original[2]!=space or not (original_path[:len(source_path)+1]==source_path+['new-local'] or original_path==source_path+['deep','new-leaf']):continue
+                                        moved=target.split('/')+original_path[len(source_path):]
+                                        current=db.execute('SELECT * FROM operation_journal WHERE id=?',(original[0],)).fetchone()
+                                        assert json.loads(current[3])==moved and current[:3]+current[4:8]==original[:3]+original[4:8],'local root identity/base changed instead of relocating'
+                                        if confirmed_local:assert current[8]=='synced'
+                                        else:assert current[8:10]+current[11:]==original[8:10]+original[11:],'local state changed before MOVE confirmation'
+                                        if not confirmed_local:
+                                            old_parents=json.loads(next(row[1] for row in saved['operation_parents'] if row[0]==original[0]))
+                                            new_parents=json.loads(db.execute('SELECT parents FROM operation_parents WHERE operation_id=?',(original[0],)).fetchone()[0])
+                                            assert new_parents==move_parents+old_parents[len(source_path)-1:],'local remote/Pending parent identities did not relocate exactly'
+                                        assert original[5:7]==(None,None)
+                                        if original[4]=='write':
+                                            assert staged_bytes(database,original[7])==local_bytes
+                                            assert db.execute('SELECT * FROM dirty_roots WHERE root=?',(original[7],)).fetchone()==next(root for root in saved['dirty_roots'] if root[0]==original[7])
+                                    assert read_file(mountpoint/(target+'/new-local/inner/file'))==local_bytes
+                                    assert read_file(mountpoint/(target+'/deep/new-leaf'))==local_bytes
                                 stored=db.execute("SELECT path,version FROM files WHERE space=? AND root='[\"dir-dest\"]' ORDER BY path",(space,)).fetchall()
                                 assert [json.loads(v) for _,v in stored]==sorted(expected_files,key=lambda v:json.dumps(v["path"],separators=(',',':')))
+                                if general_pins:
+                                    old_common=next(owner for owner in original_owners if owner[2]=='[]')
+                                    common=db.execute("SELECT directories,manifest FROM pins WHERE space=? AND root='[]'",(space,)).fetchone()
+                                    keep=lambda p:p[:len(source_path)]!=source_path and p[:len(target.split('/'))]!=target.split('/')
+                                    expected_common_dirs=[entry for entry in json.loads(old_common[4]) if keep(entry[0])]+[[target.split('/')+p[len(source_path):],identity] for p,identity in json.loads(old_common[4]) if p[:len(source_path)]==source_path]
+                                    expected_common_files=[v for v in json.loads(old_common[5]) if keep(v['path'])]+[dict(v,path=target.split('/')+v['path'][len(source_path):]) for v in json.loads(old_common[5]) if v['path'][:len(source_path)]==source_path]
+                                    assert common and json.loads(common[0])==sorted(expected_common_dirs) and json.loads(common[1])==sorted(expected_common_files,key=lambda v:v['path']),'common ancestor membership or historical sibling versions changed'
+                                for old_nested in (owner for owner in original_owners if json.loads(owner[2])[:len(source_path)]==source_path):
+                                    new_root=target.split('/')+json.loads(old_nested[2])[len(source_path):];new_key=json.dumps(new_root,separators=(',',':'))
+                                    nested_row=db.execute("SELECT directories,manifest FROM pins WHERE space=? AND root=?",(space,new_key)).fetchone()
+                                    assert nested_row and not db.execute("SELECT 1 FROM pins WHERE space=? AND root=?",(space,old_nested[2])).fetchone()
+                                    expected_nested_dirs=[[target.split('/')+path[len(source_path):],identity] for path,identity in json.loads(old_nested[4])]
+                                    expected_nested_files=[dict(v,path=target.split('/')+v['path'][len(source_path):]) for v in json.loads(old_nested[5])]
+                                    assert json.loads(nested_row[0])==expected_nested_dirs and json.loads(nested_row[1])==expected_nested_files,'independent nested pin did not follow its exact relative path'
+                                    assert [json.loads(v) for (v,) in db.execute("SELECT version FROM files WHERE space=? AND root=? ORDER BY path",(space,new_key))]==expected_nested_files
+                                    assert not db.execute("SELECT 1 FROM files WHERE space=? AND root=? UNION ALL SELECT 1 FROM chunks WHERE space=? AND root=?",(space,old_nested[2],space,old_nested[2])).fetchone(),'old moved active owner leaked'
                         inverse_active();cold_copies();inverse_active()
+                        if general_pins or union_pins:
+                            unmount_both();mount_both(writable=False)
+                            assert read_file(mountpoint/moved_dirty)==expected and read_file(mountpoint/moved_pinned)==pinned
+                            assert read_file(mountpoint/'dir-dest/sibling')==b'destination ancestor original sibling'
+                            inverse_active();unmount_both();mount_both()
                         assert copies()==retained and not (mountpoint/incoming).exists()
-                        assert read_file(mountpoint/(target+"/nested/dirty"))==original and read_file(mountpoint/(target+"/nested/pinned"))==pinned
+                        assert read_file(mountpoint/moved_dirty)==expected and read_file(mountpoint/moved_pinned)==pinned
+                        if union_pins:assert read_file(mountpoint/(target+'/deep/zero'))==b'' and os.listdir(mountpoint/(target+'/deep/inner'))==[]
+                        if paired_pins:
+                            if not union_pins:
+                                assert read_file(mountpoint/"dir-source/entry-00")==b"cookie entry"
+                                export_copy(source_capture,dirty_source.split('/'),original,"paired-source-cold")
+                            if extra_source_pin:export_copy(overlap_capture,dirty_source.split('/'),original,"overlap-cold")
+                            labels={path:status for status,path in (line.split('\t',1) for line in fixture.require(cli("--pins-space",url,space),"inspecting local pending pin metadata").stdout.splitlines())}
+                            assert labels['/dir-dest'].startswith('stale (local metadata; remote not checked)'),labels
+                            if not union_pins:assert not labels['/dir-source'].startswith('incomplete'),labels
+                            active=[json.loads(line) for line in fixture.require(cli("--retained-files",url,space,"/dir-dest"),"selecting exact newly merged active pin version").stdout.splitlines()]
+                            selected=next(row for row in active if row['path']==moved_dirty.split('/'))
+                            destination=runtime/"paired-active-original"
+                            fixture.require(cli("--export-retained",url,space,"/dir-dest","/"+moved_dirty,selected['selector'],destination),"exporting original captured version independently of dirty overlay")
+                            assert destination.read_bytes()==original
+                            if nested_pins:
+                                assert labels['/'+target+'/deep'].startswith('stale (local metadata; remote not checked)'),labels
+                                assert read_file(mountpoint/(target+'/kept'))==b"moving source sibling outside nested pin"
+                                nested_active=[json.loads(line) for line in fixture.require(cli("--retained-files",url,space,'/'+target+'/deep'),"selecting independent rebased nested pin version").stdout.splitlines()]
+                                selected=next(row for row in nested_active if row['path']==moved_dirty.split('/'))
+                                destination=runtime/'nested-active-original'
+                                fixture.require(cli("--export-retained",url,space,'/'+target+'/deep','/'+moved_dirty,selected['selector'],destination),"exporting independently retained active nested bytes")
+                                assert destination.read_bytes()==original
                         assert read_file(mountpoint/"dir-dest/sibling")==b"destination ancestor original sibling"
                         assert read_file(reservation_mount/"independent")==b"other Space remains intact"
                         export_copy(capture,["dir-dest","sibling"],b"destination ancestor original sibling","inverse-cold")
+                        if union_pins:export_copy(file_capture,(incoming+'/kept').split('/'),b'moving source sibling outside nested pin','fragment-file-cold')
                         reconnect();fixture.require(cli("--sync-space",url,space),"confirming one valid inverse MOVE")
-                        assert lab.upstream(container,"GET",base+"/"+target+"/nested/dirty")[2]==original
-                        assert lab.upstream(container,"GET",base+"/dir-source/nested/dirty")[0]==404
-                        assert offline_mount_mutations.count(("MOVE",unquote(base)+"/dir-source"))==1
+                        inverse_active(confirmed_local=local_union)
+                        if local_union:
+                            # Leave all captured remote versions unchanged in
+                            # this mode: only additional confirmed membership
+                            # can make the old capture's metadata stale.
+                            requests=[(method,path) for method,path in offline_mount_mutations if (method=='MOVE' and path==unquote(base)+'/'+incoming) or path in {unquote(base)+'/'+target+suffix for suffix in ('/new-local','/new-local/inner','/new-local/inner/file','/deep/new-leaf')}]
+                            assert requests[0]==('MOVE',unquote(base)+'/'+incoming),requests
+                            for suffix in ('/new-local','/new-local/inner'):
+                                assert requests.count(('MKCOL',unquote(base)+'/'+target+suffix))==1,requests
+                            assert requests.index(('MKCOL',unquote(base)+'/'+target+'/new-local'))<requests.index(('MKCOL',unquote(base)+'/'+target+'/new-local/inner'))<requests.index(('PUT',unquote(base)+'/'+target+'/new-local/inner/file')),requests
+                            for suffix in ('/new-local/inner/file','/deep/new-leaf'):
+                                assert requests.count(('PUT',unquote(base)+'/'+target+suffix))==1
+                                assert lab.upstream(container,'GET',base+'/'+target+suffix)[2]==local_bytes
+                            assert all(condition=='*' for method,path,condition in local_reuse_headers if path.startswith(unquote(base)+'/'+target+'/new-local') or path==unquote(base)+'/'+target+'/deep/new-leaf'),local_reuse_headers
+                            labels={path:status for status,path in (line.split('\t',1) for line in fixture.require(cli('--pins-space',url,space),'checking capture remains stale after confirming new children').stdout.splitlines())}
+                            assert labels['/dir-dest'].startswith('stale (local metadata; remote not checked)'),labels
+                        assert lab.upstream(container,"GET",base+"/"+moved_dirty)[2]==expected
+                        assert lab.upstream(container,"GET",base+"/"+dirty_source)[0]==404
+                        assert offline_mount_mutations.count(("MOVE",unquote(base)+"/"+incoming))==1
+                        if paired_pins:
+                            with open(reservation_mount/"paired-progress","xb",buffering=0) as writer:
+                                writer.write(b"independent paired ancestor progress");os.fsync(writer.fileno())
+                            fixture.require(cli("--sync-space",url,project),"confirming independent Space progress before uncertain MOVE")
+                            assert lab.upstream(container,"GET",project_base+"/paired-progress")[2]==b"independent paired ancestor progress"
                         disconnect()
-                        os.rename(reservation_mount/"tree-uncertain",reservation_mount/"loss-parent/target")
-                        os.rename(mountpoint/"conflict-source",mountpoint/"inverse-conflict/target")
+                        if local_union:
+                            create_local(reservation_mount,loss_source)
+                        os.rename(reservation_mount/loss_source,reservation_mount/"loss-parent/target")
+                        os.rename(mountpoint/conflict_incoming,mountpoint/"inverse-conflict/target")
                         reconnect()
                         assert lab.upstream(container,"DELETE",base+"/inverse-conflict/target")[0]==204
                         assert lab.upstream(container,"MKCOL",base+"/inverse-conflict/target")[0]==201
                         assert lab.upstream(container,"PUT",base+"/inverse-conflict/target/external",b"new target never overwritten")[0]==201
                         cli("--sync-space",url,space)
                         with sqlite3.connect(database) as db:
-                            token,state=db.execute("SELECT staged_file,state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path='[\"conflict-source\"]'",(space,)).fetchone()
+                            token,state=db.execute("SELECT staged_file,state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path=?",(space,json.dumps(conflict_incoming.split('/'),separators=(',',':')))).fetchone()
                             assert state=="conflict"
-                        assert ("MOVE",unquote(base)+"/conflict-source") not in offline_mount_mutations
-                        assert read_file(mountpoint/"inverse-conflict/target/nested/file")==b"source A retained"
+                        assert ("MOVE",unquote(base)+"/"+conflict_incoming) not in offline_mount_mutations
+                        assert read_file(mountpoint/conflict_file)==b"source A retained"
                         fixture.require(cli("--acknowledge",url,token),"explicitly acknowledging conflicted inverse intent without asserting remote outcome")
-                        disconnect();os.rename(mountpoint/"changed-source",mountpoint/"inverse-source-change/target");reconnect()
-                        assert lab.upstream(container,"DELETE",base+"/changed-source")[0]==204
-                        assert lab.upstream(container,"MKCOL",base+"/changed-source")[0]==201
-                        assert lab.upstream(container,"PUT",base+"/changed-source/external",b"new source never adopted")[0]==201
+                        disconnect()
+                        if local_union:create_local(mountpoint,changed_incoming)
+                        os.rename(mountpoint/changed_incoming,mountpoint/"inverse-source-change/target");reconnect()
+                        assert lab.upstream(container,"DELETE",base+"/"+changed_incoming)[0]==204
+                        assert lab.upstream(container,"MKCOL",base+"/"+changed_incoming)[0]==201
+                        assert lab.upstream(container,"PUT",base+"/"+changed_incoming+"/external",b"new source never adopted")[0]==201
                         cli("--sync-space",url,space)
-                        with sqlite3.connect(database) as db:assert db.execute("SELECT state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path='[\"changed-source\"]'",(space,)).fetchone()==("conflict",)
-                        assert ("MOVE",unquote(base)+"/changed-source") not in offline_mount_mutations
-                        assert read_file(mountpoint/"inverse-source-change/target/nested/file")==b"nested original"
-                        assert lab.upstream(container,"GET",base+"/changed-source/external")[2]==b"new source never adopted"
+                        with sqlite3.connect(database) as db:assert db.execute("SELECT state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path=?",(space,json.dumps(changed_incoming.split('/'),separators=(',',':')))).fetchone()==("conflict",)
+                        assert ("MOVE",unquote(base)+"/"+changed_incoming) not in offline_mount_mutations
+                        assert read_file(mountpoint/changed_file)==b"nested original"
+                        if local_union:assert read_file(mountpoint/'inverse-source-change/target/new-local/inner/file')==local_bytes
+                        assert lab.upstream(container,"GET",base+"/"+changed_incoming+"/external")[2]==b"new source never adopted"
                         assert lab.upstream(container,"GET",base+"/inverse-conflict/target/external")[2]==b"new target never overwritten"
                         lost_tree_move[0]=True;cli("--sync-space",url,project)
                         assert tree_moves[0]==1 and not lost_tree_move[0]
-                        with sqlite3.connect(database) as db:assert db.execute("SELECT state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path='[\"tree-uncertain\"]'",(project,)).fetchone()==("uncertain",)
-                        retained=copies();assert len(retained)==4,retained
+                        with sqlite3.connect(database) as db:assert db.execute("SELECT state FROM operation_journal WHERE space=? AND op_type='move-tree' AND path=?",(project,json.dumps(loss_source.split('/'),separators=(',',':')))).fetchone()==("uncertain",)
+                        expected_captures=sum(len(affected_owners(saved,which,origin,dest)) for which,origin,dest in ((space,incoming,target),(space,conflict_incoming,'inverse-conflict/target'),(space,changed_incoming,'inverse-source-change/target'),(project,loss_source,'loss-parent/target')))
+                        retained=copies();assert len(retained)==expected_captures,retained
                         stable=list(offline_mount_mutations)
                         unmount_both();fixture.require(cli("--stop"),"stopping inverse conflict/lost-response views");daemon.wait(timeout=10)
                         disconnect();daemon=start();mount_both()
                         assert copies()==retained
-                        assert read_file(reservation_mount/"loss-parent/target/kept")==b"uncertain MOVE retains bytes"
+                        assert read_file(reservation_mount/("loss-parent/target/deep/kept" if nested_pins else "loss-parent/target/kept"))==b"uncertain MOVE retains bytes"
                         assert read_file(reservation_mount/"loss-parent/sibling")==b"other Space ancestor sibling"
-                        assert read_file(mountpoint/"inverse-source-change/target/nested/file")==b"nested original"
+                        if local_union:
+                            for view,path in ((reservation_mount,'loss-parent/target'),(mountpoint,'inverse-source-change/target')):
+                                assert read_file(view/(path+'/new-local/inner/file'))==local_bytes
+                                assert read_file(view/(path+'/deep/new-leaf'))==local_bytes
+                            for remote,target_path in ((project_base,'loss-parent/target'),(base,'inverse-source-change/target')):
+                                assert not any(path.startswith(unquote(remote)+'/'+target_path+'/new-local') or path==unquote(remote)+'/'+target_path+'/deep/new-leaf' for _,path in offline_mount_mutations),'unconfirmed MOVE allowed a child mutation'
+                        assert read_file(mountpoint/changed_file)==b"nested original"
+                        if paired_pins and not union_pins:
+                            assert read_file(reservation_mount/"loss-source/sibling")==b"independent source ancestor sibling"
+                            export_copy(source_capture,dirty_source.split('/'),original,"paired-source-after-conflicts")
+                            lost_source_capture=next(copy for copy in retained if copy["space"]==project and copy["root"]==["loss-source"])
+                            lost_target_capture=next(copy for copy in retained if copy["space"]==project and copy["root"]==["loss-parent"])
+                            export_copy(lost_source_capture,loss_file.split('/'),b"uncertain MOVE retains bytes","paired-lost-source-cold")
+                            export_copy(lost_target_capture,["loss-parent","sibling"],b"other Space ancestor sibling","paired-lost-target-cold")
+                        if union_pins:
+                            lost_fragment=next(copy for copy in retained if copy['space']==project and copy['root']==(loss_source+'/deep').split('/'))
+                            export_copy(lost_fragment,loss_file.split('/'),b'uncertain MOVE retains bytes','fragment-lost-source-cold')
                         export_copy(capture,["dir-dest","sibling"],b"destination ancestor original sibling","inverse-after-conflicts")
                         with open(mountpoint/"dir-dest/new-dirty","xb",buffering=0) as writer:
                             writer.write(b"dirty root survives inverse capture removal");os.fsync(writer.fileno())
                         preserved=capture_state();assert preserved["dirty_roots"]
+                        if extra_source_pin:
+                            fixture.require(cli("--remove-pin-copy",url,space,overlap_capture['id']),"removing only independent overlapping source capture")
+                            current=capture_state()
+                            for table in ("pins","files","chunks","operation_journal","dirty_roots"):assert current[table]==preserved[table],table
+                            retained=[copy for copy in retained if copy['id']!=overlap_capture['id']]
+                            assert copies()==retained
+                            if not union_pins:export_copy(source_capture,dirty_source.split('/'),original,"overlap-after-copy-removal")
+                            if nested_pins:
+                                destination=runtime/'nested-active-after-copy-removal'
+                                fixture.require(cli("--export-retained",url,space,'/'+target+'/deep','/'+moved_dirty,selected['selector'],destination),"exporting nested active owner after its independent recovery copy was removed")
+                                assert destination.read_bytes()==original
+                        if paired_pins and not union_pins:
+                            fixture.require(cli("--remove-pin-copy",url,space,source_capture["id"]),"removing only original paired source capture")
+                            current=capture_state()
+                            for table in ("pins","files","chunks","operation_journal","dirty_roots"):assert current[table]==preserved[table],table
+                            retained=[copy for copy in retained if copy["id"]!=source_capture["id"]]
+                            assert copies()==retained
+                            export_copy(capture,["dir-dest","sibling"],b"destination ancestor original sibling","paired-after-source-removal")
                         fixture.require(cli("--remove-pin-copy",url,space,capture["id"]),"removing only original inverse destination capture")
                         current=capture_state()
                         for table in ("pins","files","chunks","operation_journal","dirty_roots"):assert current[table]==preserved[table],table
                         assert copies()==[copy for copy in retained if copy["id"]!=capture["id"]]
                         assert read_file(mountpoint/"dir-dest/new-dirty")==b"dirty root survives inverse capture removal"
                         assert read_file(mountpoint/"dir-dest/sibling")==b"destination ancestor original sibling"
+                        if paired_pins and not union_pins:assert read_file(mountpoint/"dir-source/entry-00")==b"cookie entry" and read_file(mountpoint/moved_dirty)==expected
+                        if union_pins:
+                            before_unpin=capture_state();before_copies=copies()
+                            fixture.require(cli('--unpin-space',url,space,'/'+target+'/kept'),'unpinning only independently rebased sibling fragment')
+                            after_unpin=capture_state();removed=json.dumps((target+'/kept').split('/'),separators=(',',':'))
+                            for table in ('pins','files','chunks'):
+                                assert after_unpin[table]==[row for row in before_unpin[table] if not(row[1]==space and row[2]==removed)],table
+                            for table in ('operation_journal','dirty_roots','pin_copies','pin_copy_files','pin_copy_chunks'):assert after_unpin[table]==before_unpin[table],table
+                            assert copies()==before_copies
+                            export_copy(file_capture,(incoming+'/kept').split('/'),b'moving source sibling outside nested pin','fragment-file-after-active-unpin')
+                            cold_copies()
+                            assert read_file(mountpoint/(target+'/kept'))==b'moving source sibling outside nested pin'
+                            assert read_file(mountpoint/moved_dirty)==expected and read_file(mountpoint/moved_pinned)==pinned
+                            assert read_file(mountpoint/'dir-dest/new-dirty')==b'dirty root survives inverse capture removal'
+                            labels={path:status for status,path in (line.split('\t',1) for line in fixture.require(cli('--pins-space',url,space),'inspecting independent fragment unpin isolation').stdout.splitlines())}
+                            assert '/'+target+'/kept' not in labels and '/dir-dest' in labels and '/'+target+'/deep' in labels
                         reconnect();cli("--sync-space",url,project);cli("--sync-space",url,space)
                         assert offline_mount_mutations==stable and tree_moves[0]==1,"unknown inverse MOVE replayed or fenced operation mutated"
                         unmount_both();fixture.require(cli("--stop"),"stopping inverse pin qualification");daemon.wait(timeout=10)
-                        print("PASS: schema17 destination-only ancestor inverse merge requires complete exact source pin/chunk SHA, overlapping target and missing chunk refusal, zero-headroom/COMMIT full rollback; whole original ancestor ID/export/accounting; exact merged active metadata/cold bytes, source/target FDs and cookie snapshots; one real MOVE, target and source replacement conflicts, explicit local conflict acknowledgment, independent Space applied-lost inverse MOVE cold non-replay; selected-copy removal isolates active siblings and dirty roots",flush=True)
+                        print("PASS: schema17 bounded ownership plan; "+("fragment union with no containing source capture: two independent source fragments + destination ancestor, explicit empty directory and zero-sized leaf, exact retained source proof IDs/ETags/generations/listing SHA, hashless duplicate disagreement/missing fragment/absent directory proof/zero-sized coverage refusal; independent active fragment unpin and copy removal isolate merged pin and dirty roots; " if union_pins else ("two nested directories + exact source + clean leaf remain independent; common/source/destination ancestors retain exact sibling history; exact target collision archived; eight whole originals per MOVE and paged 32-copy cold recovery; real hashless DAV SHA disagreement, chunk alignment and duplicate membership fail closed; " if general_pins else ""))+"whole original capture IDs/physical accounting, independent moving roots and accurate ancestor siblings/merged metadata/cold bytes, isolated copy removal, dirty original bases/FDs/cookies; target-ID and missing-content refusal, State-peer/zero-headroom/actual COMMIT rollback; one real MOVE+upload, remote replacements conflict/no stale MOVE, independent Space applied-lost MOVE cold non-replay",flush=True)
+                        if local_union:print('PASS: new local nested mkdir/file and fragment-local leaf remain separate durable roots; exact remote-only manifests/proofs/copies, unchanged root tokens/bytes, held FD and cold recovery, pressure/COMMIT rollback; MOVE before create-only child MKCOL/PUT; replacement conflicts and lost-response prevent all child mutations and replay',flush=True)
                         return
                     expected=b"PIN!"+original[4:]
                     source_fd=os.open(mountpoint/pin_source,os.O_RDONLY|os.O_DIRECTORY)
@@ -2931,8 +4508,15 @@ def child(root, runtime, container):
                             writer.write(b"PIN!");os.fsync(writer.fileno())
                             saved=capture_state()
                             if split_pin:
+                                with sqlite3.connect(database) as db:
+                                    dirs=db.execute("SELECT directories FROM pins WHERE space=? AND root='[\"dir-source\",\"nested\"]'",(space,)).fetchone()[0]
+                                    altered=json.loads(dirs);altered[0][1]='disagreeing-overlap-directory'
+                                    db.execute("UPDATE pins SET directories=? WHERE space=? AND root='[\"dir-source\",\"nested\"]'",(json.dumps(altered,separators=(',',':')),space))
+                                saved=capture_state()
                                 refuses(pin_source,"remote-target-empty",errno.EBUSY)
-                                assert capture_state()==saved,"unsupported overlapping source pin partially published split"
+                                assert capture_state()==saved,"disagreeing overlapping source pin partially published split"
+                                with sqlite3.connect(database) as db:db.execute("UPDATE pins SET directories=? WHERE space=? AND root='[\"dir-source\",\"nested\"]'",(dirs,space))
+                                assert read_file(mountpoint/'dir-source/nested/dirty')==expected # durably protect all original gaps before explicit unpin
                                 fixture.require(cli("--unpin-space",url,space,"/dir-source/nested"),"explicitly removing only overlapping source pin control")
                                 saved=capture_state()
                             usage=json.loads(fixture.require(cli("--storage-status"),"sizing pin retention pressure").stdout)
@@ -2957,14 +4541,17 @@ def child(root, runtime, container):
                         if split_directory is not None:split_directory.close()
                         os.close(source_fd);os.close(target_fd)
                     assert offline_mount_mutations==before
-                    retained=copies();assert len(retained)==2,retained
+                    retained=copies();assert len(retained)==(2 if split_pin else 3),retained
                     ancestor=next(copy for copy in retained if copy["root"]==ancestor_root)
                     old_target=next(copy for copy in retained if copy["root"]==["remote-target-empty"])
                     assert ancestor["id"]!=old_target["id"] and ancestor["target_id"]==old_target["target_id"]
                     assert any(entry["kind"]=="directory" and entry["id"]==old_target["target_id"] for entry in copy_entries(old_target))
                     export_copy(ancestor,["dir-source","nested","dirty"],original,"ancestor-before")
+                    if not split_pin:
+                        original_source=next(copy for copy in retained if copy['root']==['dir-source'])
+                        export_copy(original_source,['dir-source','nested','dirty'],original,'independent-moving-source-before')
                     charged=json.loads(fixture.require(cli("--storage-status"),"checking retained pin accounting").stdout)
-                    assert charged["pin_payload_bytes"]>usage["pin_payload_bytes"] and charged["pins"]==usage["pins"]+(2 if split_pin else 1),(usage,charged)
+                    assert charged["pin_payload_bytes"]>usage["pin_payload_bytes"] and charged["pins"]==usage["pins"]+2,(usage,charged)
                     cold_copies()
                     assert copies()==retained and not (mountpoint/pin_source).exists()
                     assert read_file(mountpoint/moved_dirty)==expected
@@ -3023,7 +4610,7 @@ def child(root, runtime, container):
                         print("PASS: real Rune wide/narrow retained-copy listing, empty directory identity and explicit two-step removal (first click preserves copy), paged original-file selection and exact local-only export; screenshots/trees "+str(ui_output),flush=True)
                     preserved=capture_state()
                     fixture.require(cli("--remove-pin-copy",url,space,old_target["id"]),"explicitly removing only empty old-target capture")
-                    assert copies()==[ancestor]
+                    assert copies()==[copy for copy in retained if copy['id']!=old_target['id']]
                     current=capture_state()
                     for table in ("pins","files","chunks","operation_journal","dirty_roots"):assert current[table]==preserved[table],table
                     export_copy(ancestor,["dir-source","nested","dirty"],original,"after-remove-other")
@@ -3039,7 +4626,7 @@ def child(root, runtime, container):
                     # snapshot; real external target replacement must conflict.
                     os.rename(mountpoint/conflict_source,mountpoint/"conflict-moved")
                     os.rename(reservation_mount/loss_source,reservation_mount/"loss-moved")
-                    all_retained=copies();assert len(all_retained)==(4 if split_pin else 3),all_retained
+                    all_retained=copies();assert len(all_retained)==(4 if split_pin else 6),all_retained
                     assert offline_mount_mutations==after_valid
                     reconnect()
                     assert lab.upstream(container,"DELETE",base+"/conflict-moved")[0]==204
@@ -3129,7 +4716,7 @@ def child(root, runtime, container):
                 with sqlite3.connect(database) as db:target_pins=db.execute("SELECT * FROM pins ORDER BY rowid").fetchall()
                 os.rename(mountpoint/"pin-displace-source",mountpoint/"remote-target-empty")
                 with sqlite3.connect(database) as db:
-                    assert db.execute("SELECT instance,space,root,is_dir,directories,manifest FROM pin_copies ORDER BY id").fetchall()==[row for row in target_pins if row[2]=='["remote-target-empty"]'],"pinned target not retained by independent identity"
+                    assert set(db.execute("SELECT instance,space,root,is_dir,directories,manifest FROM pin_copies ORDER BY id").fetchall())=={row for row in target_pins if row[1]==space and row[2] in ('["remote-target-empty"]','["pin-displace-source"]')},"moving source and displaced target not retained by independent identity"
                 assert read_file(mountpoint/"remote-target-empty/file")==b"separate pinned replacement source"
             libc=ctypes.CDLL(None,use_errno=True);libc.renameat2.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];libc.renameat2.restype=ctypes.c_int
             assert libc.renameat2(-100,os.fsencode(mountpoint/"dir-source"),-100,os.fsencode(mountpoint/"remote-target-empty"),1)==-1 and ctypes.get_errno()==errno.EEXIST
@@ -3811,7 +5398,7 @@ def child(root, runtime, container):
             fixture.require(cli("--stage-file-space",url,space,"/folder/nested.bin",source),"staging independent dirty root")
             # Save E1 emptiness, change only the server, publish ONLY root E2.
             with sqlite3.connect(database) as db:
-                assert db.execute("PRAGMA user_version").fetchone() == (17,)
+                assert db.execute("PRAGMA user_version").fetchone() == (19,)
                 e1 = db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE instance=? AND space=? AND path='[\"stale-empty\"]'",(url,space)).fetchone()
             assert e1[2] == "[]"
             assert lab.upstream(container,"PUT",base + "/stale-empty/new-child",b"must never be hidden")[0] == 201
@@ -4455,25 +6042,22 @@ def child(root, runtime, container):
             with open(mountpoint / "pin-dirty-original", "rb", buffering=0) as dirty:
                 assert os.pread(dirty.fileno(), 3, 0) == b"LOC"
                 assert os.pread(dirty.fileno(), 32, 131072-16) == a[131072-16:131072+16]
-            fixture.require(second_cli("--unpin-space", url, space, "/pin-dirty-original"), "explicitly removing sole original pin")
+            fixture.require(second_cli("--unpin-space",url,space,"/pin-dirty-original"),'protecting cold dirty originals before unpin')
             fixture.require(cli("--unmount-space", url, project), "unmounting isolated read peer"); second_mounted = False
             fixture.require(cli("--unmount-space", url, space), "unmounting dirty original read"); mounted = False
             fixture.require(cli("--stop"), "clearing read-only in-memory ranges"); daemon.wait(timeout=10)
             daemon = start()
-            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "cold mounting missing-original overlay"); mounted = True
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "cold mounting protected original overlay"); mounted = True
             record_pin_mounts()
             with open(mountpoint / "pin-dirty-original", "rb", buffering=0) as dirty:
                 assert os.pread(dirty.fileno(), 3, 0) == b"LOC"
-                # Earlier successful dirty reads deliberately retain their
-                # exact original blocks. Probe an untouched third block, not
-                # one legitimately preserved by the first two-block read.
-                try: os.pread(dirty.fileno(), 3, 262144)
-                except OSError as error: assert error.errno == errno.EIO
-                else: raise AssertionError("missing pinned original was synthesized")
+                # Refused unpin must preserve even the untouched third block,
+                # not just ranges earlier reads independently protected.
+                assert os.pread(dirty.fileno(),3,262144)==(a+a)[262144:262147]
                 assert os.pread(dirty.fileno(), 3, 0) == b"LOC"
             assert lab.upstream(container, "GET", project_base + "/pin-read-race")[2] == c
             fixture.require(cli("--unmount-space", url, space), "unmounting pin race fixture"); mounted = False
-            print(f"PASS: {journal} exact pinned A read versus real authenticated peer B repin; current B reopen, independent Space, dirty pinned original and honest missing-base EIO", flush=True)
+            print(f"PASS: {journal} exact pinned A read versus real authenticated peer B repin; current B reopen, independent Space, guarded unpin preserves cold dirty original", flush=True)
             return
         if os.environ.get("CIRRUS_TEST_LOCAL_PINS") or os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY") or os.environ.get("CIRRUS_TEST_OFFLINE_MOUNT"):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
@@ -4499,11 +6083,12 @@ def child(root, runtime, container):
             dirty_source.write_bytes(dirty_bytes)
             fixture.require(cli("--stage-file-space", url, space, "/file.bin", dirty_source), "staging complete dirty recovery copy")
             if os.environ.get("CIRRUS_TEST_OFFLINE_DIRECTORY") or os.environ.get("CIRRUS_TEST_OFFLINE_MOUNT"):
-                fixture.require(cli("--pin-space", url, space, "/overwrite.bin"), "pinning original for partial edit")
+                # Missing-original acceptance starts with genuinely unpinned
+                # bytes; unpin may no longer strand a pinned dirty base.
                 with open(mountpoint / "overwrite.bin", "r+b", buffering=0) as partial:
                     partial.write(b"LOC")
                     os.fsync(partial.fileno())
-                fixture.require(cli("--unpin-space", url, space, "/overwrite.bin"), "explicitly removing sole pinned original")
+                fixture.require(cli("--unpin-space", url, space, "/overwrite.bin"), "unpinning a never-pinned original is a no-op")
                 os.mkdir(mountpoint / "offline-local-directory")
                 with open(mountpoint / "offline-local-directory/child", "wb", buffering=0) as child:
                     child.write(b"local child namespace")
@@ -6212,7 +7797,7 @@ def child(root, runtime, container):
             tree_writer = None
             tree_child = None
             local_detached = None
-            crashed_sql = None
+            crashed_download = None
             namespace_saved = None
             crashed_namespace = None
             namespace_ceiling = 4096 * 4096  # Existing per-owner SQLite cap, not a product budget default.
@@ -7420,17 +9005,16 @@ def child(root, runtime, container):
                         reserved = budget_status()
                         other_reserved = budget_status(second_cli)
                         sql = reserved["sql_reservations"]
-                        assert len(sql) == 1 and sql[0]["store"] == "state"
-                        assert other_reserved["sql_reservations"] == sql
-                        assert sql[0]["outstanding_bytes"] == max(0, sql[0]["ceiling_bytes"] - reserved["state_sqlite"]["allocated_bytes"])
-                        assert reserved["sql_outstanding_reserved_bytes"] == sql[0]["outstanding_bytes"] > 0
-                        scratch = database.parent / sql[0]["pin_scratch_name"]
+                        assert sql == other_reserved['sql_reservations'] == [],'network download retained a State allowance'
+                        assert reserved['sql_outstanding_reserved_bytes']==other_reserved['sql_outstanding_reserved_bytes']==0
+                        scratch, = database.parent.glob('.pin-download-*')
                         scratch_stat = scratch.stat()
                         assert scratch_stat.st_size == len(contents["folder/nested.bin"]) and scratch_stat.st_blocks * 512 >= scratch_stat.st_size
                         assert reserved["named_pin_scratch"]["allocated_bytes"] == scratch_stat.st_blocks * 512
+                        assert other_reserved['named_pin_scratch']==reserved['named_pin_scratch'],'peer did not charge named download bytes'
                         assert reserved["immutable_admission_charge_bytes"] == (reserved["known_total"]["allocated_bytes"] - reserved["staging"]["allocated_bytes"] + reserved["observed_staging_charge_bytes"] + reserved["sql_outstanding_reserved_bytes"] + reserved["namespace_outstanding_reserved_bytes"])
                         set_budget(max(reserved["immutable_admission_charge_bytes"], other_reserved["immutable_admission_charge_bytes"]) + 32 * 1024)
-                        assert cli("--release-storage-reservation", "state", sql[0]["token"]).returncode != 0, "active pin reservation was released"
+                        assert cli("--release-storage-reservation", "state", scratch.name.removeprefix('.pin-download-')).returncode != 0,'named download was mistaken for a releasable SQL allowance'
                         names_before_pin = {p.name for p in staging.iterdir()}
                         head_before_pin = budget_head()
                         expect_budget_error(lambda: os.pwrite(other_writer, b"P" * 131072, 0))
@@ -7440,13 +9024,21 @@ def child(root, runtime, container):
                         set_budget(budget_status()["immutable_admission_charge_bytes"] + namespace_ceiling + 32 * 1024)
                         assert budget_read(denied_cache_fd, len(cache_body)) == cache_body
                         assert sql_cache_gets[0] > 0 and budget_status()["clean_payload_bytes"] == 0
+                        # Downloads no longer monopolize the State lease;
+                        # this refusal must be real admission pressure.
+                        set_budget(budget_status()['immutable_admission_charge_bytes'])
                         assert second_cli("--pin-space", url, space, "/folder/nested.bin").returncode != 0
                         assert budget_status()["pin_payload_bytes"] == pin_bytes
                     finally:
                         os.close(denied_cache_fd)
-                        # Content/metadata verification now needs its own
-                        # admitted namespace scratch owners after pin download.
-                        set_budget(budget_status()["immutable_admission_charge_bytes"] + 2 * namespace_ceiling + 1024 * 1024)
+                        # No old SQL ceiling remains charged during download.
+                        # Restore the full fresh publication allowance as well
+                        # as namespace verification headroom, using current DB
+                        # pages just as initial admission above does.
+                        with sqlite3.connect(database) as db:
+                            pages=db.execute('PRAGMA page_count').fetchone()[0]
+                            page_size=db.execute('PRAGMA page_size').fetchone()[0]
+                        set_budget(budget_status()['immutable_admission_charge_bytes']+pages*page_size*3+len(contents['folder/nested.bin'])*8+4*namespace_ceiling+1024*1024)
                         pin_window.unlink(missing_ok=True)
                         try:
                             out, err = pin_client.communicate(timeout=30)
@@ -7469,7 +9061,7 @@ def child(root, runtime, container):
                     assert budget_status()["clean_payload_bytes"] == 0 and budget_status()["pin_payload_bytes"] == pin_bytes
                     assert {name: hashlib.sha256((staging / name).read_bytes()).digest() for name in protected} == protected
                     assert hashlib.sha256(orphan.read_bytes()).digest() == orphan_hash
-                    print("PASS: shared pin SQL/scratch admission blocks second-daemon staging; denied persistent caching preserves real online GET; admitted cache growth, prior-pin refusal, clean-only release and protected bytes verified", flush=True)
+                    print("PASS: named pin scratch globally charged without State lease during network; shared pressure blocks second-daemon staging; denied persistent caching preserves real online GET; admitted cache growth, prior-pin refusal, clean-only release and protected bytes verified", flush=True)
                 competing = b"C" * (256 * 1024)
                 base_one, base_two = budget_status(), budget_status(second_cli)
                 set_budget(max(base_one["immutable_admission_charge_bytes"], base_two["immutable_admission_charge_bytes"]) + len(competing) + 32 * 1024)
@@ -7497,6 +9089,13 @@ def child(root, runtime, container):
                     expect_budget_error(lambda: os.pwrite(other_writer, competing, 0))
                     assert len({p.name for p in staging.iterdir()} - names_before) == 1, "second daemon materialized a double-admitted reservation"
                     assert budget_head() == prior
+                    # The materialized-payload race has now been proved at
+                    # tight capacity. Registration and head publication are
+                    # separately admitted State phases, not part of that
+                    # payload reservation; allow them before acknowledging.
+                    with sqlite3.connect(database) as db:
+                        state_room=db.execute('PRAGMA page_count').fetchone()[0]*db.execute('PRAGMA page_size').fetchone()[0]*3
+                    set_budget(budget_status()['immutable_admission_charge_bytes']+state_room+4*1024*1024)
                 finally:
                     window.unlink(missing_ok=True)
                     worker.join(timeout=20)
@@ -7543,8 +9142,9 @@ def child(root, runtime, container):
                         while not pin_window.with_suffix(".waiting").exists() and time.monotonic() < deadline and pin_client.poll() is None:
                             time.sleep(0.02)
                         assert pin_window.with_suffix(".waiting").exists()
-                        crashed_sql = budget_status()["sql_reservations"][0]
-                        crashed_scratch = database.parent / crashed_sql["pin_scratch_name"]
+                        assert budget_status()['sql_reservations']==[]
+                        crashed_scratch, = database.parent.glob('.pin-download-*')
+                        crashed_download = crashed_scratch.name.removeprefix('.pin-download-')
                         crashed_hash = hashlib.sha256(crashed_scratch.read_bytes()).digest()
                         second_daemon.kill()
                         second_daemon.wait(timeout=5)
@@ -7554,8 +9154,8 @@ def child(root, runtime, container):
                         pin_window.unlink(missing_ok=True)
                         fixture.stop_process(pin_client)
                     after_crash = budget_status()
-                    assert after_crash["sql_reservations"][0]["token"] == crashed_sql["token"]
-                    assert after_crash["sql_outstanding_reserved_bytes"] > 0
+                    assert after_crash['sql_reservations']==[] and after_crash['sql_outstanding_reserved_bytes']==0
+                    assert after_crash['named_pin_scratch']['allocated_bytes']==crashed_scratch.stat().st_blocks*512
                     assert after_crash["pin_payload_bytes"] == pin_bytes
                 else:
                     fixture.require(second_cli("--stop"), "stopping second storage allocator")
@@ -7638,17 +9238,15 @@ def child(root, runtime, container):
                 assert not budget_status()["namespace_reservations"]
                 assert not (database.parent / (".namespace-lease-" + crashed_namespace["token"])).exists()
                 print("PASS: killed anonymous-scratch owner leaves full ceiling charged through cold restart after actual unlinked file death; active/wrong token cannot release; explicit inactive token release succeeds offline and retains dirty/pin/orphan exports", flush=True)
-            if crashed_sql is not None:
-                cold_sql = cold["sql_reservations"][0]
-                assert cold_sql["token"] == crashed_sql["token"]
-                assert cold_sql["outstanding_bytes"] == max(0, cold_sql["ceiling_bytes"] - cold["state_sqlite"]["allocated_bytes"])
+            if crashed_download is not None:
+                assert cold['sql_reservations']==[] and cold['sql_outstanding_reserved_bytes']==0
                 assert hashlib.sha256(crashed_scratch.read_bytes()).digest() == crashed_hash
                 assert cli("--release-storage-reservation", "state", "0" * 32).returncode != 0
-                fixture.require(cli("--release-storage-reservation", "state", crashed_sql["token"]), "explicitly releasing inactive inspected reservation without keyring/DAV")
+                assert cli('--release-storage-reservation','state',crashed_download).returncode!=0,'allowance release removed a named download'
                 assert budget_status()["sql_reservations"] == []
                 assert hashlib.sha256(crashed_scratch.read_bytes()).digest() == crashed_hash
                 assert budget_status()["named_pin_scratch"]["allocated_bytes"] == crashed_scratch.stat().st_blocks * 512
-                print("PASS: killed pin owner leaves durable charged reservation and named scratch across cold restart; token-checked inactive release removes only allowance, never scratch/pin/dirty/orphan data", flush=True)
+                print("PASS: killed downloading pin owner leaves named scratch charged across cold restart, no State allowance/lease or automatic expiry; wrong or scratch token cannot delete scratch/pin/dirty/orphan data", flush=True)
             fixture.require(cli("--disable-storage-limits"), "disabling persisted policy after cold restart")
             assert json.loads(fixture.require(cli("--storage-limits"), "showing cold disabled policy").stdout)["limits"] is None
             assert budget_status()["staging_byte_limit"] == 4 * 1024 * 1024 * 1024
@@ -9003,6 +10601,147 @@ def child(root, runtime, container):
                 def receipt_row(name):
                     with sqlite3.connect(database) as db:
                         return db.execute("SELECT v.operation_id,v.digest,v.size,v.version,v.verified_offset FROM upload_verifications v JOIN operation_journal j ON j.id=v.operation_id WHERE j.path=?", (json.dumps([name], separators=(",", ":")),)).fetchone()
+                if os.environ.get('CIRRUS_TEST_RETAINED_SH_OWNER'):
+                    # Both initial Spaces belong to the primary, not the new
+                    # peer. Capture the explicit callback/Space for each mount.
+                    owner_cleanup_mounts.extend((
+                        (daemon,cli,('--unmount-space',url,project),reservation_mount),
+                        (daemon,cli,('--unmount-space',url,space),mountpoint),
+                    ))
+                    lock=database.parent/'account.lock'
+                    def file_helper(path, writable=False):
+                        # The HTTP/D-Bus bridge must never hold a FUSE fd:
+                        # fork/exec closes its inherited copy and sends FLUSH,
+                        # which can wait behind the deliberately paused rename.
+                        process=subprocess.Popen([sys.executable,'-u','-c',
+                            "import os,sys\nfd=os.open(sys.argv[1],os.O_RDWR if sys.argv[2]=='rw' else os.O_RDONLY)\nprint('ready',flush=True)\nfor line in sys.stdin:\n try:\n  command,_,value=line.strip().partition(' ')\n  if command=='read':print('read:'+os.pread(fd,100,0).hex(),flush=True)\n  else:\n   n=os.pwrite(fd,bytes.fromhex(value),0);os.fsync(fd);print('write:'+str(n),flush=True)\n except OSError as error:print('error:'+str(error.errno),flush=True)\nos.close(fd)\n",
+                            str(path),'rw' if writable else 'r'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+                        owner_file_helpers.append(process)
+                        ticks=Path(f'/proc/{process.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+                        print(f'OWNED owner file helper: root={root} runtime={runtime} container={container} pid={process.pid} start_ticks={ticks}',flush=True)
+                        assert process.stdout.readline().strip()=='ready'
+                        return process
+                    def file_command(process,command):
+                        operation=command.partition(' ')[0]
+                        print(f'DIAGNOSTIC owner helper request: pid={process.pid} operation={operation}',flush=True)
+                        process.stdin.write(command+'\n');process.stdin.flush()
+                        response=process.stdout.readline().strip()
+                        print(f'DIAGNOSTIC owner helper response: pid={process.pid} operation={operation} response={response!r} returncode={process.poll()}',flush=True)
+                        return response
+                    def close_helper(process):
+                        process.stdin.close();process.wait(timeout=10)
+                        assert process.returncode==0
+                    def mode():
+                        rows=[line.split() for line in Path('/proc/locks').read_text().splitlines() if 'FLOCK' in line and f' {daemon.pid} ' in line and line.split()[5].endswith(':'+str(lock.stat().st_ino))]
+                        return [row[3] for row in rows]
+                    def retained_state():
+                        with sqlite3.connect(database) as db:return {t:db.execute('SELECT * FROM '+t+' ORDER BY rowid').fetchall() for t in ('pins','files','chunks','pin_copies','dirty_roots','dirty_bases','operation_journal','operation_parents')}
+                    fixture.require(cli('--pin-space',url,space,'/file.bin'),'pinning peer candidate original')
+                    fixture.require(cli('--evict-space',url,space,'/'),'evicting owner fixture cache')
+                    stage_auth('auth-receipt',b'one successful receipt across unsaved rotation')
+                    assert auth_get_entered.wait(timeout=30),'receipt GET barrier absent'
+                    # Cache a genuine foreground session in the local-tree
+                    # caller before automatic refresh clears the shared cache.
+                    os.mkdir(mountpoint/'owner-local')
+                    with open(mountpoint/'owner-local/kept','xb',buffering=0) as writer:writer.write(b'acknowledged local bytes');os.fsync(writer.fileno())
+                    held=file_helper(mountpoint/'owner-local/kept')
+                    session_window=root/'owner-session';persisted=root/'owner-persisted';exclusive=root/'owner-exclusive'
+                    session_window.touch(mode=0o600);results=[]
+                    def rename_owner():
+                        try:os.rename(mountpoint/'owner-local',mountpoint/'owner-moved');results.append('renamed')
+                        except OSError as error:results.append(error.errno)
+                    renamer=threading.Thread(target=rename_owner);renamer.start()
+                    await_condition(lambda:session_window.with_suffix('.waiting').exists(),'local caller did not cache its session',timeout=10)
+                    auth_get_continue.set()
+                    assert auth_refresh_entered.wait(timeout=15),'automatic rotation was not admitted'
+                    before_persist=root/'owner-before-persist';before_persist.touch(mode=0o600)
+                    # Let the actual cached caller wait for the admitted
+                    # automatic turn, rather than spending its short session
+                    # inspection barrier on real Secret Service locking.
+                    session_window.unlink()
+                    auth_refresh_continue.set()
+                    await_condition(lambda:'awaiting keyring persistence' in (root/'daemon.log').read_text(),'rotation did not retain failed persistence',timeout=20)
+                    assert mode()==['READ'],mode()
+                    owner_snapshot('owner-unsaved-sh')
+                    bus_owner=fixture.require(fixture.run(['gdbus','call','--session','--dest','org.freedesktop.DBus','--object-path','/org/freedesktop/DBus','--method','org.freedesktop.DBus.GetConnectionUnixProcessID','org.cirrusdrive.AccountOperation']),'checking unsaved credential bus owner')
+                    assert str(daemon.pid) in bus_owner.stdout,bus_owner.stdout
+                    print('KERNEL OWNERSHIP: failed automatic rotation retained READ flock',flush=True)
+                    stopped=cli('--stop');assert stopped.returncode!=0 and 'await keyring persistence' in stopped.stderr,stopped
+                    assert daemon.poll() is None
+                    # Unlock the real keyring without changing its stored token.
+                    fixture.stop_process(keyring);keyring=fixture.keyring_start()
+                    fenced=json.loads(fixture.require(fixture.run(['secret-tool','lookup','application','cirrus-drive','instance',url]),'reading durable refresh fence').stdout)
+                    assert fenced['refresh_in_progress'] and fenced['refresh_token']!=auth_refresh[0]
+                    await_condition(lambda:before_persist.with_suffix('.waiting').exists(),'cached caller did not retain the automatic SH guard',timeout=10)
+                    persisted.touch(mode=0o600);before_persist.unlink()
+                    await_condition(lambda:persisted.with_suffix('.waiting').exists(),'foreground did not persist retained rotation',timeout=15)
+                    assert mode()==['READ'],mode()
+                    owner_snapshot('owner-persisted-sh')
+                    stored=json.loads(fixture.require(fixture.run(['secret-tool','lookup','application','cirrus-drive','instance',url]),'checking exact saved rotation').stdout)
+                    assert not stored['refresh_in_progress'] and stored['refresh_token']==auth_refresh[0] and stored['access_token']==auth_token[0]
+                    peer_runtime=runtime/'owner-peer';peer_runtime.mkdir(mode=0o700)
+                    registration=root/'owner-registration'
+                    peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_ROOT_REGISTRATION_ADMISSION_WINDOW=str(registration))
+                    with (root/'owner-peer.log').open('w') as log:second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                    def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
+                    second_cli=peer_cli # Shared failure cleanup must address this peer's runtime.
+                    await_condition(lambda:peer_cli('--status').returncode==0,'owner peer did not start',timeout=10)
+                    ticks=Path(f'/proc/{second_daemon.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+                    print(f'OWNED retained SH peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}',flush=True)
+                    peer_mount=root/'owner-peer-mount';peer_mount.mkdir(mode=0o700)
+                    fixture.require(peer_cli('--mount-offline-writable-space',url,space,peer_mount),'mounting actual SH staging peer')
+                    owner_cleanup_mounts.append((second_daemon,peer_cli,('--unmount-space',url,space),peer_mount))
+                    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+                        parts=line.split()
+                        if parts[4]==str(peer_mount):print(f'OWNED owner peer mount: id={parts[0]} path={parts[4]} source={parts[parts.index("-")+2]}',flush=True)
+                    peer_file=file_helper(peer_mount/'file.bin',True);registration.touch(mode=0o600);writes=[]
+                    def peer_write():
+                        writes.append(file_command(peer_file,'write '+b'PEER'.hex()))
+                    writer=threading.Thread(target=peer_write);writer.start()
+                    await_condition(lambda:registration.with_suffix('.waiting').exists(),'real SH peer never reached unregistered candidate',timeout=10)
+                    owner_snapshot('owner-peer-unregistered')
+                    saved=retained_state();persisted.unlink();renamer.join(timeout=15)
+                    assert not renamer.is_alive() and len(results)==1 and results[0]!='renamed',results
+                    assert retained_state()==saved,'shared-owner refusal changed roots/parents/pins/journal'
+                    held_response=file_command(held,'read')
+                    assert held_response=='read:'+b'acknowledged local bytes'.hex(),held_response
+                    # Fresh EX must also refuse while the peer staging turn
+                    # still owns SH, without upgrading or publishing a path.
+                    results.clear();rename_owner();assert results and results[0]!='renamed',results
+                    assert retained_state()==saved
+                    registration.unlink();writer.join(timeout=15);assert not writer.is_alive() and writes==['write:4'],writes
+                    exclusive.touch(mode=0o600);results.clear();renamer=threading.Thread(target=rename_owner);renamer.start()
+                    await_condition(lambda:exclusive.with_suffix('.waiting').exists(),'retry did not prove EX',timeout=15)
+                    assert mode()==['WRITE'],mode()
+                    owner_snapshot('owner-fresh-ex')
+                    with lock.open('rb') as peer_lock:
+                        try:fcntl.flock(peer_lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                        except BlockingIOError:pass
+                        else:raise AssertionError('proven EX still admitted peer SH')
+                    print('KERNEL OWNERSHIP: retry holds WRITE flock; actual peer SH denied',flush=True)
+                    saved=retained_state()
+                    denied=file_command(peer_file,'write '+b'NOPE'.hex())
+                    assert denied in {f'error:{error}' for error in (errno.EIO,errno.EBUSY,errno.EAGAIN)},denied
+                    assert retained_state()==saved
+                    exclusive.unlink();renamer.join(timeout=15);assert not renamer.is_alive() and results==['renamed'],results
+                    held_response=file_command(held,'read')
+                    assert held_response=='read:'+b'acknowledged local bytes'.hex(),held_response
+                    close_helper(held);close_helper(peer_file)
+                    assert read_file(mountpoint/'owner-moved/kept')==b'acknowledged local bytes'
+                    fixture.require(peer_cli('--unmount-space',url,space),'unmounting exact owner peer')
+                    fixture.require(peer_cli('--stop'),'stopping exact owner peer');second_daemon.wait(timeout=10)
+                    await_condition(lambda:state(['auth-receipt'])=='synced','receipt did not resume safely')
+                    await_condition(lambda:state(['owner-moved','kept'])=='synced','local retry did not sync')
+                    assert auth_rotations[0]==1 and auth_counts['auth-receipt']['PUT']==1
+                    assert lab.upstream(container,'GET',base+'/owner-moved/kept')[2]==b'acknowledged local bytes'
+                    print('PASS: real automatic rotation/locked Secret Service retains SH and unsaved credential bus fence; shutdown refuses; restored persistence under SH cannot authorize local tree transformation, real peer candidate remains safe; fresh EX refuses live peer then excludes kernel SH/staging, retry/handles/parents/receipt exact with one rotation/PUT',flush=True)
+                    return
+                # These two mounts belong to the primary, not second_daemon.
+                # Retain exact Space callbacks for failure cleanup as in G1.
+                owner_cleanup_mounts.extend((
+                    (daemon, cli, ('--unmount-space', url, project), reservation_mount),
+                    (daemon, cli, ('--unmount-space', url, space), mountpoint),
+                ))
                 payload = b"successful PUT exact auth receipt" * 5000
                 stage_auth("auth-receipt", payload)
                 assert auth_get_entered.wait(timeout=30), "successful upload never entered GET verification"
@@ -9011,14 +10750,36 @@ def child(root, runtime, container):
                 auth_get_continue.set()
                 assert auth_refresh_entered.wait(timeout=15), "GET401 never reached guarded refresh"
                 with (database.parent / "account.lock").open("rb") as ownership:
+                    lock_stat = os.fstat(ownership.fileno())
+                    lock_key = f"{os.major(lock_stat.st_dev):02x}:{os.minor(lock_stat.st_dev):02x}:{lock_stat.st_ino}"
+                    owners = [line.split() for line in Path('/proc/locks').read_text().splitlines()]
+                    modes = [row[3] for row in owners if len(row) >= 8 and row[1] == 'FLOCK'
+                             and row[4] == str(daemon.pid) and row[5] == lock_key]
+                    assert modes and set(modes) == {'READ'}, ('automatic refresh principal owner', modes)
                     try:
                         fcntl.flock(ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         pass
                     else:
-                        raise AssertionError("refresh did not retain exclusive cross-process account ownership")
+                        raise AssertionError("refresh did not exclude an exclusive principal writer")
+                    # A shared observer must actually enter; our own SH cannot
+                    # be what caused the preceding EX-denial positive control.
+                    fcntl.flock(ownership, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    fcntl.flock(ownership, fcntl.LOCK_UN)
+                bus = ['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                       '--object-path', '/org/freedesktop/DBus', '--method']
+                credential_name = 'org.cirrusdrive.AccountOperation'
+                owner = fixture.require(fixture.run(bus + ['org.freedesktop.DBus.GetNameOwner', credential_name]),
+                                        'finding automatic credential bus owner').stdout.split("'")[1]
+                owner_pid = fixture.require(fixture.run(bus + ['org.freedesktop.DBus.GetConnectionUnixProcessID', owner]),
+                                            'identifying automatic credential bus owner').stdout
+                assert int(owner_pid.split('uint32 ', 1)[1].split(',', 1)[0]) == daemon.pid
+                competing = fixture.require(fixture.run(bus + ['org.freedesktop.DBus.RequestName', credential_name, '4']),
+                                            'checking credential writer exclusion').stdout
+                assert int(competing.split('uint32 ', 1)[1].split(',', 1)[0]) == 3, competing
                 fenced = json.loads(fixture.require(fixture.run(["secret-tool", "lookup", "application", "cirrus-drive", "instance", url]), "inspecting disposable refresh fence").stdout)
                 assert fenced["refresh_in_progress"] and fenced["refresh_token"] == auth_refresh[0]
+                print('AUTH OWNERSHIP: daemon READ principal, SH admitted/EX refused, daemon credential-bus owner excludes competing writer, durable pre-POST refresh fence', flush=True)
                 auth_refresh_continue.set()
                 await_condition(lambda: state(["auth-receipt"]) == "synced", "GET401 receipt did not recover")
                 assert auth_rotations[0] == 1 and auth_counts["auth-receipt"]["PUT"] == 1
@@ -9080,7 +10841,7 @@ def child(root, runtime, container):
                 assert stored["refresh_in_progress"]
                 time.sleep(3)
                 assert auth_rotations[0] == 5 and "refresh" in local_status(project)["cause"]
-                print("PASS: real automatic successful-PUT GET401 exact SHA/version continuation with exclusive ownership and persisted one-use refresh rotation; Graph/DAV401 bounded recovery; applied-mutation401 one PUT/uncertainty across restart; independent Space progress; repeated401 bounded Attention/receipt restart; revoked refresh durable fence", flush=True)
+                print("PASS: real automatic successful-PUT GET401 exact SHA/version continuation with shared principal/exclusive credential-bus fencing and persisted one-use refresh rotation; Graph/DAV401 bounded recovery; applied-mutation401 one PUT/uncertainty across restart; independent Space progress; repeated401 bounded Attention/receipt restart; revoked refresh durable fence", flush=True)
                 return
             if os.environ.get("CIRRUS_TEST_NAMESPACE_POLL") or os.environ.get("CIRRUS_TEST_NAMESPACE_POLL_PEER"):
                 peer_poll = bool(os.environ.get("CIRRUS_TEST_NAMESPACE_POLL_PEER"))
@@ -12255,7 +14016,7 @@ def child(root, runtime, container):
             with sqlite3.connect(database) as db:
                 assert db.execute("PRAGMA user_version").fetchone() == (14,)
                 assert db.execute("SELECT state FROM operation_journal WHERE id=?", (row[0],)).fetchone() == ("pending",)
-                db.execute("PRAGMA user_version=17")
+                db.execute("PRAGMA user_version=19")
                 assert db.execute("DELETE FROM operation_parents WHERE operation_id=?", (row[0],)).rowcount == 1
             daemon = start()
             assert cli("--sync", url).returncode != 0, "missing parent evidence was silently skipped"
@@ -13601,6 +15362,41 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_INFLIGHT_WRITE"):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
+            # BEGIN OPTIONAL G10 CLI EXPORT
+            if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
+                export_dir = Path(os.environ["CIRRUS_TEST_G10_EXPORT_DIR"])
+                assert export_dir.is_absolute()
+                export_dir.mkdir(mode=0o700)
+                assert export_dir.stat().st_uid == os.getuid() and stat.S_IMODE(export_dir.stat().st_mode) == 0o700
+
+                def g10_rows():
+                    retained = []
+                    while True:
+                        page = [json.loads(line) for line in fixture.require(
+                            cli("--retained-staged", url, len(retained)), "G10 listing retained staged versions").stdout.splitlines()]
+                        if not page:
+                            return [row for row in retained if row["path"] == ["uncertain-edit"]]
+                        retained.extend(page)
+                        assert len(retained) <= 64, "unexpected fixture journal growth"
+
+                def g10_export_pair(phase, states, previous=None):
+                    retained = g10_rows()
+                    assert [row["state"] for row in retained] == states, retained
+                    assert len(retained) == 2 and retained[0]["selector"] != retained[1]["selector"]
+                    if previous is not None:
+                        assert [(r["id"], r["staged_file"], r["selector"]) for r in retained] == previous
+                    for row, expected, label in zip(retained, (b"first!", b"second"), ("predecessor", "successor")):
+                        destination = export_dir / (phase + "-" + label)
+                        result = fixture.require(cli("--export-staged", url, row["id"], row["selector"], destination), "G10 exporting " + label)
+                        assert "remote outcome not asserted" in result.stdout
+                        assert destination.read_bytes() == expected, (phase, label)
+                        info = destination.lstat()
+                        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid() and info.st_nlink == 1
+                    with (export_dir / (phase + ".json")).open("x") as receipt:
+                        json.dump(retained, receipt, indent=2)
+                    print("G10 CLI: " + phase + " exact predecessor=first! successor=second; private exports", flush=True)
+                    return [(r["id"], r["staged_file"], r["selector"]) for r in retained]
+            # END OPTIONAL G10 CLI EXPORT
             with open(mountpoint / "write-inflight", "w+b", buffering=0) as writer:
                 writer.write(b"first!")
                 os.fsync(writer.fileno())
@@ -13707,6 +15503,10 @@ def child(root, runtime, container):
                 blocked_put[0] = None
                 assert uncertain_puts[0] == 1
                 assert lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"first!"
+            # BEGIN OPTIONAL G10 CLI EXPORT
+            if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
+                g10_selection = g10_export_pair("before-restart", ["uncertain", "pending"])
+            # END OPTIONAL G10 CLI EXPORT
             fixture.require(cli("--unmount"), "unmounting with uncertain upload and later write")
             mounted = False
             fixture.require(cli("--stop"), "stopping with uncertain upload and later write")
@@ -13720,6 +15520,25 @@ def child(root, runtime, container):
                 rows = db.execute("SELECT staged_file,state FROM operation_journal WHERE path=? ORDER BY id", ('["uncertain-edit"]',)).fetchall()
                 assert [row[1] for row in rows] == ["uncertain", "pending"], rows
                 assert db.execute("SELECT count(*) FROM write_dependencies").fetchone()[0] == 1
+            # BEGIN OPTIONAL G10 CLI EXPORT
+            if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
+                g10_export_pair("after-restart", ["uncertain", "pending"], g10_selection)
+                retained = g10_rows()
+                mismatch = export_dir / "wrong-selector"
+                refused = cli("--export-staged", url, retained[0]["id"], retained[1]["selector"], mismatch)
+                assert refused.returncode != 0 and "changed; list it again" in refused.stderr and not mismatch.exists(), refused
+                selection_refusal = {"exit": refused.returncode, "stderr": refused.stderr}
+                collision = export_dir / "existing-user-file"
+                collision.write_bytes(b"existing destination must survive")
+                info = collision.stat()
+                refused = cli("--export-staged", url, retained[0]["id"], retained[0]["selector"], collision)
+                assert refused.returncode != 0 and "destination exists or cannot be created" in refused.stderr, refused
+                assert collision.read_bytes() == b"existing destination must survive" and collision.stat().st_ino == info.st_ino and collision.stat().st_mode == info.st_mode
+                assert [(r["id"], r["staged_file"], r["selector"]) for r in g10_rows()] == g10_selection
+                with (export_dir / "refusals.json").open("x") as receipt:
+                    json.dump({"selector": selection_refusal, "destination": {"exit": refused.returncode, "stderr": refused.stderr}, "source_selections_unchanged": True}, receipt, indent=2)
+                print("G10 CLI: mismatched selection and existing destination refused; source selections unchanged", flush=True)
+            # END OPTIONAL G10 CLI EXPORT
             fixture.require(cli("--acknowledge", url, rows[0][0]), "acknowledging inspected uncertain upload")
             with sqlite3.connect(database) as db:
                 rows = db.execute("SELECT staged_file,state FROM operation_journal WHERE path=? ORDER BY id", ('["uncertain-edit"]',)).fetchall()
@@ -13729,6 +15548,87 @@ def child(root, runtime, container):
             assert cli("--sync", url).returncode != 0 and uncertain_puts[0] == 1
             assert lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"first!"
             print("PASS: uncertain upload and later edit remain fenced across restart", flush=True)
+            # BEGIN OPTIONAL G10 CLI EXPORT
+            if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
+                g10_export_pair("after-acknowledgement", ["resolved", "conflict"], g10_selection)
+                fixture.require(cli("--pin", url, "/overwrite.bin"), "G10 retaining a real known remote file")
+                pins = [json.loads(line) for line in fixture.require(cli("--retained-pins", url), "G10 listing active retained pins").stdout.splitlines()]
+                assert any(pin["space"] == space and pin["root"] == ["overwrite.bin"] for pin in pins)
+                files = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/overwrite.bin"), "G10 listing exact retained file selection").stdout.splitlines()]
+                assert len(files) == 1 and files[0]["path"] == ["overwrite.bin"]
+                destination = export_dir / "active-retained-pin"
+                fixture.require(cli("--export-retained", url, space, "/overwrite.bin", "/overwrite.bin", files[0]["selector"], destination), "G10 exporting active retained pin")
+                assert destination.read_bytes() == contents["overwrite.bin"]
+                assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+                with (export_dir / "active-retained-pin.json").open("x") as receipt:
+                    json.dump({"pins": pins, "files": files}, receipt, indent=2)
+                print("PASS: G10 real CLI exact staged predecessor/successor before restart, after restart and acknowledgement; selector/destination safety; exact active retained pin export", flush=True)
+                # BEGIN OPTIONAL G10 COPIES
+                if os.environ.get("CIRRUS_TEST_G10_COPIES"):
+                    former, current = b"former pinned A copy", b"new active B from local tree"
+                    assert lab.upstream(container, "MKCOL", base + "/g10-copy-target")[0] == 201
+                    assert lab.upstream(container, "PUT", base + "/g10-copy-target/item", former)[0] == 201
+                    fixture.require(cli("--pin", url, "/g10-copy-target"), "G10 pinning former A tree")
+                    assert lab.upstream(container, "DELETE", base + "/g10-copy-target/item")[0] == 204
+                    assert lab.upstream(container, "PUT", base + "/g10-original", b"Q" * 262144)[0] == 201
+                    fixture.require(cli("--unmount"), "G10 saving final replacement observations without mount refresh")
+                    mounted = False
+                    fixture.require(cli("--ls", url), "G10 saving real root and never-read original metadata")
+                    fixture.require(cli("--ls", url, "/g10-copy-target"), "G10 saving actual empty replacement target")
+                    fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "G10 same-path writable offline replacement mount")
+                    mounted = True
+                    os.mkdir(mountpoint / "g10-copy-source")
+                    with open(mountpoint / "g10-copy-source/item", "xb", buffering=0) as writer:
+                        assert writer.write(current) == len(current)
+                        os.fsync(writer.fileno())
+                    os.rename(mountpoint / "g10-copy-source", mountpoint / "g10-copy-target")
+                    copies = [json.loads(line) for line in fixture.require(cli("--pin-copies", url), "G10 listing real displaced pin copies").stdout.splitlines()]
+                    selected_copy = [row for row in copies if row["space"] == space and row["root"] == ["g10-copy-target"]]
+                    assert len(selected_copy) == 1
+                    copy_id = selected_copy[0]["id"]
+                    entries = [json.loads(line) for line in fixture.require(cli("--pin-copy-entries", url, space, copy_id), "G10 selecting former A copy entry").stdout.splitlines()]
+                    entry = next(row for row in entries if row["kind"] == "file" and row["path"] == ["g10-copy-target", "item"])
+                    fixture.require(cli("--export-pin-copy", url, space, copy_id, "/g10-copy-target/item", entry["selector"], export_dir / "pin-copy-old"), "G10 exporting former A copy")
+                    assert (export_dir / "pin-copy-old").read_bytes() == former
+                    fixture.require(cli("--unmount"), "G10 closing offline replacement mount")
+                    mounted = False
+                    fixture.require(cli("--mount", url, mountpoint), "G10 resuming existing online RW mount")
+                    mounted = True
+                    assert cli("--sync", url).returncode != 0, "original unrelated conflict must remain visible"
+                    assert uncertain_puts[0] == 1 and lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"first!"
+                    assert lab.upstream(container, "GET", base + "/g10-copy-target/item")[2] == current
+                    fixture.require(cli("--pin", url, "/g10-copy-target"), "G10 pinning new active B tree")
+                    active = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/g10-copy-target"), "G10 selecting new active B").stdout.splitlines()]
+                    assert len(active) == 1 and active[0]["path"] == ["g10-copy-target", "item"]
+                    fixture.require(cli("--export-retained", url, space, "/g10-copy-target", "/g10-copy-target/item", active[0]["selector"], export_dir / "pin-copy-active-new"), "G10 exporting new active B")
+                    assert (export_dir / "pin-copy-active-new").read_bytes() == current
+                    entries_after = [json.loads(line) for line in fixture.require(cli("--pin-copy-entries", url, space, copy_id), "G10 reselecting former A after repin").stdout.splitlines()]
+                    assert entries_after == entries
+                    fixture.require(cli("--export-pin-copy", url, space, copy_id, "/g10-copy-target/item", entry["selector"], export_dir / "pin-copy-old-after-repin"), "G10 exporting unchanged former A after repin")
+                    assert (export_dir / "pin-copy-old-after-repin").read_bytes() == former
+                    copies_after = [json.loads(line) for line in fixture.require(cli("--pin-copies", url), "G10 confirming retained copy listing after exports").stdout.splitlines()]
+                    assert copies_after == copies
+                    with (export_dir / "copies.json").open("x") as receipt:
+                        json.dump({"copies": copies, "entries": entries, "active": active, "entries_after": entries_after}, receipt, indent=2)
+                    # Never pin/read the complete original or run sync after this
+                    # partial edit. Local-only export must not fetch its gaps.
+                    with open(mountpoint / "g10-original", "r+b", buffering=0) as writer:
+                        assert os.pwrite(writer.fileno(), b"LOC", 0) == 3
+                        os.fsync(writer.fileno())
+                        missing_rows = [json.loads(line) for line in fixture.require(cli("--retained-staged", url), "G10 listing naturally incomplete partial edit").stdout.splitlines()]
+                        missing = [row for row in missing_rows if row["path"] == ["g10-original"]]
+                        assert len(missing) == 1 and missing[0]["selector"] and missing[0]["size"] == 262144
+                        unavailable = root / "tmp/g10-unavailable-export"
+                        refusal = cli("--export-staged", url, missing[0]["id"], missing[0]["selector"], unavailable)
+                        assert refusal.returncode != 0 and "exact original content base is unavailable locally" in refusal.stderr, refusal
+                        after = [json.loads(line) for line in fixture.require(cli("--retained-staged", url), "G10 reselecting incomplete source after refusal").stdout.splitlines()]
+                        assert [row for row in after if row["id"] == missing[0]["id"]] == missing
+                        assert os.pread(writer.fileno(), 3, 0) == b"LOC"
+                        with (export_dir / "missing-original.json").open("x") as receipt:
+                            json.dump({"selection": missing[0], "exit": refusal.returncode, "stderr": refusal.stderr, "retained_prefix_hex": b"LOC".hex(), "source_selection_unchanged": True, "output_exists": unavailable.exists(), "partial_output_size": unavailable.stat().st_size if unavailable.exists() else None}, receipt, indent=2)
+                    print("PASS: G10 immutable former pin copy remains exact after new active repin; naturally unavailable original export refuses with selection and local edit retained", flush=True)
+                # END OPTIONAL G10 COPIES
+            # END OPTIONAL G10 CLI EXPORT
             return
         if os.environ.get("CIRRUS_TEST_OPEN_SYNC_RACE"):
             marker = root / "write-sync-window"
@@ -14735,6 +16635,8 @@ def child(root, runtime, container):
         daemon.wait(timeout=5)
         print("PASS: OpenCloud reads, pins, mounted writes and atomic saves, offline restart, sync and conflict", flush=True)
     finally:
+        for name in ('owner-session','owner-before-persist','owner-persisted','owner-exclusive','owner-registration'):
+            (root/name).unlink(missing_ok=True)
         if credential_bus_pid is not None:
             try:os.kill(credential_bus_pid,signal.SIGCONT)
             except ProcessLookupError:pass
@@ -14772,21 +16674,38 @@ def child(root, runtime, container):
                         print("Parent identities:", db.execute("SELECT * FROM operation_parents ORDER BY operation_id").fetchall(), file=sys.stderr)
         # A failed graceful unmount must not bypass termination of either
         # owned daemon/keyring or the source-checked fallback mount cleanup.
-        for active, process, client in ((mounted, daemon, cli), (second_mounted, second_daemon, locals().get("second_cli"))):
+        # The G1 helpers own open FUSE descriptors: finish their protocol and
+        # close them before asking either daemon to unmount its exact Spaces.
+        for helper in owner_file_helpers:
+            if helper.poll() is None:
+                try:
+                    helper.stdin.close();helper.wait(timeout=10)
+                    if helper.returncode:
+                        cleanup_errors.append(f"owner helper {helper.pid} exited {helper.returncode}")
+                except (OSError,subprocess.TimeoutExpired) as error:
+                    cleanup_errors.append(f"owner helper {helper.pid} close failed: {type(error).__name__}")
+                    fixture.stop_process(helper)
+        cleanup_mounts = ([(True,process,client,args,path) for process,client,args,path in owner_cleanup_mounts]
+            if owner_cleanup_mounts else [(mounted,daemon,cli,('--unmount',),mountpoint),
+                (second_mounted,second_daemon,locals().get('second_cli'),('--unmount',),reservation_mount)])
+        for active, process, client, args, path in cleanup_mounts:
             if active and process and process.poll() is None:
                 try:
-                    result = client("--unmount")
+                    if owner_cleanup_mounts:print(f'DIAGNOSTIC owner cleanup request: pid={process.pid} mount={path} command={args[0]}',flush=True)
+                    result = client(*args)
+                    if owner_cleanup_mounts:print(f'DIAGNOSTIC owner cleanup response: pid={process.pid} mount={path} returncode={result.returncode}',flush=True)
                     if result.returncode:
-                        cleanup_errors.append(f"unmount failed: {result.stderr.strip()}")
+                        cleanup_errors.append(f"unmount failed at {path}: {result.stderr.strip()}")
                 except subprocess.TimeoutExpired:
-                    cleanup_errors.append("owned fixture unmount timed out")
+                    cleanup_errors.append(f"owned fixture unmount timed out at {path} pid={process.pid}")
         fixture.stop_process(second_daemon)
         fixture.stop_process(daemon)
+        for process in owner_file_helpers:fixture.stop_process(process)
         for record_path in runtime.rglob("cirrus-drive.mount-*"):
             record = json.loads(record_path.read_text())
             for line in Path("/proc/self/mountinfo").read_text().splitlines():
                 parts = line.split()
-                if ("-" in parts and parts[4] in (str(mountpoint), str(reservation_mount))
+                if ("-" in parts and parts[4] in (str(mountpoint), str(reservation_mount), str(root/'owner-peer-mount'))
                         and parts[parts.index("-") + 1:parts.index("-") + 3]
                         == ["fuse.cirrus-drive", record.get("source")]):
                     result = fixture.run(["fusermount3", "-u", "-z", "--", parts[4]])

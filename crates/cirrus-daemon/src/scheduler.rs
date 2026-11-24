@@ -92,7 +92,7 @@ impl Scheduler {
     pub(crate) fn start(
         accounts: Arc<Accounts>,
         busy: Arc<AtomicBool>,
-        mounts: Arc<Mutex<Vec<cirrus_fuse::Mounted>>>,
+        mounts: Arc<Mutex<crate::local::MountRegistry>>,
         enabled: bool,
     ) -> io::Result<Self> {
         let control = Arc::new(Control {
@@ -125,7 +125,7 @@ impl Scheduler {
             .name("cirrus-sync".into())
             .spawn(move || {
                 let mut after: Option<(String, String)> = None;
-                let mut leader = None;
+                let mut leader: Option<cirrus_account::SchedulerGuard> = None;
                 let mut refreshed = Instant::now();
                 let mut mount_after = 0;
                 #[cfg(feature = "fault-injection")]
@@ -137,11 +137,20 @@ impl Scheduler {
                     }
                     if !worker.paused.load(Ordering::Acquire)
                         && worker.pending.load(Ordering::Acquire) == 0
-                        && let Ok(spaces) = worker.accounts.activated_spaces()
                     {
-                        if !spaces.is_empty() && leader.is_none() {
+                        // This preflight only avoids idle elections. Once elected,
+                        // enumerate again through the retained election capability.
+                        if leader.is_none() && worker.accounts.activated_spaces().is_ok_and(|spaces| !spaces.is_empty()) {
                             leader = worker.accounts.acquire_scheduler().ok();
                         }
+                        let mut election_failed = false;
+                        let spaces = match leader.as_ref().map(|guard| guard.activated_spaces(&worker.accounts)).transpose() {
+                            Ok(spaces) => spaces.unwrap_or_default(),
+                            Err(_) => {
+                                election_failed = true;
+                                Vec::new()
+                            }
+                        };
                         let next =
                             spaces
                                 .iter()
@@ -150,13 +159,14 @@ impl Scheduler {
                                     after.as_ref().is_some_and(|after| *key <= after)
                                 }))
                                 .find(|(instance, space)| {
-                                    leader.is_some()
+                                    !election_failed
+                                        && leader.is_some()
                                         && !worker.accounts.background_yield_requested()
                                         && !worker.stopping.load(Ordering::Acquire)
                                         && !worker.paused.load(Ordering::Acquire)
                                         && worker.pending.load(Ordering::Acquire) == 0
-                                        && worker.accounts.sync_status(instance, space).is_ok_and(
-                                            |status| {
+                                        && match leader.as_ref().expect("dispatcher election missing").sync_status(&worker.accounts, instance, space) {
+                                            Ok(status) => {
                                                 status.new_work
                                                     && !matches!(
                                                         status.phase,
@@ -164,7 +174,15 @@ impl Scheduler {
                                                             | cirrus_account::SyncPhase::Attention
                                                     )
                                             },
-                                        )
+                                            Err(_) => {
+                                                // A Space-specific status failure must
+                                                // not starve other Spaces. Recheck only
+                                                // through the same election capability.
+                                                election_failed = leader.as_ref().expect("dispatcher election missing")
+                                                    .activated_spaces(&worker.accounts).is_err();
+                                                false
+                                            }
+                                        }
                                 })
                                 .cloned();
                         if let Some((instance, space)) = next {
@@ -193,14 +211,16 @@ impl Scheduler {
                                     diagnostic_events += 1;
                                     eprintln!("cirrus lab scheduler diagnostic: time_ms={} begin space={space}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
                                 }
-                                let result = worker
-                                    .accounts
-                                    .automatic_sync_turn(&instance, &space);
+                                let result = leader.as_ref().expect("dispatcher election missing")
+                                    .automatic_sync_turn(&worker.accounts, &instance, &space);
                                 #[cfg(feature = "fault-injection")]
                                 if std::env::var_os("CIRRUS_TEST_AUTO_DIAGNOSTICS").is_some() && diagnostic_events < 1024 {
                                     diagnostic_events += 1;
                                     eprintln!("cirrus lab scheduler diagnostic: time_ms={} end space={space} result={result:?}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
                                 }
+                                election_failed = result.is_err()
+                                    && leader.as_ref().expect("dispatcher election missing")
+                                        .activated_spaces(&worker.accounts).is_err();
                                 progressed = result.unwrap_or(false);
                                 #[cfg(feature = "fault-injection")]
                                 if std::env::var_os("CIRRUS_TEST_DIRTY_RANGE").is_some() {
@@ -209,6 +229,13 @@ impl Scheduler {
                                 worker.accounts.invalidate_mount_metadata();
                                 drop(permit);
                             }
+                        }
+                        if election_failed {
+                            // Release the original OFD, never move/reflock it.
+                            // The normal bounded wait precedes fresh election.
+                            leader = None;
+                            after = None;
+                            progressed = false;
                         }
                     }
                     // One cached/viewed directory from one mount, outside the
@@ -222,6 +249,7 @@ impl Scheduler {
                     {
                         refreshed = Instant::now();
                         let handle = mounts.try_lock().ok().and_then(|mounts| {
+                            let mounts = mounts.ready().ok()?;
                             if mounts.is_empty() {
                                 return None;
                             }

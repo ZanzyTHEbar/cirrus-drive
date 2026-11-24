@@ -9,13 +9,15 @@ use std::sync::{
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 use rustix::{
-    fs::{self, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, Dir, FileType, Mode, OFlags},
     process,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{AccountError, offline, ownership};
+use crate::{AccountError, account_storage::StorageRoot, offline};
 
 pub(crate) mod limits;
 pub(crate) mod namespace;
@@ -27,6 +29,7 @@ pub use sql_reservation::SqlStorageReservation;
 const SCAN_LIMIT: u64 = 8192;
 const TRACK_LIMIT: usize = 1024;
 struct AnonymousFile {
+    root: StorageRoot,
     kind: AnonymousKind,
     file: Weak<std::fs::File>,
     namespace_token: Option<String>,
@@ -42,12 +45,17 @@ pub(crate) enum AnonymousKind {
 
 // Weak file references do not keep scratch storage alive, nor interfere with
 // DirectorySnapshot's Arc::get_mut uniqueness checks on its separate Storage.
-pub(crate) fn track(file: std::fs::File, kind: AnonymousKind) -> Arc<std::fs::File> {
+pub(crate) fn track(
+    root: &StorageRoot,
+    file: std::fs::File,
+    kind: AnonymousKind,
+) -> Arc<std::fs::File> {
     let file = Arc::new(file);
     if let Ok(mut live) = ANONYMOUS.lock() {
         live.retain(|entry| entry.file.strong_count() != 0);
         if live.len() < TRACK_LIMIT {
             live.push(AnonymousFile {
+                root: root.clone(),
                 kind,
                 file: Arc::downgrade(&file),
                 namespace_token: None,
@@ -63,23 +71,30 @@ pub(crate) fn track(file: std::fs::File, kind: AnonymousKind) -> Arc<std::fs::Fi
 
 // Snapshot teardown calls this after closing its file owner, before releasing
 // its durable allowance. Sampling references never outlive this registry lock.
-pub(crate) fn finish_namespace_observation(token: &str) -> Result<(), AccountError> {
+pub(crate) fn finish_namespace_observation(
+    root: &StorageRoot,
+    token: &str,
+) -> Result<(), AccountError> {
     let mut entries = ANONYMOUS.lock().map_err(|_| unavailable())?;
-    for entry in entries
-        .iter_mut()
-        .filter(|entry| entry.namespace_token.as_deref() == Some(token))
-    {
+    for entry in entries.iter_mut().filter(|entry| {
+        entry.root.identity() == root.identity() && entry.namespace_token.as_deref() == Some(token)
+    }) {
         entry.namespace_token = None;
     }
     Ok(())
 }
 
-pub(crate) fn bind_namespace(file: &Arc<std::fs::File>, token: &str) -> Result<(), AccountError> {
+pub(crate) fn bind_namespace(
+    root: &StorageRoot,
+    file: &Arc<std::fs::File>,
+    token: &str,
+) -> Result<(), AccountError> {
     let mut entries = ANONYMOUS.lock().map_err(|_| unavailable())?;
     let entry = entries
         .iter_mut()
         .find(|entry| {
-            matches!(entry.kind, AnonymousKind::Directory)
+            entry.root.identity() == root.identity()
+                && matches!(entry.kind, AnonymousKind::Directory)
                 && entry.file.as_ptr() == Arc::as_ptr(file)
         })
         .ok_or_else(unavailable)?;
@@ -199,15 +214,27 @@ impl StorageUsage {
 // database, which would release process-wide POSIX locks. Reuse the project's
 // held-directory procfs path and before/after inode/ownership validation.
 fn database(
-    dir: &impl AsFd,
-    name: &str,
+    root: &StorageRoot,
+    database: crate::sqlite_open::Database,
     app: i64,
     version: i64,
 ) -> Result<Option<Connection>, AccountError> {
+    let _gate = database.opening_gate().map_err(|_| unavailable())?;
+    let dir = root.directory();
+    let name = database.basename();
+    #[cfg(target_os = "linux")]
     let before = match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(rustix::io::Errno::NOENT) => return Ok(None),
         Err(_) => return Err(unavailable()),
+    };
+    #[cfg(target_os = "macos")]
+    let before = match database
+        .prepare_darwin(root, false)
+        .map_err(|_| unavailable())?
+    {
+        Some((stat, _)) => stat,
+        None => return Ok(None),
     };
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
         || before.st_uid != process::geteuid().as_raw()
@@ -216,6 +243,7 @@ fn database(
     {
         return Err(unavailable());
     }
+    #[cfg(target_os = "linux")]
     let proc = fs::openat2(
         fs::CWD,
         "/proc",
@@ -224,14 +252,28 @@ fn database(
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| unavailable())?;
+    #[cfg(target_os = "linux")]
     if fs::fstatfs(&proc).map_err(|_| unavailable())?.f_type != fs::PROC_SUPER_MAGIC {
         return Err(unavailable());
     }
+    #[cfg(target_os = "linux")]
+    database.check_auxiliaries(dir).map_err(|_| unavailable())?;
+    #[cfg(target_os = "linux")]
     let conn = Connection::open_with_flags(
         format!("/proc/self/fd/{}/{name}", dir.as_fd().as_raw_fd()),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|_| unavailable())?;
+    #[cfg(target_os = "macos")]
+    let conn = {
+        database
+            .check_darwin(root, &before)
+            .map_err(|_| unavailable())?;
+        database
+            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| unavailable())?
+    };
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
     conn.busy_timeout(Duration::from_secs(1))
         .map_err(|_| unavailable())?;
     let identity: i64 = conn
@@ -242,7 +284,13 @@ fn database(
         .map_err(|_| unavailable())?;
     let after = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| unavailable())?;
     if identity != app
-        || schema != version
+        || (schema != version
+            // Read-only accounting can inspect the supported pre-migration
+            // schema without upgrading or opening a second writer. Its payload
+            // tables are unchanged by the additive catalog migration.
+            && !(matches!(database, crate::sqlite_open::Database::State)
+                && matches!(schema, 17 | 18)
+                && version == offline::STATE_SCHEMA_VERSION))
         || (
             before.st_dev,
             before.st_ino,
@@ -259,24 +307,33 @@ fn database(
     {
         return Err(unavailable());
     }
+    #[cfg(target_os = "linux")]
+    database.check_auxiliaries(dir).map_err(|_| unavailable())?;
+    #[cfg(target_os = "macos")]
+    database
+        .check_darwin(root, &before)
+        .map_err(|_| unavailable())?;
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
     Ok(Some(conn))
 }
 
-pub(crate) fn status() -> Result<StorageStatus, AccountError> {
-    observe(&offline::storage_reservations()?, true)
+pub(crate) fn status_in(root: &StorageRoot) -> Result<StorageStatus, AccountError> {
+    observe(root, &offline::storage_reservations_in(root)?, true)
 }
 
-pub(crate) fn allocation_status(
+pub(crate) fn allocation_status_in(
+    root: &StorageRoot,
     reservations: &[(String, u64)],
 ) -> Result<StorageStatus, AccountError> {
-    observe(reservations, false)
+    observe(root, reservations, false)
 }
 
 fn observe(
+    root: &StorageRoot,
     reservations: &[(String, u64)],
     payload_counts: bool,
 ) -> Result<StorageStatus, AccountError> {
-    let dir = ownership::state_dir()?;
+    let dir = root.directory();
     let device = fs::fstat(&dir).map_err(|_| unavailable())?.st_dev;
     let mut result = StorageStatus {
         namespace_reservations: Vec::new(),
@@ -318,11 +375,18 @@ fn observe(
         clean_ranges: 0,
         filesystem_available_bytes: 0,
     };
-    match limits::view() {
+    match limits::view_in(root) {
         Ok(view) => result.storage_limits = Some(view),
         Err(error) => result.storage_limits_error = Some(error.to_string()),
     }
-    if payload_counts && let Some(conn) = database(&dir, "state.db", 0x4344_5231, 17)? {
+    if payload_counts
+        && let Some(conn) = database(
+            root,
+            crate::sqlite_open::Database::State,
+            0x4344_5231,
+            offline::STATE_SCHEMA_VERSION,
+        )?
+    {
         (result.pin_payload_bytes, result.pin_chunks) = conn
             .query_row(
                 "SELECT coalesce(sum(bytes),0),coalesce(sum(n),0) FROM (SELECT sum(length(body)) AS bytes,count(*) AS n FROM chunks UNION ALL SELECT sum(length(body)),count(*) FROM pin_copy_chunks)",
@@ -341,7 +405,9 @@ fn observe(
             .query_row("SELECT count(*) FROM dirty_roots", [], |row| row.get(0))
             .map_err(|_| unavailable())?;
     }
-    if payload_counts && let Some(conn) = database(&dir, "cache.db", 0x4344_4331, 2)? {
+    if payload_counts
+        && let Some(conn) = database(root, crate::sqlite_open::Database::Cache, 0x4344_4331, 2)?
+    {
         (result.clean_payload_bytes, result.clean_ranges) = conn
             .query_row(
                 "SELECT coalesce(sum(length(body)),0),count(*) FROM ranges",
@@ -396,12 +462,11 @@ fn observe(
                 && kind.is_empty()
                 && matches!(text, "staging" | "directory-snapshots")
             {
-                let child = fs::openat2(
+                let child = crate::ownership::open_private_file(
                     &directory,
-                    name,
+                    text,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                     Mode::empty(),
-                    ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
                 )
                 .map_err(|_| unavailable())?;
                 let actual = fs::fstat(&child).map_err(|_| unavailable())?;
@@ -411,6 +476,8 @@ fn observe(
                 {
                     return Err(unavailable());
                 }
+                #[cfg(target_os = "macos")]
+                crate::ownership::darwin_acl::check_directory(&child).map_err(|_| unavailable())?;
                 if seen.insert((stat.st_dev, stat.st_ino)) {
                     result.directories.record(&stat)?;
                 }
@@ -484,6 +551,7 @@ fn observe(
     let anonymous = ANONYMOUS.lock().map_err(|_| unavailable())?;
     let live = anonymous
         .iter()
+        .filter(|entry| entry.root.identity() == root.identity())
         .filter_map(|entry| {
             entry
                 .file
@@ -506,7 +574,7 @@ fn observe(
                         local_namespace.insert(
                             token,
                             (
-                                stat.st_dev,
+                                stat.st_dev as u64,
                                 stat.st_ino,
                                 u64::try_from(stat.st_blocks)
                                     .map_err(|_| unavailable())?

@@ -5,7 +5,7 @@ mod settings;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,12 +20,24 @@ use cirrus_daemon::{
 use cirrus_runtime::RuntimeDir;
 use rune::tok::{self, type_};
 use rune::{
-    App, AppSpec, Color, Cx, El, FileDialogOptions, ScrollSpec, TextEdit, Tx, Waker, col, el, row,
-    text, text_input,
+    App, AppSpec, Color, Cx, El, FileDialogOptions, FileDialogResult, ScrollSpec, TextEdit, Tx,
+    Waker, col, el, row, text, text_input,
 };
 
 enum Action {
+    LoadSettings,
+    ChosenMountpoint(Arc<MountpointOrigin>, PathBuf),
+    DefaultMountpoint {
+        instance: String,
+        space: String,
+        name: String,
+        spaces: Vec<(String, String)>,
+    },
     Status,
+    PrepareConnect {
+        instance: String,
+        ca: String,
+    },
     Connect {
         instance: String,
         ca: String,
@@ -164,9 +176,13 @@ enum RecoveryPage {
 }
 
 enum ResultValue {
+    Settings(Option<String>),
+    ChosenMountpoint(Arc<MountpointOrigin>, Result<String, &'static str>),
+    DefaultMountpoint(String, String, Result<String, &'static str>),
     Status(Result<Vec<MountInfo>, String>),
-    Connected,
-    Spaces(String, Vec<(String, String)>),
+    PreparedConnect(String, String, std::io::Result<String>),
+    Connected(String, std::io::Result<()>),
+    Spaces(String, Vec<(String, String)>, std::io::Result<()>),
     Mounted(String),
     Unmounted,
     FolderOpened,
@@ -196,6 +212,26 @@ enum Page {
     Offline,
     Activity,
     Recovery,
+}
+
+struct MountpointOrigin {
+    instance: String,
+    space: String,
+}
+
+impl MountpointOrigin {
+    fn is_current(&self, state: &State) -> bool {
+        state.instance.text == self.instance
+            && state.spaces_instance.as_deref() == Some(self.instance.as_str())
+            && state.selected.as_deref() == Some(self.space.as_str())
+            && state.spaces.iter().any(|(id, _)| id == &self.space)
+    }
+}
+
+enum Activity {
+    Idle,
+    Working,
+    ChoosingMountpoint(Arc<MountpointOrigin>),
 }
 
 struct State {
@@ -229,8 +265,8 @@ struct State {
     sync_space_id: TextEdit,
     recovery_instance: Option<String>,
     recovery_page: Option<RecoveryPage>,
-    recovery_rows: Vec<RecoveryRow>,
-    recovery_selection: Option<RecoverySelection>,
+    recovery_rows: Arc<Vec<RecoveryRow>>,
+    recovery_selection: Option<Arc<RecoverySelection>>,
     recovery_destination: TextEdit,
     pin_copy_remove: Option<(String, i64)>,
     spaces: Vec<(String, String)>,
@@ -241,7 +277,7 @@ struct State {
     message: String,
     status_notice: Option<String>,
     error: bool,
-    busy: bool,
+    activity: Activity,
     sign_in: Option<String>,
     sign_in_started: Option<Instant>,
     sign_in_seconds: u64,
@@ -266,7 +302,7 @@ impl Default for State {
             show_mount_recovery: false,
             service_running: false,
             service_unavailable: false,
-            instance: TextEdit::new(settings::server().unwrap_or_default()),
+            instance: TextEdit::new(""),
             ca: TextEdit::new(""),
             mountpoint: TextEdit::new(""),
             recovery_mountpoint: TextEdit::new(""),
@@ -290,7 +326,7 @@ impl Default for State {
             sync_space_id: TextEdit::new(""),
             recovery_instance: None,
             recovery_page: None,
-            recovery_rows: Vec::new(),
+            recovery_rows: Arc::new(Vec::new()),
             recovery_selection: None,
             pin_copy_remove: None,
             recovery_destination: TextEdit::new(""),
@@ -302,7 +338,7 @@ impl Default for State {
             message: "Checking daemon…".into(),
             status_notice: None,
             error: false,
-            busy: false,
+            activity: Activity::Idle,
             sign_in: None,
             sign_in_started: None,
             sign_in_seconds: 0,
@@ -344,34 +380,69 @@ fn default_mountpoint(name: &str, spaces: &[(String, String)]) -> Result<String,
 }
 
 impl State {
-    fn use_default_mountpoint(&mut self) {
-        let result = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.spaces.iter().find(|(space_id, _)| space_id == id))
-            .ok_or("Choose a Space first.")
-            .and_then(|(_, name)| default_mountpoint(name, &self.spaces));
+    fn busy(&self) -> bool {
+        !matches!(self.activity, Activity::Idle)
+    }
+
+    fn mountpoint_chosen(&mut self, origin: Arc<MountpointOrigin>, result: FileDialogResult) {
+        if !matches!(&self.activity, Activity::ChoosingMountpoint(active) if Arc::ptr_eq(active, &origin))
+        {
+            return;
+        }
+        self.activity = Activity::Idle;
+        if !origin.is_current(self) {
+            return;
+        }
         match result {
-            Ok(path) => {
-                self.mountpoint = TextEdit::new(&path);
-                self.create_mountpoint = true;
-                self.error = false;
-                self.message = "A new default folder will be created when you mount.".into();
-            }
-            Err(message) => {
-                self.mountpoint = TextEdit::new("");
-                self.create_mountpoint = false;
+            Ok(Some(path)) => self.start(Action::ChosenMountpoint(origin, path)),
+            Ok(None) => {}
+            Err(error) => {
                 self.error = true;
-                self.message = message.into();
+                self.message = format!(
+                    "Folder picker unavailable: {error}. Check your desktop portal and retry."
+                );
             }
         }
     }
 
+    fn sync_target(&self) -> Option<&str> {
+        let explicit = self.sync_space_id.text.trim();
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+        if self.spaces_instance.as_deref() != Some(self.instance.text.as_str()) {
+            return None;
+        }
+        self.selected
+            .as_deref()
+            .filter(|id| self.spaces.iter().any(|(space, _)| space == id))
+    }
+
+    fn use_default_mountpoint(&mut self) {
+        let selected = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.spaces.iter().find(|(space_id, _)| space_id == id));
+        if let Some((space, name)) = selected {
+            self.start(Action::DefaultMountpoint {
+                instance: self.instance.text.clone(),
+                space: space.clone(),
+                name: name.clone(),
+                spaces: self.spaces.clone(),
+            });
+        } else {
+            self.mountpoint = TextEdit::new("");
+            self.create_mountpoint = false;
+            self.error = true;
+            self.message = "Choose a Space first.".into();
+        }
+    }
+
     fn start(&mut self, action: Action) {
-        if self.busy {
+        if self.busy() {
             return;
         }
-        self.busy = true;
+        self.activity = Activity::Working;
         self.error = false;
         if let Action::Connect { attempt, .. } = &action {
             self.sign_in = Some(attempt.clone());
@@ -393,10 +464,20 @@ impl State {
         if matches!(action, Action::Sync(_, _)) {
             self.journal_instance = None;
         }
+        if matches!(
+            action,
+            Action::SyncStatus(_, _) | Action::Sync(_, _) | Action::Connect { .. }
+        ) {
+            self.sync_status = None;
+        }
         if matches!(action, Action::CacheStatus | Action::Evict { .. }) {
             self.cache_status = None;
         }
         self.message = match action {
+            Action::LoadSettings => "Loading saved server…",
+            Action::ChosenMountpoint(..) => "Checking chosen folder…",
+            Action::DefaultMountpoint { .. } => "Checking default folder…",
+            Action::PrepareConnect { .. } => "Preparing sign-in…",
             Action::Connect { .. } => "Connecting or waiting for sign-in. Check your browser for errors; provider pages may not report errors to Cirrus. The browser response has a three-minute limit after the browser is requested.",
             Action::Spaces(_) => "Loading Spaces…",
             Action::Mount { .. } => "Mounting Space…",
@@ -489,6 +570,40 @@ impl State {
 }
 
 fn execute(action: Action) -> std::io::Result<ResultValue> {
+    let action = match action {
+        Action::LoadSettings => return Ok(ResultValue::Settings(settings::server())),
+        Action::PrepareConnect { instance, ca } => {
+            return Ok(ResultValue::PreparedConnect(
+                instance,
+                ca,
+                Daemon::sign_in_attempt(),
+            ));
+        }
+        Action::ChosenMountpoint(origin, path) => {
+            let result = path
+                .canonicalize()
+                .map_err(|_| "Cannot access that folder. Choose another location.")
+                .and_then(|folder| {
+                    folder.to_str().map(str::to_owned).ok_or(
+                        "This location has a name Cirrus cannot represent. Choose another folder.",
+                    )
+                });
+            return Ok(ResultValue::ChosenMountpoint(origin, result));
+        }
+        Action::DefaultMountpoint {
+            instance,
+            space,
+            name,
+            spaces,
+        } => {
+            return Ok(ResultValue::DefaultMountpoint(
+                instance,
+                space,
+                default_mountpoint(&name, &spaces),
+            ));
+        }
+        action => action,
+    };
     if let Action::OpenFolder(path) = action {
         let mut child = Command::new("xdg-open")
             .arg(path)
@@ -504,6 +619,12 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
     let runtime = RuntimeDir::open(Path::new(&path))?;
     let daemon = Daemon::new();
     match action {
+        Action::LoadSettings
+        | Action::PrepareConnect { .. }
+        | Action::ChosenMountpoint(..)
+        | Action::DefaultMountpoint { .. } => {
+            unreachable!()
+        }
         Action::Status => {
             daemon.status(&runtime)?;
             Ok(ResultValue::Status(daemon.mounts(&runtime).map_err(
@@ -537,11 +658,14 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
                 )
             };
             daemon.connect_with_attempt(&runtime, &instance, pem, &attempt)?;
-            Ok(ResultValue::Connected)
+            let saved = settings::save_server(&instance);
+            Ok(ResultValue::Connected(instance, saved))
         }
-        Action::Spaces(instance) => daemon
-            .spaces(&runtime, &instance)
-            .map(|spaces| ResultValue::Spaces(instance, spaces)),
+        Action::Spaces(instance) => {
+            let spaces = daemon.spaces(&runtime, &instance)?;
+            let saved = settings::save_server(&instance);
+            Ok(ResultValue::Spaces(instance, spaces, saved))
+        }
         Action::Mount {
             instance,
             space,
@@ -725,7 +849,7 @@ fn setup(state: &mut State, wake: Waker) {
         }
     });
     state.wake = Some(wake);
-    state.start(Action::Status);
+    state.start(Action::LoadSettings);
 }
 
 fn desktop_accent() -> Option<Color> {
@@ -801,11 +925,60 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
     let Ok((checking_status, result)) = state.receiver.try_recv() else {
         return accent_changed;
     };
-    state.busy = false;
+    state.activity = Activity::Idle;
     state.sign_in = None;
     state.sign_in_started = None;
     state.cancelling_sign_in = false;
     match result {
+        Ok(ResultValue::PreparedConnect(instance, ca, result)) => {
+            if state.instance.text == instance && state.ca.text == ca {
+                match result {
+                    Ok(attempt) => state.start(Action::Connect { instance, ca, attempt }),
+                    Err(_) => {
+                        state.error = true;
+                        state.message =
+                            "Cannot start sign-in: system randomness is unavailable.".into();
+                    }
+                }
+            }
+        }
+        Ok(ResultValue::ChosenMountpoint(origin, result)) => {
+            if origin.is_current(state) {
+                match result {
+                    Ok(path) => {
+                        state.mountpoint = TextEdit::new(path);
+                        state.create_mountpoint = false;
+                        state.error = false;
+                        state.message = "Folder selected. Mounting will verify it before use.".into();
+                    }
+                    Err(message) => {
+                        state.error = true;
+                        state.message = message.into();
+                    }
+                }
+            }
+        }
+        Ok(ResultValue::Settings(server)) => {
+            state.instance = TextEdit::new(server.unwrap_or_default());
+            state.start(Action::Status);
+        }
+        Ok(ResultValue::DefaultMountpoint(instance, space, result)) => {
+            if state.instance.text == instance && state.selected.as_deref() == Some(space.as_str()) {
+                match result {
+                    Ok(path) => {
+                        state.mountpoint = TextEdit::new(&path);
+                        state.create_mountpoint = true;
+                        state.message = "A new default folder will be created when you mount.".into();
+                    }
+                    Err(message) => {
+                        state.mountpoint = TextEdit::new("");
+                        state.create_mountpoint = false;
+                        state.error = true;
+                        state.message = message.into();
+                    }
+                }
+            }
+        }
         Err(error) => {
             state.error = true;
             if checking_status {
@@ -839,7 +1012,7 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
             state.error = true;
             state.message = format!("Mount status could not be verified: {error}");
         }
-        Ok(ResultValue::Connected) => {
+        Ok(ResultValue::Connected(instance, saved)) => {
             state.service_running = true;
             state.service_unavailable = false;
             state.pins_instance = None;
@@ -848,19 +1021,18 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
             state.spaces_instance = None;
             state.selected = None;
             state.message = "Account connected. Loading Spaces…".into();
-            if settings::save_server(&state.instance.text).is_err() {
+            if saved.is_err() {
                 state.error = true;
                 state.message =
                     "Account connected, but the server address could not be saved.".into();
             }
-            state.start(Action::Spaces(state.instance.text.clone()));
+            state.start(Action::Spaces(instance));
         }
-        Ok(ResultValue::Spaces(instance, spaces)) => {
+        Ok(ResultValue::Spaces(instance, spaces, saved)) => {
             if state.spaces_instance.as_deref() != Some(instance.as_str()) {
                 state.selected = None;
             }
             state.spaces_instance = Some(instance);
-            let saved = settings::save_server(&state.instance.text).is_ok();
             state.spaces = spaces;
             state.edit_account = false;
             if state
@@ -876,7 +1048,7 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                 "Choose a Space to configure its mount or offline work"
             }
             .into();
-            if !saved {
+            if saved.is_err() {
                 state.error = true;
                 state.message = "Spaces loaded, but the server address could not be saved.".into();
             }
@@ -948,21 +1120,21 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                 "Acknowledged locally; remote outcome not asserted. Any staged copies are retained.".into();
         }
         Ok(ResultValue::RecoveryCopies(instance,offset,rows))=>{
-            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::Copies(offset));state.recovery_rows=rows.into_iter().map(RecoveryRow::Copy).collect();state.recovery_selection=None;state.pin_copy_remove=None;
+            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::Copies(offset));state.recovery_rows=Arc::new(rows.into_iter().map(RecoveryRow::Copy).collect());state.recovery_selection=None;state.pin_copy_remove=None;
             state.message="Immutable displaced pin captures. Open an ID to inspect directories or export a selected file.".into();
         }
         Ok(ResultValue::RecoveryCopyEntries(instance,space,id,offset,rows))=>{
-            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::CopyEntries{space:space.clone(),id,offset});state.recovery_rows=rows.into_iter().map(|entry|RecoveryRow::CopyEntry{space:space.clone(),id,entry}).collect();state.recovery_selection=None;state.pin_copy_remove=None;
+            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::CopyEntries{space:space.clone(),id,offset});state.recovery_rows=Arc::new(rows.into_iter().map(|entry|RecoveryRow::CopyEntry{space:space.clone(),id,entry}).collect());state.recovery_selection=None;state.pin_copy_remove=None;
             state.message="Captured directory IDs are metadata, not file payloads. Select a file version to export.".into();
         }
         Ok(ResultValue::PinCopyRemoved)=>{
-            state.recovery_rows.clear();state.recovery_selection=None;state.pin_copy_remove=None;state.recovery_page=None;
+            state.recovery_rows=Arc::new(Vec::new());state.recovery_selection=None;state.pin_copy_remove=None;state.recovery_page=None;
             state.message="Removed only the named immutable pin capture. Active pins, other captures and dirty roots were not removed. Reload retained captures.".into();
         }
         Ok(ResultValue::RecoveryRoots(instance, offset, rows)) => {
             state.recovery_instance = Some(instance);
             state.recovery_page = Some(RecoveryPage::Roots(offset));
-            state.recovery_rows = rows.into_iter().map(RecoveryRow::Root).collect();
+            state.recovery_rows = Arc::new(rows.into_iter().map(RecoveryRow::Root).collect());
             state.recovery_selection = None;
             state.message = "Retained pins may be stale; choose a pin root.".into();
         }
@@ -973,21 +1145,21 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                 root: root.clone(),
                 offset,
             });
-            state.recovery_rows = rows
+            state.recovery_rows = Arc::new(rows
                 .into_iter()
                 .map(|file| RecoveryRow::File {
                     space: space.clone(),
                     root: root.clone(),
                     file,
                 })
-                .collect();
+                .collect());
             state.recovery_selection = None;
             state.message = "Retained versions may be stale; choose a file to export.".into();
         }
         Ok(ResultValue::RecoveryStaged(instance, offset, rows)) => {
             state.recovery_instance = Some(instance);
             state.recovery_page = Some(RecoveryPage::Staged(offset));
-            state.recovery_rows = rows.into_iter().map(RecoveryRow::Staged).collect();
+            state.recovery_rows = Arc::new(rows.into_iter().map(RecoveryRow::Staged).collect());
             state.recovery_selection = None;
             state.message = "Staged copies are local; their original hash was not recorded.".into();
         }
@@ -1078,6 +1250,21 @@ fn secondary_button(
         .on_press(action)
 }
 
+fn space_button(
+    paint: Paint,
+    label: &str,
+    key: String,
+    enabled: bool,
+    origin: Option<Arc<MountpointOrigin>>,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    button(paint, label, key, enabled && origin.is_some(), move |s| {
+        if !s.busy() && origin.as_ref().is_some_and(|origin| origin.is_current(s)) {
+            action(s);
+        }
+    })
+}
+
 fn nav_button(paint: Paint, label: &'static str, page: Page, current: Page) -> El {
     el().key(format!("nav-{label}"))
         .label(label)
@@ -1102,7 +1289,17 @@ fn nav_button(paint: Paint, label: &'static str, page: Page, current: Page) -> E
 fn view(state: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(cx.system_dark());
     let paint = Paint::new(t, state.accent);
-    let can_work = !state.busy;
+    let can_work = !state.busy();
+    let space_origin = state
+        .selected
+        .as_ref()
+        .map(|space| {
+            Arc::new(MountpointOrigin {
+                instance: state.instance.text.clone(),
+                space: space.clone(),
+            })
+        })
+        .filter(|origin| origin.is_current(state));
     let known_mounted = state.mount_checked && !state.mounts.is_empty();
     let input = |field: &TextEdit,
                  key: &'static str,
@@ -1120,6 +1317,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 "stage-source" => "Local source file",
                 "acknowledge-file" => "Journal filename or operation token",
                 "recovery-destination" => "New local destination",
+                "automatic-space-id" => "Space ID override (optional)",
                 _ => hint,
             })
             .single_line()
@@ -1166,6 +1364,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             "Not mounted".to_owned()
         };
         let choose_id = id.clone();
+        let choose_instance = state.instance.text.clone();
         let mut item = col()
             .w_full()
             .gap(6.0)
@@ -1189,6 +1388,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 format!("space-{id}"),
                 can_work && !selected,
                 move |s| {
+                    if s.busy()
+                        || s.instance.text != choose_instance
+                        || s.spaces_instance.as_deref() != Some(choose_instance.as_str())
+                        || !s.spaces.iter().any(|(id, _)| id == &choose_id)
+                    {
+                        return;
+                    }
                     s.selected = Some(choose_id.clone());
                     s.pins_instance = None;
                     if s.mounts.iter().any(|mount| {
@@ -1328,6 +1534,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             ),
         };
         let entry = entry.clone();
+        let rows = Arc::clone(&state.recovery_rows);
+        let instance = state.instance.text.clone();
         recovery_rows = recovery_rows.child(
             row()
                 .w_full()
@@ -1346,10 +1554,18 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     action_label,
                     format!("recovery-row-{index}"),
                     can_work && selectable,
-                    move |s| match &entry {
+                    move |s| {
+                        if s.busy()
+                            || s.instance.text != instance
+                            || s.recovery_instance.as_deref() != Some(instance.as_str())
+                            || !Arc::ptr_eq(&s.recovery_rows, &rows)
+                        {
+                            return;
+                        }
+                        match &entry {
                         RecoveryRow::Copy(copy)=>s.start(Action::RecoveryCopyEntries{instance:s.instance.text.clone(),space:copy.space.clone(),id:copy.id,offset:0}),
                         RecoveryRow::CopyEntry {space,id,entry}=>{
-                            s.recovery_selection=Some(RecoverySelection::Copy{space:space.clone(),id:*id,file:entry.clone()});s.message="Selected immutable captured file version; export to a new absolute local path.".into();
+                            s.recovery_selection=Some(Arc::new(RecoverySelection::Copy{space:space.clone(),id:*id,file:entry.clone()}));s.message="Selected immutable captured file version; export to a new absolute local path.".into();
                         }
                         RecoveryRow::Root(pin) => s.start(Action::RecoveryFiles {
                             instance: s.instance.text.clone(),
@@ -1358,20 +1574,21 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                             offset: 0,
                         }),
                         RecoveryRow::File { space, root, file } => {
-                            s.recovery_selection = Some(RecoverySelection::Pin {
+                            s.recovery_selection = Some(Arc::new(RecoverySelection::Pin {
                                 space: space.clone(),
                                 root: root.clone(),
                                 file: file.clone(),
-                            });
+                            }));
                             s.message =
                                 "Selected retained pin version; choose a new local destination."
                                     .into();
                         }
                         RecoveryRow::Staged(file) => {
-                            s.recovery_selection = Some(RecoverySelection::Staged(file.clone()));
+                            s.recovery_selection = Some(Arc::new(RecoverySelection::Staged(file.clone())));
                             s.message =
                                 "Selected staged copy; choose a new local destination.".into();
                         }
+                    }
                     },
                 )),
         );
@@ -1384,7 +1601,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         );
     }
     let selected_recovery = if current_recovery {
-        match &state.recovery_selection {
+        match state.recovery_selection.as_deref() {
             Some(RecoverySelection::Copy { space, id, file }) => format!(
                 "Selected immutable capture #{id} · Space {space} · /{} · {} bytes; not the current namespace",
                 file.path.join("/"),
@@ -1489,18 +1706,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                         "Connect account",
                         "connect".into(),
                         can_work && !known_mounted && !state.instance.text.trim().is_empty(),
-                        |s| match Daemon::sign_in_attempt() {
-                            Ok(attempt) => s.start(Action::Connect {
+                        |s| {
+                            s.start(Action::PrepareConnect {
                                 instance: s.instance.text.clone(),
                                 ca: s.ca.text.clone(),
-                                attempt,
-                            }),
-                            Err(_) => {
-                                s.error = true;
-                                s.message =
-                                    "Cannot start sign-in: system randomness is unavailable."
-                                        .into();
-                            }
+                            })
                         },
                     ))
                     .child(button(
@@ -1701,6 +1911,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         })
     });
     if current_spaces && selected_space.is_some() && !selected_has_mount {
+        let picker_origin = space_origin.clone();
+        let default_origin = space_origin.clone();
         let selected_name = selected_space
             .map(|(_, name)| name.clone())
             .unwrap_or_default();
@@ -1711,21 +1923,15 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .child(text("By default Cirrus creates a new folder named after this Space in your home directory. If it already exists, choose another location. You may also choose an existing empty, user-owned folder with permissions 0700; Cirrus will not change its permissions.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
             .child(row().gap(8.0).child(el().key("choose-mount-folder").label("Choose location").role("button").focusable(can_work).padding(10.0).radius(6.0).fill(t.card).border(1.0, t.separator).hover(t.hover).press(t.press)
                 .child(text("Choose location").font(type_::LABEL).color(t.text))
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                    if s.busy { return; }
-                    tx.open_folder(FileDialogOptions { title: "Choose the mount folder".into(), ..Default::default() }, |s: &mut State, result, _| match result {
-                        Ok(Some(parent)) => match parent.canonicalize() {
-                            Ok(folder) => match folder.to_str() {
-                                Some(path) => { s.mountpoint = TextEdit::new(path); s.create_mountpoint = false; s.error = false; },
-                                None => { s.error = true; s.message = "This location has a name Cirrus cannot represent. Choose another folder.".into(); }
-                            },
-                            Err(_) => { s.error = true; s.message = "Cannot access that folder. Choose another location.".into(); }
-                        },
-                        Ok(None) => {},
-                        Err(error) => { s.error = true; s.message = format!("Folder picker unavailable: {error}. Check your desktop portal and retry."); }
-                    });
-                })).child(secondary_button(paint, "Use default", "default-mount-folder", |s| { if !s.busy { s.use_default_mountpoint(); } })))
-            .child(row().child(button(paint, "Mount Space", "mount".into(), can_work && state.mount_checked && !state.mountpoint.text.is_empty(), |s| {
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    if s.busy() { return; }
+                    let Some(origin) = picker_origin.clone() else { return; };
+                    if !origin.is_current(s) { return; }
+                    s.activity = Activity::ChoosingMountpoint(Arc::clone(&origin));
+                    tx.open_folder(FileDialogOptions { title: "Choose the mount folder".into(), ..Default::default() },
+                        move |s: &mut State, result, _| s.mountpoint_chosen(origin, result));
+                })).child(secondary_button(paint, "Use default", "default-mount-folder", move |s| { if !s.busy() && default_origin.as_ref().is_some_and(|origin| origin.is_current(s)) { s.use_default_mountpoint(); } })))
+            .child(row().child(space_button(paint, "Mount Space", "mount".into(), can_work && state.mount_checked && !state.mountpoint.text.is_empty(), space_origin.clone(), |s| {
                 if let Some(space) = s.selected.clone() {
                     s.start(Action::Mount { instance: s.instance.text.clone(), space, path: if s.create_mountpoint { None } else { Some(s.mountpoint.text.clone()) } });
                 }
@@ -1751,22 +1957,43 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(row().child(button(paint, "Recover stale mount", "recover".into(), can_work && !state.recovery_mountpoint.text.is_empty(), |s| s.start(Action::Recover { path: s.recovery_mountpoint.text.clone() })) )));
         }
     }
+    let sync_instance = state.instance.text.clone();
+    let sync_target = state.sync_target().map(str::to_owned);
+    let journal_instance = state.instance.text.clone();
+    let journal_space = state.journal_space.clone();
+    let journal_before = state.journal_next;
     let activity = col()
         .w_full()
         .gap(12.0)
         .child(text("Activity & sync").font(tok::TextStyle::new(22.0, 600.0)).color(t.text))
         .child(text("Mounted Spaces activate daemon-owned automatic sync. Activation survives restart without remounting. Local saves are not remote confirmation; conflicts and ambiguous requests need attention.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
+        .child(text("Space ID override (optional)").font(type_::LABEL).color(t.text))
         .child(input(&state.sync_space_id,"automatic-space-id","Space ID for local status (or use the selected Space)",|s| &mut s.sync_space_id).max_w(480.0))
-        .child(row().child(button(paint,"Automatic sync status","automatic-sync-status".into(),can_work && (!state.sync_space_id.text.is_empty() || state.selected.is_some()),|s| {
-            let space = if s.sync_space_id.text.trim().is_empty() { s.selected.clone() } else { Some(s.sync_space_id.text.trim().to_owned()) };
-            if let Some(space) = space { s.start(Action::SyncStatus(s.instance.text.clone(),space)); }
+        .child(text(state.sync_target().map_or_else(|| "Select a Space on Drive, or enter its exact ID above.".to_owned(), |space| format!("Status target: Space {space}. The override affects only this status check, not sync or local staging."))).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(row().child(button(paint,"Automatic sync status","automatic-sync-status".into(),can_work && state.sync_target().is_some(),move |s| {
+            if s.busy() || s.instance.text != sync_instance || s.sync_target() != sync_target.as_deref() { return; }
+            if let Some(space) = sync_target.clone() { s.start(Action::SyncStatus(sync_instance.clone(),space)); }
         })))
-        .child(text(if let Some(status) = state.sync_status.as_ref().filter(|status| status.instance == state.instance.text) {
+        .child(text(if let Some(status) = state.sync_status.as_ref().filter(|status| same_instance(&status.instance, &state.instance.text) && Some(status.space.as_str()) == state.sync_target()) {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|duration| duration.as_secs() as i64);
             let next = status.next_attempt.map_or_else(|| "none scheduled".into(),|time| if time>now { format!("in {}s",time-now) } else { "due; refresh status".into() });
             let last = status.last_verified.map_or_else(|| "none yet".into(),|time| format!("{}s ago (historical)",now.saturating_sub(time)));
-            format!("Last local observation · Space {} · {:?}\nActivated {} · worker enabled here {}\n{} queued · {} uploading · {} verifying · {} ambiguous · {} conflicts · {} damaged\nRetry attempt {} · {} · cause {}\nLast verified mutation {} · new work {} · journal high-water {} (observed idle through {}). Not globally clean.",status.space,status.phase,status.activated,status.worker_enabled_here.unwrap_or(false),status.queued,status.uploading,status.verifying,status.uncertain,status.conflicts,status.damaged,status.retry_attempt,next,status.cause.as_deref().unwrap_or("none"),last,status.new_work,status.high_water,status.verified_through)
-        } else { "Automatic sync status not checked for this Space. Refresh after new work or a service restart.".into() }).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+            let phase = match status.phase {
+                cirrus_daemon::SyncPhase::Queued => "Saved locally · waiting for sync",
+                cirrus_daemon::SyncPhase::Uploading => "Uploading · not yet confirmed",
+                cirrus_daemon::SyncPhase::Verifying => "Verifying a mutation receipt · not yet confirmed",
+                cirrus_daemon::SyncPhase::Retry => "Waiting to retry · see reason below",
+                cirrus_daemon::SyncPhase::Attention => "Needs attention · inspect Journal status and retained copies in Recovery before retrying or acknowledging",
+                cirrus_daemon::SyncPhase::ObservedIdle => "No eligible work observed · not proof of current remote contents",
+            };
+            let activation = if status.activated { "Automatic sync activated" } else { "Automatic sync not activated; mount this Space on Drive to activate it" };
+            let worker = match status.worker_enabled_here {
+                Some(true) => "Automatic worker enabled in this service",
+                Some(false) => "Automatic worker disabled in this service",
+                None => "Automatic worker availability unknown",
+            };
+            format!("Last local observation · Space {}\n{phase}\n{activation}. {worker}.\n{} pending · {} uploading · {} verifying · {} uncertain · {} conflicts · {} local state issues\nRetry attempt {} · {} · reason: {}\nLast historically verified mutation: {}. This does not confirm current remote bytes or connection. Refresh after new work or a service restart.",status.space,status.queued,status.uploading,status.verifying,status.uncertain,status.conflicts,status.damaged,status.retry_attempt,next,status.cause.as_deref().unwrap_or("none reported"),last)
+        } else { "No observation available for this status target. Use Automatic sync status to check; a failed check does not confirm connection or upload.".into() }).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(text("Review pending changes, conflicts and errors in the journal. Sync now checks all Spaces; Sync selected Space checks only the selected Space.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
         .child(text(account_context.clone()).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(text(selected_context.clone()).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
@@ -1789,13 +2016,14 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(
             row()
                 .gap(8.0)
-                .child(button(paint,
+                .child(space_button(paint,
                     "Save locally",
                     "stage".into(),
                     can_work
                         && current_spaces && state.selected.is_some()
                         && !state.stage_path.text.is_empty()
                         && !state.stage_source.text.is_empty(),
+                    space_origin.clone(),
                     |s| {
                         if let Some(space) = s.selected.clone() {
                             s.start(Action::Stage {
@@ -1813,13 +2041,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     s.start(Action::Sync(s.instance.text.clone(), None))
                 })),
         )
-        .child(button(paint, "Sync selected Space", "sync-space".into(), can_work && current_spaces && state.selected.is_some(), |s| {
+        .child(space_button(paint, "Sync selected Space", "sync-space".into(), can_work && current_spaces && state.selected.is_some(), space_origin.clone(), |s| {
             if let Some(space) = s.selected.clone() {
                 s.start(Action::Sync(s.instance.text.clone(), Some(space)));
             }
         }))
         .child(text("Remove cached data for this path without removing offline pins or unsynced edits.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-        .child(button(paint, "Evict clean cache", "evict".into(), can_work && current_spaces && state.selected.is_some() && !state.pin_path.text.is_empty(), |s| {
+        .child(space_button(paint, "Evict clean cache", "evict".into(), can_work && current_spaces && state.selected.is_some() && !state.pin_path.text.is_empty(), space_origin.clone(), |s| {
             if let Some(space) = s.selected.clone() {
                 s.start(Action::Evict { instance: s.instance.text.clone(), space, path: s.pin_path.text.clone() });
             }
@@ -1858,14 +2086,17 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .color(t.text_secondary),
         )
         .child(row().gap(8.0)
-            .child(button(paint, "Selected Space journal", "journal-space".into(), can_work && current_spaces && state.selected.is_some(), |s| {
+            .child(space_button(paint, "Selected Space journal", "journal-space".into(), can_work && current_spaces && state.selected.is_some(), space_origin.clone(), |s| {
                 if let Some(space) = s.selected.clone() {
                     s.start(Action::Journal(s.instance.text.clone(), Some(space), None));
                 }
             }))
-            .child(button(paint, "Older journal entries", "journal-older".into(), can_work && state.journal_instance.as_deref() == Some(state.instance.text.as_str()) && state.journal_next.is_some(), |s| {
-                if let Some(before) = s.journal_next {
-                    s.start(Action::Journal(s.instance.text.clone(), s.journal_space.clone(), Some(before)));
+            .child(button(paint, "Older journal entries", "journal-older".into(), can_work && state.journal_instance.as_deref() == Some(state.instance.text.as_str()) && state.journal_next.is_some(), move |s| {
+                if s.busy() || s.instance.text != journal_instance
+                    || s.journal_instance.as_deref() != Some(journal_instance.as_str())
+                    || s.journal_space != journal_space || s.journal_next != journal_before { return; }
+                if let Some(before) = journal_before {
+                    s.start(Action::Journal(journal_instance.clone(), journal_space.clone(), Some(before)));
                 }
             })))
         .child(input(
@@ -1902,27 +2133,29 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(
             row()
                 .gap(8.0)
-                .child(button(paint,
+                .child(space_button(paint,
                     "Pin",
                     "pin".into(),
                     can_work && current_spaces && state.selected.is_some() && !state.pin_path.text.is_empty(),
+                    space_origin.clone(),
                     |s| {
                         if let Some(space) = s.selected.clone() {
                             s.start(Action::Pin { instance: s.instance.text.clone(), space, path: s.pin_path.text.clone() });
                         }
                     },
                 ))
-                .child(button(paint,
+                .child(space_button(paint,
                     "Unpin",
                     "unpin".into(),
                     can_work && current_spaces && state.selected.is_some() && !state.pin_path.text.is_empty(),
+                    space_origin.clone(),
                     |s| {
                         if let Some(space) = s.selected.clone() {
                             s.start(Action::Unpin { instance: s.instance.text.clone(), space, path: s.pin_path.text.clone() });
                         }
                     },
                 ))
-                .child(button(paint, "Pins", "pins".into(), can_work && current_spaces && state.selected.is_some(), |s| {
+                .child(space_button(paint, "Pins", "pins".into(), can_work && current_spaces && state.selected.is_some(), space_origin.clone(), |s| {
                     if let Some(space) = s.selected.clone() {
                         s.start(Action::Pins { instance: s.instance.text.clone(), space });
                     }
@@ -1950,7 +2183,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         )
         .child(text("Clean cache").font(type_::TITLE).color(t.text))
         .child(text("Temporary ranges are shared across Spaces and may be evicted. They are not offline pins.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-        .child(row().child(button(paint, "Check cache usage", "cache-status".into(), state.service_running && !state.busy, |s| s.start(Action::CacheStatus))))
+        .child(row().child(button(paint, "Check cache usage", "cache-status".into(), state.service_running && !state.busy(), |s| s.start(Action::CacheStatus))))
         .child(text(match &state.cache_status {
             Some(status) => {
                 let limit = if status.byte_limit.is_multiple_of(1024 * 1024) {
@@ -1962,6 +2195,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             },
             None => "Cache usage has not been checked.".to_owned(),
         }).font(type_::BODY).w_full().wrap().color(t.text_secondary));
+    let more_rows = Arc::clone(&state.recovery_rows);
+    let more_instance = state.instance.text.clone();
+    let export_rows = Arc::clone(&state.recovery_rows);
+    let export_instance = state.instance.text.clone();
+    let export_selection = state.recovery_selection.clone();
     let mut recovery = col()
         .w_full()
         .gap(12.0)
@@ -1971,7 +2209,10 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(row().gap(8.0)
             .child(button(paint, "Retained pins", "recovery-pins".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryRoots { instance: s.instance.text.clone(), offset: 0 })))
             .child(button(paint, "Staged copies", "recovery-staged".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryStaged { instance: s.instance.text.clone(), offset: 0 })))
-            .child(button(paint, "More", "recovery-more".into(), can_work && current_recovery && !state.recovery_rows.is_empty(), |s| {
+            .child(button(paint, "More", "recovery-more".into(), can_work && current_recovery && !state.recovery_rows.is_empty(), move |s| {
+                if s.busy() || s.instance.text != more_instance
+                    || s.recovery_instance.as_deref() != Some(more_instance.as_str())
+                    || !Arc::ptr_eq(&s.recovery_rows, &more_rows) { return; }
                 let next = s.recovery_rows.len() as u32;
                 match s.recovery_page.clone() {
                     Some(RecoveryPage::Copies(offset))=>s.start(Action::RecoveryCopies{instance:s.instance.text.clone(),offset:offset.saturating_add(next)}),
@@ -1986,9 +2227,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(recovery_rows)
         .child(text(selected_recovery).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(input(&state.recovery_destination, "recovery-destination", "New absolute local destination", |s| &mut s.recovery_destination))
-        .child(button(paint, "Export selected copy", "recovery-export".into(), can_work && current_recovery && state.recovery_selection.is_some() && !state.recovery_destination.text.is_empty(), |s| {
-            if let Some(selection) = s.recovery_selection.clone() {
-                s.start(Action::RecoveryExport { instance: s.instance.text.clone(), selection, destination: s.recovery_destination.text.clone() });
+        .child(button(paint, "Export selected copy", "recovery-export".into(), can_work && current_recovery && state.recovery_selection.is_some() && !state.recovery_destination.text.is_empty(), move |s| {
+            if s.busy() || s.instance.text != export_instance
+                || s.recovery_instance.as_deref() != Some(export_instance.as_str())
+                || !Arc::ptr_eq(&s.recovery_rows, &export_rows) { return; }
+            if let Some(selection) = export_selection.as_ref().filter(|selection|
+                s.recovery_selection.as_ref().is_some_and(|current| Arc::ptr_eq(current, selection))) {
+                s.start(Action::RecoveryExport { instance: export_instance.clone(), selection: (**selection).clone(), destination: s.recovery_destination.text.clone() });
             }
         }));
 
@@ -1998,11 +2243,17 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         let space = space.clone();
         let id = *id;
         let confirmed = state.pin_copy_remove.as_ref() == Some(&(space.clone(), id));
+        let remove_rows = Arc::clone(&state.recovery_rows);
+        let remove_instance = state.instance.text.clone();
         recovery=recovery
             .child(text(format!("Remove capture #{id} in Space {space} only. Its retained bytes will no longer be recoverable from this copy. Active pins, other captures and dirty roots remain." )).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
             .child(button(paint,if confirmed {"Confirm removal of this capture"}else{"Remove this retained capture…"},"remove-pin-copy".into(),can_work,move|s|{
-                if s.pin_copy_remove.as_ref()==Some(&(space.clone(),id)) {s.start(Action::RemovePinCopy{instance:s.instance.text.clone(),space:space.clone(),id});}
-                else {s.pin_copy_remove=Some((space.clone(),id));s.message=format!("Review capture #{id} before confirming removal. This affects only that capture ID.");}
+                if s.busy() || s.instance.text != remove_instance
+                    || s.recovery_instance.as_deref() != Some(remove_instance.as_str())
+                    || !Arc::ptr_eq(&s.recovery_rows, &remove_rows) { return; }
+                if confirmed {
+                    if s.pin_copy_remove.as_ref()==Some(&(space.clone(),id)) {s.start(Action::RemovePinCopy{instance:remove_instance.clone(),space:space.clone(),id});}
+                } else {s.pin_copy_remove=Some((space.clone(),id));s.message=format!("Review capture #{id} before confirming removal. This affects only that capture ID.");}
             }))
             .child(button(paint,"Cancel capture removal","cancel-pin-copy-removal".into(),can_work&&confirmed,|s|s.pin_copy_remove=None));
     }

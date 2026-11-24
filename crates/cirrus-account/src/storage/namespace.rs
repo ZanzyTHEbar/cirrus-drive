@@ -7,12 +7,13 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use rustix::{
-    fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, FileType, Mode, OFlags},
     process,
 };
 use serde::{Deserialize, Serialize};
 
 use super::limits;
+use crate::account_storage::StorageRoot;
 use crate::{AccountError, offline, ownership};
 
 pub(crate) const PREFIX: &str = ".namespace-reservation-";
@@ -49,12 +50,11 @@ fn record(dir: &OwnedFd, token: &str) -> Result<Record, AccountError> {
     if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid());
     }
-    let fd = fs::openat2(
+    let fd = ownership::open_private_file(
         dir,
         name(token).as_str(),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| invalid())?;
     let stat = fs::fstat(&fd).map_err(|_| invalid())?;
@@ -67,6 +67,8 @@ fn record(dir: &OwnedFd, token: &str) -> Result<Record, AccountError> {
         return Err(invalid());
     }
     let mut bytes = Vec::new();
+    #[cfg(target_os = "macos")]
+    ownership::darwin_acl::check_file(&fd).map_err(|_| invalid())?;
     std::fs::File::from(fd)
         .take(4097)
         .read_to_end(&mut bytes)
@@ -118,11 +120,11 @@ pub(crate) fn observe(
     Ok(result)
 }
 
-pub(crate) fn release(token: &str) -> Result<(), AccountError> {
+pub(crate) fn release_in(root: &StorageRoot, token: &str) -> Result<(), AccountError> {
     // Never create a marker while inspecting/releasing a nonexistent token.
-    let _lease = ownership::namespace_lease(token, false)?;
-    let _budget = ownership::acquire_staging()?;
-    let dir = ownership::state_dir()?;
+    let _lease = ownership::namespace_lease_in(root, token, false)?;
+    let _budget = ownership::acquire_staging_in(root)?;
+    let dir = root.directory();
     record(&dir, token)?;
     fs::unlinkat(&dir, name(token).as_str(), AtFlags::empty()).map_err(|_| invalid())?;
     fs::unlinkat(
@@ -137,6 +139,7 @@ pub(crate) fn release(token: &str) -> Result<(), AccountError> {
 }
 
 pub(crate) struct NamespaceReservation {
+    root: StorageRoot,
     token: String,
     dir: OwnedFd,
     _lease: OwnedFd,
@@ -147,20 +150,24 @@ pub(crate) struct NamespaceReservation {
 }
 
 impl NamespaceReservation {
-    pub(crate) fn begin(file: &Arc<std::fs::File>) -> Result<Option<Self>, AccountError> {
-        if limits::view()?.limits.is_none() {
+    pub(crate) fn begin_in(
+        root: &StorageRoot,
+        file: &Arc<std::fs::File>,
+    ) -> Result<Option<Self>, AccountError> {
+        if limits::view_in(root)?.limits.is_none() {
             return Ok(None);
         }
         let token = offline::namespace_token()?;
-        let lease = ownership::namespace_lease(&token, true)?;
+        let lease = ownership::namespace_lease_in(root, &token, true)?;
         let stat = fs::fstat(file).map_err(|_| invalid())?;
         let mut reservation = Self {
+            root: root.clone(),
             token,
-            dir: ownership::state_dir()?,
+            dir: root.directory().try_clone().map_err(|_| invalid())?,
             _lease: lease,
             published: false,
             ceiling: 0,
-            device: stat.st_dev,
+            device: stat.st_dev as u64,
             inode: stat.st_ino,
         };
         // No store lease, SQL query, SQLite contention or network under this
@@ -172,9 +179,9 @@ impl NamespaceReservation {
     }
 
     fn prepare(&mut self, file: &Arc<std::fs::File>) -> Result<(), AccountError> {
-        let _budget = ownership::acquire_staging()?;
-        let local = offline::storage_reservations()?;
-        let observation = super::allocation_status(&local)?;
+        let _budget = ownership::acquire_staging_in(&self.root)?;
+        let local = offline::storage_reservations_in(&self.root)?;
+        let observation = super::allocation_status_in(&self.root, &local)?;
         let block = observation.filesystem_fragment_bytes;
         self.ceiling = crate::directory::SQLITE_BYTES
             .div_ceil(block)
@@ -187,7 +194,8 @@ impl NamespaceReservation {
             .ok_or_else(invalid)?;
         // The original file is already in the local weak tracker. Charge only
         // its unmaterialized remainder, plus this new bounded control record.
-        limits::check(
+        limits::check_in(
+            &self.root,
             self.ceiling
                 .saturating_sub(allocated)
                 .checked_add(block)
@@ -201,16 +209,17 @@ impl NamespaceReservation {
             ceiling_bytes: self.ceiling,
         };
         let temp = format!(".namespace-publish-{}", self.token);
-        let fd = fs::openat2(
+        let fd = ownership::open_private_file(
             &self.dir,
             temp.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(|_| invalid())?;
         let published = (|| {
             let mut output = std::fs::File::from(fd);
+            #[cfg(target_os = "macos")]
+            ownership::darwin_acl::check_file(&output).map_err(|_| invalid())?;
             output
                 .write_all(&serde_json::to_vec(&record).map_err(|_| invalid())?)
                 .and_then(|()| output.sync_all())
@@ -233,9 +242,9 @@ impl NamespaceReservation {
             )
             .map_err(|_| invalid())?;
             self.published = true;
-            super::bind_namespace(file, &self.token)?;
+            super::bind_namespace(&self.root, file, &self.token)?;
             fs::fsync(&self.dir).map_err(|_| invalid())?;
-            limits::check(0, &local)
+            limits::check_in(&self.root, 0, &local)
         })();
         let _ = fs::unlinkat(&self.dir, temp.as_str(), AtFlags::empty());
         published
@@ -243,7 +252,7 @@ impl NamespaceReservation {
 
     pub(crate) fn validate_file(&self, file: &std::fs::File) -> Result<(), AccountError> {
         let stat = fs::fstat(file).map_err(|_| invalid())?;
-        if (stat.st_dev, stat.st_ino, stat.st_nlink) != (self.device, self.inode, 0)
+        if (stat.st_dev as u64, stat.st_ino, stat.st_nlink) != (self.device, self.inode, 0)
             || u64::try_from(stat.st_blocks)
                 .ok()
                 .and_then(|blocks| blocks.checked_mul(512))
@@ -260,8 +269,8 @@ impl NamespaceReservation {
 
 impl Drop for NamespaceReservation {
     fn drop(&mut self) {
-        if let Ok(_budget) = ownership::acquire_staging() {
-            if super::finish_namespace_observation(&self.token).is_err() {
+        if let Ok(_budget) = ownership::acquire_staging_in(&self.root) {
+            if super::finish_namespace_observation(&self.root, &self.token).is_err() {
                 return;
             }
             if self.published {

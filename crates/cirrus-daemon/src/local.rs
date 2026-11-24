@@ -12,7 +12,7 @@ use cirrus_account::{Accounts, JournalPage, PortalBrowser, SignIn};
 use cirrus_fuse::Mounted;
 use cirrus_runtime::RuntimeDir;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType, sockopt};
+use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,80 @@ struct JournalPermit(Arc<AtomicUsize>);
 impl Drop for JournalPermit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) enum MountRegistry {
+    Available(Vec<Mounted>),
+    Reserved,
+}
+
+impl MountRegistry {
+    pub(crate) fn ready(&self) -> Result<&[Mounted], String> {
+        match self {
+            Self::Available(mounts) => Ok(mounts),
+            Self::Reserved => Err("mount operation is in progress".to_owned()),
+        }
+    }
+
+    fn ready_mut(&mut self) -> Result<&mut Vec<Mounted>, String> {
+        match self {
+            Self::Available(mounts) => Ok(mounts),
+            Self::Reserved => Err("mount operation is in progress".to_owned()),
+        }
+    }
+
+    fn has_mounts(&self) -> bool {
+        match self {
+            Self::Available(mounts) => !mounts.is_empty(),
+            Self::Reserved => true,
+        }
+    }
+}
+
+struct MountOperation<'a> {
+    registry: &'a Mutex<MountRegistry>,
+    mounts: Vec<Mounted>,
+}
+
+impl<'a> MountOperation<'a> {
+    fn begin(registry: &'a Mutex<MountRegistry>) -> Result<Self, String> {
+        let mut state = registry
+            .lock()
+            .map_err(|_| "mount state is unavailable".to_owned())?;
+        let mounts = std::mem::take(state.ready_mut()?);
+        *state = MountRegistry::Reserved;
+        Ok(Self { registry, mounts })
+    }
+
+    fn unmount(mut self, space: Option<(&str, &str)>) -> Result<(), String> {
+        let mounts = &mut self.mounts;
+        let index = if let Some((instance, space)) = space {
+            mounts
+                .iter()
+                .position(|mount| mount.instance() == instance && mount.space_id() == space)
+                .ok_or_else(|| "Space is not mounted".to_owned())?
+        } else if mounts.len() == 1 {
+            0
+        } else {
+            return Err(if mounts.is_empty() {
+                "no Space is mounted"
+            } else {
+                "multiple Spaces are mounted; select a Space to unmount"
+            }
+            .to_owned());
+        };
+        mounts[index].unmount().map_err(|error| error.to_string())?;
+        mounts.remove(index);
+        Ok(())
+    }
+}
+
+impl Drop for MountOperation<'_> {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().expect("mount state lock poisoned");
+        // Return the actual owners before foreground/reply admission is released.
+        *registry = MountRegistry::Available(std::mem::take(&mut self.mounts));
     }
 }
 
@@ -508,8 +582,38 @@ fn recover_endpoint(runtime: &RuntimeDir, socket: impl AsFd) -> io::Result<()> {
 }
 
 fn verify_peer(stream: &UnixStream) -> io::Result<()> {
-    let peer = sockopt::socket_peercred(stream).map_err(io::Error::from)?;
-    if peer.uid != process::geteuid() {
+    // A peer outside our PID namespace has PID 0, but still has kernel-bound
+    // UID/GID credentials. rustix's UCred requires a nonzero PID, so read the
+    // kernel representation directly rather than constructing that type.
+    let mut peer = libc::ucred {
+        pid: -1,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let expected_len =
+        libc::socklen_t::try_from(std::mem::size_of_val(&peer)).map_err(io::Error::other)?;
+    let mut len = expected_len;
+    // SAFETY: peer is a live, writable Linux ucred with len set to its size.
+    // getsockopt cannot write beyond that buffer; stream holds the socket open.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut peer).cast(),
+            &mut len,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if len != expected_len || peer.pid < 0 || peer.uid == u32::MAX || peer.gid == u32::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socket peer credentials",
+        ));
+    }
+    if peer.uid != process::geteuid().as_raw() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "socket peer UID does not match",
@@ -663,7 +767,7 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
     let listener = UnixListener::from(fd);
     let busy = Arc::new(AtomicBool::new(false));
     let accounts = Arc::new(Accounts::new(runtime.try_clone()?));
-    let mount: Arc<Mutex<Vec<Mounted>>> = Arc::new(Mutex::new(Vec::new()));
+    let mount = Arc::new(Mutex::new(MountRegistry::Available(Vec::new())));
     let mut scheduler = crate::scheduler::Scheduler::start(
         Arc::clone(&accounts),
         Arc::clone(&busy),
@@ -963,7 +1067,7 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                         .try_lock()
                         .map_err(|_| "mount operation is in progress".to_owned())
                         .and_then(|mounts| {
-                            mount_statuses(runtime, &mounts)?
+                            mount_statuses(runtime, mounts.ready()?)?
                                 .into_iter()
                                 .map(|info| {
                                     serde_json::to_string(&info)
@@ -991,81 +1095,47 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                     continue;
                 }
                 if matches!(request, AccountRequest::MountStatus) {
-                    let response = match mount.try_lock() {
-                        Ok(mount) if mount.iter().any(|m| !m.is_active().unwrap_or(false)) => {
-                            AccountResponse {
-                                error: Some(
-                                    "mountpoint identity changed or cannot be verified".into(),
-                                ),
-                                spaces: Vec::new(),
-                                entries: Vec::new(),
-                                mount: None,
-                                journal: None,
-                                write_turn: None,
-                                sync_status: None,
+                    let result = mount
+                        .try_lock()
+                        .map_err(|_| "mount operation is in progress".to_owned())
+                        .and_then(|registry| {
+                            let mounts = registry.ready()?;
+                            if mounts.iter().any(|mount| !mount.is_active().unwrap_or(false)) {
+                                return Err(
+                                    "mountpoint identity changed or cannot be verified".to_owned()
+                                );
                             }
-                        }
-                        Ok(mount)
-                            if mount.is_empty()
-                                && cirrus_fuse::recovery_pending(runtime).unwrap_or(true) =>
-                        {
-                            AccountResponse {
-                                error: Some(
-                                    "stale mount record requires recovery or inspection".into(),
-                                ),
-                                spaces: Vec::new(),
-                                entries: Vec::new(),
-                                mount: None,
-                                journal: None,
-                                write_turn: None,
-                                sync_status: None,
+                            if mounts.is_empty()
+                                && cirrus_fuse::recovery_pending(runtime).unwrap_or(true)
+                            {
+                                return Err(
+                                    "stale mount record requires recovery or inspection".to_owned()
+                                );
                             }
-                        }
-                        Ok(mount)
-                            if !mount.is_empty()
-                                && check_mount_owners(runtime, &mount).is_err() =>
-                        {
-                            AccountResponse {
-                                error: Some("stale or ambiguous mount records require recovery or inspection".into()),
-                                spaces: Vec::new(),
-                                entries: Vec::new(),
-                                mount: None,
-                                journal: None,
-                                write_turn: None,
-                                sync_status: None,
+                            if !mounts.is_empty() && check_mount_owners(runtime, mounts).is_err() {
+                                return Err("stale or ambiguous mount records require recovery or inspection".to_owned());
                             }
-                        }
-                        Ok(mount) if mount.len() > 1 => AccountResponse {
-                            error: Some(
-                                "multiple Spaces are mounted; select a Space to unmount".into(),
-                            ),
-                            spaces: Vec::new(),
-                            entries: Vec::new(),
-                            mount: None,
-                            journal: None,
-                            write_turn: None,
-                            sync_status: None,
-                        },
-                        Ok(mount) => AccountResponse {
-                            error: None,
-                            spaces: Vec::new(),
-                            entries: Vec::new(),
-                            mount: mount
+                            if mounts.len() > 1 {
+                                return Err(
+                                    "multiple Spaces are mounted; select a Space to unmount".to_owned()
+                                );
+                            }
+                            Ok(mounts
                                 .first()
-                                .map(|m| m.path().to_string_lossy().into_owned()),
-                            journal: None,
-                            write_turn: None,
-                            sync_status: None,
-                        },
-                        Err(_) => AccountResponse {
-                            error: Some("mount operation is in progress".into()),
-                            spaces: Vec::new(),
-                            entries: Vec::new(),
-                            mount: None,
-                            journal: None,
-                            write_turn: None,
-                            sync_status: None,
-                        },
+                                .map(|mount| mount.path().to_string_lossy().into_owned()))
+                        });
+                    let (error, mounted) = match result {
+                        Ok(mounted) => (None, mounted),
+                        Err(error) => (Some(error), None),
+                    };
+                    let response = AccountResponse {
+                        error,
+                        spaces: Vec::new(),
+                        entries: Vec::new(),
+                        mount: mounted,
+                        journal: None,
+                        write_turn: None,
+                        sync_status: None,
                     };
                     let _ = write_account_response(&mut stream, response);
                     continue;
@@ -1134,20 +1204,27 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                     // writable mount/unmount need not wait for background auth.
                     let local_offline =
                         matches!(&request, AccountRequest::WritableOfflineMountSpace { .. })
-                            || mount.lock().is_ok_and(|mounts| match &request {
-                                AccountRequest::Unmount => {
-                                    mounts.len() == 1 && mounts[0].is_offline_writable()
+                            || mount.lock().is_ok_and(|registry| {
+                                let Ok(mounts) = registry.ready() else {
+                                    return false;
+                                };
+                                match &request {
+                                    AccountRequest::Unmount => {
+                                        mounts.len() == 1 && mounts[0].is_offline_writable()
+                                    }
+                                    AccountRequest::UnmountSpace { instance, space } => {
+                                        Accounts::canonical_instance(instance).is_ok_and(
+                                            |canonical| {
+                                                mounts.iter().any(|mount| {
+                                                    mount.instance() == canonical
+                                                        && mount.space_id() == space
+                                                        && mount.is_offline_writable()
+                                                })
+                                            },
+                                        )
+                                    }
+                                    _ => false,
                                 }
-                                AccountRequest::UnmountSpace { instance, space } => {
-                                    Accounts::canonical_instance(instance).is_ok_and(|canonical| {
-                                        mounts.iter().any(|mount| {
-                                            mount.instance() == canonical
-                                                && mount.space_id() == space
-                                                && mount.is_offline_writable()
-                                        })
-                                    })
-                                }
-                                _ => false,
                             });
                     if let Err(error) = if local_offline {
                         Ok(())
@@ -1171,7 +1248,10 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                     // Operations from the control client can change the journal or
                     // credentials without passing through the mounted filesystem.
                     accounts.invalidate_mount_metadata();
-                    let mounted = mount.lock().ok().is_some_and(|m| !m.is_empty());
+                    let mounted = mount
+                        .lock()
+                        .ok()
+                        .is_some_and(|registry| registry.has_mounts());
                     let mut write_turn = None;
                     let offline_writable =
                         matches!(&request, AccountRequest::WritableOfflineMountSpace { .. });
@@ -1402,10 +1482,9 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                             .map(|()| (Vec::new(), Vec::new()))
                             .map_err(|e| e.to_string()),
                         AccountRequest::Mount { instance, path } => (|| {
-                            let mut slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
-                            check_mount_owners(&worker_runtime, &slot)?;
+                            let mut operation = MountOperation::begin(&mount)?;
+                            let slot = &mut operation.mounts;
+                            check_mount_owners(&worker_runtime, slot)?;
                             if !slot.is_empty() {
                                 return Err(
                                     "use an explicit Space ID when another Space is mounted"
@@ -1435,10 +1514,9 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                             if automatic && !offline_writable {
                                 return Err("offline mounts require restarting the service with --no-auto-sync".to_owned());
                             }
-                            let mut slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
-                            check_mount_owners(&worker_runtime, &slot)?;
+                            let mut operation = MountOperation::begin(&mount)?;
+                            let slot = &mut operation.mounts;
+                            check_mount_owners(&worker_runtime, slot)?;
                             let canonical = Accounts::canonical_instance(&instance)
                                 .map_err(|e| e.to_string())?;
                             let path_ref = std::path::Path::new(&path);
@@ -1473,10 +1551,9 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                             space,
                             path,
                         } => (|| {
-                            let mut slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
-                            check_mount_owners(&worker_runtime, &slot)?;
+                            let mut operation = MountOperation::begin(&mount)?;
+                            let slot = &mut operation.mounts;
+                            check_mount_owners(&worker_runtime, slot)?;
                             let canonical = Accounts::canonical_instance(&instance)
                                 .map_err(|e| e.to_string())?;
                             if slot.iter().any(|mount| {
@@ -1524,19 +1601,7 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                                     "account credentials await keyring persistence".to_owned()
                                 );
                             }
-                            let mut slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
-                            if slot.len() != 1 {
-                                return Err(if slot.is_empty() {
-                                    "no Space is mounted"
-                                } else {
-                                    "multiple Spaces are mounted; select a Space to unmount"
-                                }
-                                .to_owned());
-                            }
-                            slot[0].unmount().map_err(|e| e.to_string())?;
-                            slot.remove(0);
+                            MountOperation::begin(&mount)?.unmount(None)?;
                             if accounts.has_pending_credentials().unwrap_or(true) {
                                 return Err("Space unmounted, but account credentials await keyring persistence".to_owned());
                             }
@@ -1550,15 +1615,7 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                             }
                             let canonical = Accounts::canonical_instance(&instance)
                                 .map_err(|e| e.to_string())?;
-                            let mut slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
-                            let index = slot
-                                .iter()
-                                .position(|m| m.instance() == canonical && m.space_id() == space)
-                                .ok_or_else(|| "Space is not mounted".to_owned())?;
-                            slot[index].unmount().map_err(|e| e.to_string())?;
-                            slot.remove(index);
+                            MountOperation::begin(&mount)?.unmount(Some((&canonical, &space)))?;
                             if accounts.has_pending_credentials().unwrap_or(true) {
                                 return Err("Space unmounted, but account credentials await keyring persistence".to_owned());
                             }
@@ -1566,9 +1623,8 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                         })(
                         ),
                         AccountRequest::RecoverMount { path } => (|| {
-                            let slot = mount
-                                .lock()
-                                .map_err(|_| "mount state is unavailable".to_owned())?;
+                            let operation = MountOperation::begin(&mount)?;
+                            let slot = &operation.mounts;
                             if slot
                                 .iter()
                                 .any(|mount| mount.path() == std::path::Path::new(&path))
@@ -1652,20 +1708,36 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
                 let _ = write_line(&mut stream, STOP_PENDING_RESPONSE, Instant::now() + TIMEOUT);
                 continue;
             }
+            // STOP owns the accept loop; foreground/reply owners have drained
+            // and paused scheduler admission excludes refresh. No IPC publisher
+            // can observe this temporary transfer of the mount owners.
+            let mut draining = {
+                let mut slot = mount
+                    .lock()
+                    .map_err(|_| io::Error::other("mount state is unavailable"))?;
+                std::mem::take(slot.ready_mut().map_err(io::Error::other)?)
+            };
+            let unmounted = (|| -> io::Result<()> {
+                while !draining.is_empty() {
+                    draining[0].unmount()?;
+                    draining.remove(0);
+                }
+                Ok(())
+            })();
             {
                 let mut slot = mount
                     .lock()
                     .map_err(|_| io::Error::other("mount state is unavailable"))?;
-                while !slot.is_empty() {
-                    if let Err(error) = slot[0].unmount() {
-                        scheduler.resume();
-                        let message = format!("CIRRUS/2 ERROR cannot unmount Space: {error}\n");
-                        let _ =
-                            write_line(&mut stream, message.as_bytes(), Instant::now() + TIMEOUT);
-                        continue 'serve;
-                    }
-                    slot.remove(0);
-                }
+                // Restore the failed owner and untouched suffix before resuming.
+                slot.ready_mut()
+                    .map_err(io::Error::other)?
+                    .append(&mut draining);
+            }
+            if let Err(error) = unmounted {
+                scheduler.resume();
+                let message = format!("CIRRUS/2 ERROR cannot unmount Space: {error}\n");
+                let _ = write_line(&mut stream, message.as_bytes(), Instant::now() + TIMEOUT);
+                continue 'serve;
             }
             // A FUSE request can finish a token refresh during unmount. Check
             // again after joining the worker, before discarding account state.

@@ -1,27 +1,31 @@
 use std::os::fd::AsRawFd;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 use rustix::{
-    fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags},
+    fs::{self, AtFlags, FileType, Mode, OFlags},
     process,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{AccountError, CleanCacheStatus, FileVersion, ReadSession, ownership};
+use crate::{
+    AccountError, CleanCacheStatus, FileVersion, ReadSession, account_storage::StorageRoot,
+};
 
 const CACHE_APP_ID: i64 = 0x4344_4331;
 const MAX_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 1024;
-static OPEN_LOCK: Mutex<()> = Mutex::new(());
 
-fn database(create: bool) -> Result<Option<Connection>, AccountError> {
-    let _guard = OPEN_LOCK
-        .lock()
+fn database(root: &StorageRoot, create: bool) -> Result<Option<Connection>, AccountError> {
+    let database = crate::sqlite_open::Database::Cache;
+    let _guard = database
+        .opening_gate()
         .map_err(|_| AccountError::new("cache is unavailable"))?;
-    let dir = ownership::state_dir()?;
+    let dir = root.directory();
     let stat_existing = || fs::statat(&dir, "cache.db", AtFlags::SYMLINK_NOFOLLOW);
+    #[cfg(target_os = "linux")]
     let (stat, created) = if create {
         match fs::openat2(
             &dir,
@@ -47,6 +51,14 @@ fn database(create: bool) -> Result<Option<Connection>, AccountError> {
             Err(_) => return Err(AccountError::new("cannot inspect cache")),
         }
     };
+    #[cfg(target_os = "macos")]
+    let (stat, created) = match database
+        .prepare_darwin(root, create)
+        .map_err(|_| AccountError::new("cannot admit cache"))?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
     // An extra open/close of an existing file releases process-wide SQLite locks.
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || stat.st_uid != process::geteuid().as_raw()
@@ -57,6 +69,7 @@ fn database(create: bool) -> Result<Option<Connection>, AccountError> {
             "cache has unsafe ownership or permissions",
         ));
     }
+    #[cfg(target_os = "linux")]
     let proc = fs::openat2(
         fs::CWD,
         "/proc",
@@ -65,6 +78,7 @@ fn database(create: bool) -> Result<Option<Connection>, AccountError> {
         ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|_| AccountError::new("trusted procfs is required for cache"))?;
+    #[cfg(target_os = "linux")]
     if fs::fstatfs(&proc)
         .map_err(|_| AccountError::new("cannot inspect procfs"))?
         .f_type
@@ -72,9 +86,25 @@ fn database(create: bool) -> Result<Option<Connection>, AccountError> {
     {
         return Err(AccountError::new("trusted procfs is required for cache"));
     }
+    #[cfg(target_os = "linux")]
     let path = format!("/proc/self/fd/{}/cache.db", dir.as_raw_fd());
+    #[cfg(target_os = "linux")]
+    database
+        .check_auxiliaries(&dir)
+        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
+    #[cfg(target_os = "linux")]
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|_| AccountError::new("cannot open cache"))?;
+    #[cfg(target_os = "macos")]
+    let conn = {
+        database
+            .check_darwin(root, &stat)
+            .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
+        database
+            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|_| AccountError::new("cannot open cache"))?
+    };
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| AccountError::new("cache changed"))?;
     conn.busy_timeout(Duration::from_secs(1))
         .map_err(|_| AccountError::new("cannot configure cache"))?;
     if created {
@@ -108,6 +138,15 @@ fn database(create: bool) -> Result<Option<Connection>, AccountError> {
     // The clean cache is separate from dirty data and pins, with room for SQLite metadata.
     conn.execute_batch("PRAGMA max_page_count=24576")
         .map_err(|_| AccountError::new("cannot bound cache"))?;
+    #[cfg(target_os = "linux")]
+    database
+        .check_auxiliaries(&dir)
+        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
+    #[cfg(target_os = "macos")]
+    database
+        .check_darwin(root, &stat)
+        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
+    crate::sqlite_open::check_unmoved(&conn).map_err(|_| AccountError::new("cache changed"))?;
     Ok(Some(conn))
 }
 
@@ -115,8 +154,8 @@ fn encoded(version: &FileVersion) -> Result<String, AccountError> {
     serde_json::to_string(version).map_err(|_| AccountError::new("invalid cache version"))
 }
 
-pub(crate) fn status() -> Result<CleanCacheStatus, AccountError> {
-    let (bytes, ranges) = match database(false)? {
+pub(crate) fn status_in(root: &StorageRoot) -> Result<CleanCacheStatus, AccountError> {
+    let (bytes, ranges) = match database(root, false)? {
         Some(conn) => conn
             .query_row(
                 "SELECT coalesce(sum(length(body)),0),count(*) FROM ranges",
@@ -138,15 +177,16 @@ pub(crate) fn status() -> Result<CleanCacheStatus, AccountError> {
 /// or budget lock: SQLite may wait, checkpoint, or fail to release physical WAL
 /// space. Admission always remeasures afterward; row deletion is not free-space
 /// proof. State DB, pins, dirty objects and orphans are never touched here.
-pub(crate) fn reclaim_for_storage_pressure() -> Result<bool, AccountError> {
-    let _lease = match crate::storage::sql_reservation::cleanup_lease(
+pub(crate) fn reclaim_for_storage_pressure_in(root: &StorageRoot) -> Result<bool, AccountError> {
+    let _lease = match crate::storage::sql_reservation::cleanup_lease_in(
+        root,
         crate::storage::sql_reservation::Store::Cache,
     ) {
         Ok(lease) => lease,
         Err(error) if error.is_operation_busy() => return Ok(false),
         Err(error) => return Err(error),
     };
-    let Some(mut conn) = database(false)? else {
+    let Some(mut conn) = database(root, false)? else {
         return Ok(false);
     };
     let tx = conn
@@ -179,7 +219,7 @@ pub(crate) fn reclaim_for_storage_pressure() -> Result<bool, AccountError> {
 }
 
 pub(crate) fn contains(session: &ReadSession, version: &FileVersion) -> Result<bool, AccountError> {
-    let Some(conn) = database(false)? else {
+    let Some(conn) = database(&session.root, false)? else {
         return Ok(false);
     };
     conn.query_row(
@@ -194,8 +234,8 @@ pub(crate) fn contains(session: &ReadSession, version: &FileVersion) -> Result<b
     .map_err(|_| AccountError::new("cannot inspect cached ranges"))
 }
 
-pub(crate) fn generation() -> Result<i64, AccountError> {
-    let Some(conn) = database(false)? else {
+pub(crate) fn generation_in(root: &StorageRoot) -> Result<i64, AccountError> {
+    let Some(conn) = database(root, false)? else {
         return Ok(0);
     };
     conn.query_row("SELECT value FROM generation", [], |row| row.get(0))
@@ -207,11 +247,15 @@ pub(crate) fn evict(
     space: &str,
     path: &[String],
 ) -> Result<(), AccountError> {
-    let _lease = crate::storage::sql_reservation::cleanup_lease(
+    let root = &session.root;
+    let _lease = crate::storage::sql_reservation::cleanup_lease_in(
+        root,
         crate::storage::sql_reservation::Store::Cache,
     )?;
-    let Some(mut conn) =
-        database(crate::storage::limits::view().is_ok_and(|view| view.limits.is_none()))?
+    let Some(mut conn) = database(
+        root,
+        crate::storage::limits::view_in(root).is_ok_and(|view| view.limits.is_none()),
+    )?
     else {
         return Ok(());
     };
@@ -264,7 +308,8 @@ pub(crate) fn read(
     offset: u64,
     length: u32,
 ) -> Result<Option<Vec<u8>>, AccountError> {
-    read_identity(
+    read_identity_in(
+        &session.root,
         &session.account.issuer,
         &session.account.subject,
         version,
@@ -274,7 +319,8 @@ pub(crate) fn read(
     )
 }
 
-pub(crate) fn read_identity(
+pub(crate) fn read_identity_in(
+    root: &StorageRoot,
     issuer: &str,
     subject: &str,
     version: &FileVersion,
@@ -286,7 +332,7 @@ pub(crate) fn read_identity(
         .checked_add(u64::from(length))
         .filter(|end| length > 0 && *end <= version.size && *end <= i64::MAX as u64)
         .ok_or_else(|| AccountError::new("invalid cached range"))?;
-    let Some(conn) = database(false)? else {
+    let Some(conn) = database(root, false)? else {
         return Ok(None);
     };
     let version = encoded(version)?;
@@ -315,7 +361,7 @@ pub(crate) fn read_identity(
         position += count as u64;
         // With policy enabled a cache hit is read-only, not an unreserved
         // metadata transaction. The next admitted insert still bounds the LRU.
-        if touch && crate::storage::limits::view().is_ok_and(|view| view.limits.is_none()) {
+        if touch && crate::storage::limits::view_in(root).is_ok_and(|view| view.limits.is_none()) {
             let _ = conn.execute(
                 "UPDATE ranges SET accessed=unixepoch() WHERE rowid=?1",
                 [id],
@@ -332,6 +378,7 @@ pub(crate) fn store(
     bytes: &[u8],
     generation: i64,
 ) -> Result<(), AccountError> {
+    let root = &session.root;
     if bytes.is_empty()
         || bytes.len() > 131_072
         || offset
@@ -340,14 +387,15 @@ pub(crate) fn store(
     {
         return Err(AccountError::new("invalid cached range"));
     }
-    let reservation = if crate::storage::limits::view()?.limits.is_some() {
-        let existing = database(false)?;
+    let reservation = if crate::storage::limits::view_in(root)?.limits.is_some() {
+        let existing = database(root, false)?;
         let metadata = serde_json::to_vec(version)
             .map_err(|_| AccountError::new("invalid cached version"))?
             .len() as u64
             + session.account.issuer.len() as u64
             + session.account.subject.len() as u64;
-        crate::storage::sql_reservation::SqlReservation::begin(
+        crate::storage::sql_reservation::SqlReservation::begin_in(
+            root,
             crate::storage::sql_reservation::Store::Cache,
             existing.as_ref(),
             bytes.len() as u64,
@@ -357,7 +405,7 @@ pub(crate) fn store(
     } else {
         None
     };
-    let Some(mut conn) = database(true)? else {
+    let Some(mut conn) = database(root, true)? else {
         return Err(AccountError::new("cache is unavailable"));
     };
     if let Some(reservation) = &reservation {
@@ -405,7 +453,7 @@ pub(crate) fn store(
         .map_err(|_| AccountError::new("cannot save cached range"))?;
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
-    } else if crate::storage::limits::view()?.limits.is_some() {
+    } else if crate::storage::limits::view_in(root)?.limits.is_some() {
         return Err(AccountError::new(crate::storage::limits::PRESSURE));
     }
     tx.commit()

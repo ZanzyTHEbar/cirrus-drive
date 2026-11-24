@@ -3,28 +3,30 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::{
-    AccountError, FileVersion, PendingWrite, database, encode_parents, has_unresolved, path_key,
-    sqlite_storage_error, write_needs_attention,
+    AccountError, FileVersion, PendingWrite, StorageRoot, database_in, encode_parents,
+    has_unresolved, path_key, sqlite_storage_error, write_needs_attention,
 };
 
 pub(crate) fn write_turn_dependencies(
+    root: &StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<bool, AccountError> {
-    database()?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND state='pending' AND op_type!='write')", params![instance,space], |row| row.get(0))
+    database_in(root)?.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND state='pending' AND op_type!='write')", params![instance,space], |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect write dependencies"))
 }
 
 pub(crate) fn write_turn_remaining(
+    root: &StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<crate::WriteTurnOutcome, AccountError> {
-    let conn = database()?;
+    let conn = database_in(root)?;
     let attention: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND state IN ('conflict','uncertain'))", params![instance,space], |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect write outcome"))?;
     Ok(if attention {
         crate::WriteTurnOutcome::Attention
-    } else if has_unresolved(instance, space)? {
+    } else if has_unresolved(root, instance, space)? {
         crate::WriteTurnOutcome::Dependencies
     } else {
         crate::WriteTurnOutcome::Idle
@@ -32,6 +34,7 @@ pub(crate) fn write_turn_remaining(
 }
 
 pub(crate) struct UploadVerification {
+    root: StorageRoot,
     pub operation: PendingWrite,
     pub digest: String,
     pub size: u64,
@@ -41,7 +44,38 @@ pub(crate) struct UploadVerification {
 }
 
 impl UploadVerification {
+    pub(crate) fn check_progress(&self, instance: &str) -> Result<(), AccountError> {
+        if self.offset > self.size
+            || self.parent_index > self.operation.parents.len()
+            || (self.parent_index != 0 && self.offset != self.size)
+            || self.version.as_ref().is_some_and(|version| {
+                version.instance != instance
+                    || version.space != self.operation.space
+                    || version.path != self.operation.path
+                    || version.size != self.size
+                    || !crate::dav::valid_remote_id(&version.id)
+                    || !crate::dav::strong_etag(&version.etag)
+            })
+            || (self.version.is_none() && (self.offset != 0 || self.parent_index != 0))
+        {
+            return Err(AccountError::new(
+                "invalid upload verification progress; outcome remains uncertain",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_root(&self, root: &StorageRoot) -> Result<(), AccountError> {
+        if self.root.identity() != root.identity() {
+            return Err(AccountError::new(
+                "upload verification storage root changed",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn record(
+        root: &StorageRoot,
         instance: &str,
         operation: &PendingWrite,
         digest: String,
@@ -52,7 +86,7 @@ impl UploadVerification {
         // even if receipt persistence fails, and must never be reset to pending.
         #[cfg(feature = "fault-injection")]
         crate::wait_test_window("CIRRUS_TEST_VERIFICATION_RECEIPT_WINDOW")?;
-        let mut conn = database()?;
+        let mut conn = database_in(root)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| sqlite_storage_error(error, "cannot begin upload verification"))?;
@@ -81,6 +115,7 @@ impl UploadVerification {
         tx.commit()
             .map_err(|error| sqlite_storage_error(error, "cannot commit upload verification"))?;
         Ok(Self {
+            root: root.clone(),
             operation: operation.clone(),
             digest,
             size,
@@ -91,7 +126,8 @@ impl UploadVerification {
     }
 
     pub(crate) fn save(&self, instance: &str) -> Result<(), AccountError> {
-        if !write_needs_attention(instance, &self.operation).map_err(|mut error| {
+        self.check_progress(instance)?;
+        if !write_needs_attention(&self.root, instance, &self.operation).map_err(|mut error| {
             error.retryable_read = true;
             error
         })? {
@@ -105,20 +141,6 @@ impl UploadVerification {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|_| AccountError::new("cannot encode upload version"))?;
-        if self.offset > self.size
-            || self.parent_index > self.operation.parents.len()
-            || self.version.as_ref().is_some_and(|version| {
-                version.instance != instance
-                    || version.space != self.operation.space
-                    || version.path != self.operation.path
-                    || version.size != self.size
-            })
-            || (self.version.is_none() && (self.offset != 0 || self.parent_index != 0))
-        {
-            return Err(AccountError::new(
-                "invalid upload verification progress; outcome remains uncertain",
-            ));
-        }
         let encoded = serde_json::to_string(&self.operation)
             .map_err(|_| AccountError::new("cannot encode upload snapshot"))?;
         let parents = encode_parents(&self.operation.path, &self.operation.parents)?;
@@ -127,7 +149,7 @@ impl UploadVerification {
         // the PUT/GET or source reads; record/confirmation/recovery stay uncapped.
         let result = (|| {
             let reservation;
-            let mut conn = database()?;
+            let mut conn = database_in(&self.root)?;
             let planning_version: i64 = conn
                 .pragma_query_value(None, "data_version", |row| row.get(0))
                 .map_err(|_| AccountError::new("cannot inspect verification progress plan"))?;
@@ -144,7 +166,10 @@ impl UploadVerification {
                     "upload verification changed; receipt and local copy retained",
                 ));
             }
-            let planned = if crate::storage::limits::view()?.limits.is_some() {
+            let planned = if crate::storage::limits::view_in(&self.root)?
+                .limits
+                .is_some()
+            {
                 serde_json::to_vec(&(&version, self.offset, self.parent_index, self.operation.id))
                     .map_err(|_| AccountError::new("cannot size verification progress"))?
                     .len() as u64
@@ -153,7 +178,8 @@ impl UploadVerification {
             };
             #[cfg(feature = "fault-injection")]
             crate::wait_test_window("CIRRUS_TEST_VERIFICATION_ADMISSION_WINDOW")?;
-            reservation = crate::storage::sql_reservation::SqlReservation::begin(
+            reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+                &self.root,
                 crate::storage::sql_reservation::Store::State,
                 Some(&conn),
                 planned,
@@ -193,7 +219,10 @@ impl UploadVerification {
             crate::wait_test_window("CIRRUS_TEST_VERIFICATION_COMMIT_WINDOW")?;
             if let Some(reservation) = &reservation {
                 reservation.validate(&tx)?;
-            } else if crate::storage::limits::view()?.limits.is_some() {
+            } else if crate::storage::limits::view_in(&self.root)?
+                .limits
+                .is_some()
+            {
                 return Err(AccountError::new(crate::storage::limits::PRESSURE));
             }
             let committed = tx.commit();
@@ -232,7 +261,7 @@ impl UploadVerification {
     }
 
     pub(crate) fn discard(&self) -> Result<(), AccountError> {
-        database()?
+        database_in(&self.root)?
             .execute(
                 "DELETE FROM upload_verifications WHERE operation_id=?1",
                 [self.operation.id],
@@ -243,11 +272,12 @@ impl UploadVerification {
 }
 
 pub(crate) fn upload_verifications(
+    root: &StorageRoot,
     instance: &str,
     space: Option<&str>,
     after: i64,
 ) -> Result<Vec<UploadVerification>, AccountError> {
-    let conn = database()?;
+    let conn = database_in(root)?;
     let mut statement = conn.prepare("SELECT v.operation_id,j.space,v.operation,v.digest,v.size,v.version,v.verified_offset,v.parent_index FROM upload_verifications v JOIN operation_journal j ON j.id=v.operation_id WHERE j.instance=?1 AND (?2 IS NULL OR j.space=?2) AND j.state='uncertain' AND j.op_type='write' AND j.id>?3 ORDER BY j.id LIMIT 32")
         .map_err(|_| AccountError::new("cannot load upload verifications"))?;
     let rows = statement
@@ -275,24 +305,112 @@ pub(crate) fn upload_verifications(
             .map_err(|_| AccountError::new("invalid upload version"))?;
         if operation.id != id
             || operation.space != space
-            || offset > size
-            || parent_index > operation.parents.len()
             || digest.len() != 64
             || !digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || !write_needs_attention(instance, &operation)?
+            || !write_needs_attention(root, instance, &operation)?
         {
             return Err(AccountError::new(
                 "invalid upload verification; local copy retained",
             ));
         }
-        Ok(UploadVerification {
+        let verification = UploadVerification {
+            root: root.clone(),
             operation,
             digest,
             size,
             version,
             offset,
             parent_index,
-        })
+        };
+        verification.check_progress(instance)?;
+        Ok(verification)
     })
     .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod acceptance {
+    use super::*;
+    use sha2::Digest;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    #[ignore = "requires an explicit empty private receipt container"]
+    fn rejects_unversioned_progress_on_restart() {
+        let container = std::path::PathBuf::from(
+            std::env::var_os("CIRRUS_TEST_RECEIPT_CONTAINER").expect("explicit private container"),
+        );
+        assert_eq!(container, std::fs::canonicalize(&container).unwrap());
+        assert_eq!(
+            container.parent().unwrap().parent().unwrap(),
+            std::path::Path::new("/workspaces/.ubuntu-disposable-scratch")
+        );
+        let metadata = std::fs::symlink_metadata(&container).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        assert!(std::fs::read_dir(&container).unwrap().next().is_none());
+        let root = StorageRoot::open_container(&container).unwrap();
+        let instance = "https://receipt-acceptance.invalid/";
+        crate::offline::bind_identity_in(&root, instance, "fixture-issuer", "fixture-subject")
+            .unwrap();
+        let bytes = b"immutable receipt restart payload";
+        let mut candidate = crate::offline::overlay::Overlay::empty_in(&root);
+        candidate.write(0, bytes).unwrap();
+        let staged = candidate.save().unwrap();
+        let conn = database_in(&root).unwrap();
+        let path = vec!["folder".to_owned(), "draft.txt".to_owned()];
+        let parents = vec![crate::DirectoryIdentity::Remote("fixture-parent".into())];
+        conn.execute(
+            "INSERT INTO operation_journal(instance,space,path,op_type,staged_file,state,updated_at) VALUES(?1,'fixture-space',?2,'write',?3,'uncertain',1)",
+            params![instance, path_key(&path).unwrap(), staged],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        crate::offline::save_operation_parents(&conn, id, &path, &parents, None).unwrap();
+        let operation = PendingWrite {
+            id,
+            space: "fixture-space".into(),
+            path,
+            base_id: None,
+            base_etag: None,
+            staged,
+            parents,
+        };
+        drop(conn);
+        UploadVerification::record(
+            &root,
+            instance,
+            &operation,
+            format!("{:x}", sha2::Sha256::digest(bytes)),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let loaded = upload_verifications(&root, instance, None, 0).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].version.is_none());
+        assert_eq!((loaded[0].offset, loaded[0].parent_index), (0, 0));
+        drop(loaded);
+
+        let conn = database_in(&root).unwrap();
+        conn.execute(
+            "UPDATE upload_verifications SET verified_offset=size,parent_index=?2 WHERE operation_id=?1 AND version IS NULL",
+            params![id, operation.parents.len()],
+        )
+        .unwrap();
+        let snapshot = |conn: &rusqlite::Connection| -> String {
+            conn.query_row(
+                "SELECT json_array(j.state,v.operation,v.digest,v.size,v.version,v.verified_offset,v.parent_index) FROM upload_verifications v JOIN operation_journal j ON j.id=v.operation_id WHERE v.operation_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let malformed = snapshot(&conn);
+        drop(conn);
+
+        assert!(upload_verifications(&root, instance, None, 0).is_err());
+        let reopened = database_in(&root).unwrap();
+        assert_eq!(snapshot(&reopened), malformed);
+    }
 }

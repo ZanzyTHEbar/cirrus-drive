@@ -547,9 +547,11 @@ version = "0.1.0"
 dependencies = [
  "cirrus-discovery",
  "cirrus-runtime",
+ "core-foundation",
  "dav-xml",
  "httparse",
  "httpdate",
+ "libc",
  "md-5",
  "nix",
  "oauth2",
@@ -560,6 +562,7 @@ dependencies = [
  "rusqlite",
  "rustix 1.1.5",
  "secret-service",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha1",
@@ -578,6 +581,7 @@ dependencies = [
  "cirrus-discovery",
  "cirrus-fuse",
  "cirrus-runtime",
+ "libc",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -3927,6 +3931,16 @@ dependencies = [
  "serde",
  "sha2 0.11.1",
  "zbus 5.19.0",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "317936bbbd05227752583946b9e66d7ce3b489f84e11a94a510b4437fef407d7"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]

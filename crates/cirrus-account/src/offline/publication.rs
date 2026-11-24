@@ -3,9 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    AccountError, database, load_operation_parents, path_key, validate_parent_dependencies,
-};
+use super::{AccountError, load_operation_parents, path_key, validate_parent_dependencies};
 
 const PREFIX: &str = "local publication recovery:";
 
@@ -98,11 +96,12 @@ pub(super) fn planned_fence_bytes(
         .ok_or_else(unavailable)
 }
 
-pub(crate) fn spaces(
+pub(crate) fn spaces_in(
+    storage: &crate::account_storage::StorageRoot,
     instance: &str,
     space: Option<&str>,
 ) -> Result<std::collections::HashSet<String>, AccountError> {
-    let conn = database()?;
+    let conn = super::database_in(storage)?;
     let mut stmt = conn.prepare("SELECT DISTINCT space FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2) AND error_msg GLOB 'local publication recovery:*'")
         .map_err(|_| unavailable())?;
     stmt.query_map(params![instance, space], |row| row.get::<_, String>(0))
@@ -130,7 +129,8 @@ pub(crate) fn ensure_clear(
 /// Call under account/staging ownership. Reopening closes the failed SQLite
 /// transaction before interpreting its outcome. No COMMIT or write is replayed.
 /// `expected` is the exact attempted candidate; None is an explicit fresh open.
-pub(crate) fn recover(
+pub(crate) fn recover_in(
+    storage: &crate::account_storage::StorageRoot,
     instance: &str,
     space: &str,
     path: &[String],
@@ -138,7 +138,7 @@ pub(crate) fn recover(
     expected: Option<&str>,
     verify_payloads: bool,
 ) -> Result<bool, AccountError> {
-    let mut conn = database()?;
+    let mut conn = super::database_in(storage)?;
     let marker: Option<String> = conn.query_row("SELECT error_msg FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4", params![id,instance,space,path_key(path)?], |row| row.get(0)).optional().map_err(|_| unavailable())?.flatten();
     let Some(marker) = marker.filter(|message| message.starts_with(PREFIX)) else {
         return Ok(false);
@@ -172,7 +172,7 @@ pub(crate) fn recover(
     }
     let parents = load_operation_parents(&tx, id, path)?;
     validate_parent_dependencies(&tx, instance, space, path, &parents)?;
-    let root = super::overlay::Overlay::load_in(&tx, &current.root)?;
+    let root = super::overlay::Overlay::load_in_root(storage, &tx, &current.root)?;
     if root.len() != current.size || root.original_base_json()? != current.original_base {
         return Err(unavailable());
     }
