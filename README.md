@@ -1,16 +1,26 @@
 # Cirrus Drive
 
-Cirrus Drive is an experimental Linux OpenCloud client. A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control the daemon. Files are read on demand, and edits are staged locally for synchronization.
+Cirrus Drive is an experimental early-alpha OpenCloud client for Linux, with macOS support under development.
 
-**Use only a disposable server, account and data. This is not production-ready.** Reads cannot guarantee that OpenCloud's returned bytes are atomically bound to the observed version. Concurrent server changes can also cause lost updates during writes, deletes and renames. Namespace and open-handle behavior is incomplete, and filesystem, power-loss and lifecycle guarantees remain unqualified. Local `fsync` does not mean an upload is confirmed. Keep independent backups; pinned or staged data is not a backup.
+This was made partially because I do not like the native Qt OpenCloud app, interface, or filesystem implementation on Linux.
 
-## Requirements
+A per-user daemon mounts Spaces through FUSE; a desktop window and CLI control the daemon. Files are read on demand, and edits are staged locally for synchronization.
+
+v0.1 targets unmodified stock OpenCloud; a custom backend or Reva fork is not required. Cirrus does not add stronger server-side atomicity or concurrency guarantees. Remote bytes are not guaranteed to be atomically bound to observed versions, and concurrent remote changes can cause lost updates during writes, deletes and renames. Local `fsync` does not mean an upload is confirmed. Evaluate this alpha with disposable data and keep independent backups; pinned or staged content is not a backup.
+
+The macOS source and build targets are experimental. Compile/link and standalone worker checks do not establish an installed app, Finder extension, Keychain or Spotlight integration. The instructions below cover Linux, not macOS installation.
+
+## Linux requirements
 
 - Linux with FUSE 3 (`/dev/fuse` and `fusermount3`), a private `XDG_RUNTIME_DIR`, a user D-Bus session, and Linux 5.6 or newer with `openat2` available.
 - A graphical session with a browser, desktop portal and an unlocked Secret Service keyring for sign-in. The desktop window also needs a working Vulkan implementation.
 - Rust toolchain from `rust-toolchain.toml` and the native libraries required to build the workspace. State requires a local filesystem accepted by the coordination checks: ext2/3/4, XFS, Btrfs, tmpfs, F2FS or ZFS. This is an implementation allowlist, not a tested durability matrix; tmpfs is volatile. Network and FUSE filesystems are not supported for state.
 
-Only one account is supported. Multiple Spaces may be mounted at separate locations. Credentials are stored in Secret Service; local state and file content are stored under `~/.local/state/cirrus-drive` without application-level encryption. Same-user processes are not isolated from one another. Storage controls do not impose a hard global limit. There is no state migration or account-removal workflow; updates may reject older state rather than migrate it.
+Only one account is supported for now. Multiple Spaces may be mounted at separate locations. Credentials are stored in Secret Service. Local state and file content are stored under `~/.local/state/cirrus-drive` without application-level encryption. Same-user processes are not isolated from one another. Storage controls do not impose a hard global limit.
+
+> [!NOTE]
+> This is an experimental early alpha, not a production-ready filesystem.
+> There is no state migration or account-removal workflow yet. Updates may reject older state rather than migrate it.
 
 Locking the keyring does not encrypt or revoke access to retained local content. Private file permissions do not protect it from other processes running as you, administrators or someone with access to the underlying disk.
 
@@ -24,7 +34,7 @@ Mounts are private and `noexec`, `nosuid`, `nodev`. File modes are presented as 
 
 Implementation refusal ceilings include 128 open files and 128 open directory handles per mount, 16,384 tracked nodes, and remote listings bounded by 16,383 entries and 2 MiB of encoded metadata. Pins are bounded snapshots (4,096 entries, depth 128, 1 GiB of content per pin), not continuously updated mirrors. Smaller operations may still be refused because of metadata, storage, identity or unresolved-operation constraints. These ceilings are not tested capacity, performance or scale guarantees; no production operating envelope is currently qualified.
 
-## Build and install
+## Build and install (Linux)
 
 ```sh
 cargo build --locked --workspace
@@ -35,7 +45,7 @@ systemctl --user start cirrus-drive.service
 
 The installer uses the debug binaries in `target/debug`, installs user-local binaries, a systemd user service and a desktop launcher, and refuses to replace existing installation files. It does not start or enable the service. To use release binaries instead, build with `cargo build --locked --workspace --release` and run `CIRRUS_BIN_DIR="$PWD/target/release" ./packaging/install.sh`. An experimental Arch package recipe is described in [packaging/arch/README.md](packaging/arch/README.md). Both recipes include the retained [license and notice bundle](THIRD_PARTY_NOTICES.md); release-specific dependency review and actual package qualification remain incomplete and are required before distribution.
 
-Alternatively, run `target/debug/cirrus-daemon` in a terminal; the daemon must remain running while the mount is in use. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
+Alternatively, run `target/debug/cirrus-daemon` in a terminal. The daemon must remain running while the mount is in use. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
 
 ## Connect and mount
 
@@ -47,7 +57,7 @@ cirrus-daemon --mount-space https://cloud.example SPACE_ID /absolute/path/to/emp
 cirrus-daemon --mounts
 ```
 
-Replace the URL and Space ID with those of your disposable instance. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
+Replace the URL and Space ID with those of your instance. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
 
 ## Sync, status and recovery
 
@@ -59,7 +69,7 @@ cirrus-daemon --journal https://cloud.example
 cirrus-daemon --unmount-space https://cloud.example SPACE_ID
 ```
 
-A successful mount enables automatic write-back for that Space; explicit sync is also available. Check sync status and the journal for pending, conflict or uncertain operations. Do not assume a failed or uncertain operation was applied or safely replayed. If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
+A successful mount enables automatic write-back for that Space. Explicit sync is also available. Check sync status and the journal for pending, conflict or uncertain operations. Do not assume a failed or uncertain operation was applied or safely replayed. If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
 
 Retained staged files and pinned copies can be inspected and exported using the commands in `cirrus-daemon --help`; retain the local state when investigating a problem. Saved metadata can be stale, and offline reads fail when the necessary content is unavailable. Do not delete local state or keyring entries to resolve an error without first preserving the data you need.
 
