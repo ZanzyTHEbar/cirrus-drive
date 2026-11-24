@@ -1,220 +1,89 @@
-# Third-party notices: Rune and its fonts
+# Third-party notices
 
-Cirrus Drive depends on Rune at revision `f401bce5a9658413b559760c0c6774c4421324a9` from <https://github.com/anomalyco/rune>. The following notices cover Rune and its embedded fonts, not all dependencies.
+License and copyright texts are retained in [LICENSES](LICENSES/INDEX.md).
+The [inventory](LICENSES/inventory.json) identifies exact versions, source
+revisions, enabled features, notice origins and SHA-256 digests. Upstream
+license expressions describe those packages; they do not replace license texts.
 
-MIT License
+## Scope
 
-Copyright (c) 2026 Christopher Langton
+This bundle inventories the pinned `x86_64-unknown-linux-gnu` daemon and UI
+source graph with workspace default features, without fault injection.
+`runtime-candidate` means reachable through normal dependencies, not proof
+that every crate survives linking. `build-tool` means build dependencies or
+procedural macros and their dependencies; these are retained conservatively
+because tools can contribute generated code. Packages can have both roles.
+Development edges are excluded. Unselected target/feature lock entries are
+listed separately, not represented as distributed code. Cargo metadata's
+feature union is not an exact compilation-unit or binary inventory.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Generated-input records bind the published SPIR-V, Vulkan and XCB bindings
+to their upstream source snapshots, generation recipes and pinned input
+schemas/headers. Their original per-input copyright notices and license
+texts are retained, including Vulkan video headers. Compressed exact inputs
+are included for offline provenance verification, not as additional runtime
+dependencies. This records upstream generation provenance; it does not
+claim to reproduce generation byte-for-byte.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The bundle includes original license/notice documents and additional grants
+from Wayland protocol XML and ring source headers. Some documents cover
+unselected files as well; retaining them does not assert those files are used.
+Rust standard-library copyright notices and their referenced license files
+are included separately from Cargo dependencies.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+### Rune and fonts
 
-## Inter fonts
+Rune, rune-motion and rune-staging use revision
+`f401bce5a9658413b559760c0c6774c4421324a9` of
+<https://github.com/anomalyco/rune>. Their MIT license is retained in the index.
+Rune embeds Inter Regular, Medium and SemiBold in native builds, under the
+included SIL Open Font License 1.1 notice. Its IBM Plex Mono notice is also
+retained; that embedded font is selected for WebAssembly, not this Linux target.
+System fallback fonts are not bundled by this source inventory.
 
-Rune embeds Inter fonts for native builds. The notice from its pinned source follows.
+### Native and data components
 
-Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
+- `libsqlite3-sys` selects bundled SQLite 3.50.2, whose copyright disclaimer
+  is retained alongside the Rust wrapper's license. SQLCipher is not selected;
+  its upstream license document is retained conservatively.
+- `ring` includes native cryptography and assembly, with ISC, Apache and
+  component-specific grants retained. BLAKE3's native implementation is
+  covered by its retained upstream license alternatives.
+- Wayland protocol-generated bindings have per-protocol notices in addition
+  to their Rust wrapper licenses. Unicode data and TLS root data retain their
+  upstream Unicode and CDLA license texts respectively.
+- Wayland, XKB, Vulkan and C/C++ runtime libraries may be system-linked or
+  loaded at runtime. `fuser` selects its pure-Rust Linux mount implementation;
+  a system FUSE helper is not the same as bundled libfuse code. Exact native
+  library versions and static-link exceptions require the release artifact's
+  linkage record. System libraries or fonts redistributed separately require
+  their own notices and any other applicable materials.
 
-This Font Software is licensed under the SIL Open Font License, Version 1.1.
-This license is copied below, and is also available with a FAQ at:
-http://scripts.sil.org/OFL
+## Distribution status
 
------------------------------------------------------------
-SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
------------------------------------------------------------
+**Distribution qualification is incomplete.** [Open review items](LICENSES/review.json)
+cover release-specific build/linkage and package qualification. The installer
+and Arch recipe include the retained bundle using per-file ownership and
+checksum-pinned inputs. Do not distribute a package as notice-complete until
+the remaining review items are resolved and actual release package contents
+have been verified. Disposable packaging fixtures are not release binaries.
+This inventory is not a
+legal compatibility or redistribution-permission guarantee.
 
-PREAMBLE
-The goals of the Open Font License (OFL) are to stimulate worldwide
-development of collaborative font projects, to support the font creation
-efforts of academic and linguistic communities, and to provide a free and
-open framework in which fonts may be shared and improved in partnership
-with others.
+The [historical Linux binary linkage](LICENSES/native-linkage.json) distinguishes
+actual ELF dependencies and linker-map inputs from source-declared runtime
+loaders for the binary hashes recorded there, not the current release candidate.
+That historical pair needs glibc 2.43 or newer. GNU C/GCC runtime package notices
+and license texts are retained; the system shared libraries themselves are
+not redistributed. Rust standard-library and compiler-builtins inputs are
+covered by the retained toolchain notices, not inferred from `ldd`.
 
-The OFL allows the licensed fonts to be used, studied, modified and
-redistributed freely as long as they are not sold by themselves. The
-fonts, including any derivative works, can be bundled, embedded,
-redistributed and/or sold with any software provided that any reserved
-names are not used by derivative works. The fonts and derivatives,
-however, cannot be released under any other type of license. The
-requirement for fonts to remain under this license does not apply
-to any document created using the fonts or their derivatives.
+The historical daemon includes `libc_nonshared.a(pthread_atfork.oS)` and startup
+objects. The applicable exception or LGPL source/relink requirements for
+these exact objects remain unresolved; retaining license texts alone does
+not close that distribution obligation. Desktop/GPU-loaded libraries and
+drivers remain environment-dependent and were not exercised by ELF inspection.
+Source verification and archive/content checks do not qualify current native
+linkage; historical evidence cannot pass release-completeness checks.
 
-DEFINITIONS
-"Font Software" refers to the set of files released by the Copyright
-Holder(s) under this license and clearly marked as such. This may
-include source files, build scripts and documentation.
-
-"Reserved Font Name" refers to any names specified as such after the
-copyright statement(s).
-
-"Original Version" refers to the collection of Font Software components as
-distributed by the Copyright Holder(s).
-
-"Modified Version" refers to any derivative made by adding to, deleting,
-or substituting -- in part or in whole -- any of the components of the
-Original Version, by changing formats or by porting the Font Software to a
-new environment.
-
-"Author" refers to any designer, engineer, programmer, technical
-writer or other person who contributed to the Font Software.
-
-PERMISSION AND CONDITIONS
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of the Font Software, to use, study, copy, merge, embed, modify,
-redistribute, and sell modified and unmodified copies of the Font
-Software, subject to the following conditions:
-
-1) Neither the Font Software nor any of its individual components,
-in Original or Modified Versions, may be sold by itself.
-
-2) Original or Modified Versions of the Font Software may be bundled,
-redistributed and/or sold with any software, provided that each copy
-contains the above copyright notice and this license. These can be
-included either as stand-alone text files, human-readable headers or
-in the appropriate machine-readable metadata fields within text or
-binary files as long as those fields can be easily viewed by the user.
-
-3) No Modified Version of the Font Software may use the Reserved Font
-Name(s) unless explicit written permission is granted by the corresponding
-Copyright Holder. This restriction only applies to the primary font name as
-presented to the users.
-
-4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
-Software shall not be used to promote, endorse or advertise any
-Modified Version, except to acknowledge the contribution(s) of the
-Copyright Holder(s) and the Author(s) or with their explicit written
-permission.
-
-5) The Font Software, modified or unmodified, in part or in whole,
-must be distributed entirely under this license, and must not be
-distributed under any other license. The requirement for fonts to
-remain under this license does not apply to any document created
-using the Font Software.
-
-TERMINATION
-This license becomes null and void if any of the above conditions are
-not met.
-
-DISCLAIMER
-THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
-OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
-COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
-DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
-OTHER DEALINGS IN THE FONT SOFTWARE.
-
-## IBM Plex Mono font
-
-Rune includes this font in WebAssembly builds. The notice from its pinned source follows.
-
-Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
-
-This Font Software is licensed under the SIL Open Font License, Version 1.1.
-
-This license is copied below, and is also available with a FAQ at: http://scripts.sil.org/OFL
-
-
------------------------------------------------------------
-SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
------------------------------------------------------------
-
-PREAMBLE
-The goals of the Open Font License (OFL) are to stimulate worldwide
-development of collaborative font projects, to support the font creation
-efforts of academic and linguistic communities, and to provide a free and
-open framework in which fonts may be shared and improved in partnership
-with others.
-
-The OFL allows the licensed fonts to be used, studied, modified and
-redistributed freely as long as they are not sold by themselves. The
-fonts, including any derivative works, can be bundled, embedded,
-redistributed and/or sold with any software provided that any reserved
-names are not used by derivative works. The fonts and derivatives,
-however, cannot be released under any other type of license. The
-requirement for fonts to remain under this license does not apply
-to any document created using the fonts or their derivatives.
-
-DEFINITIONS
-"Font Software" refers to the set of files released by the Copyright
-Holder(s) under this license and clearly marked as such. This may
-include source files, build scripts and documentation.
-
-"Reserved Font Name" refers to any names specified as such after the
-copyright statement(s).
-
-"Original Version" refers to the collection of Font Software components as
-distributed by the Copyright Holder(s).
-
-"Modified Version" refers to any derivative made by adding to, deleting,
-or substituting -- in part or in whole -- any of the components of the
-Original Version, by changing formats or by porting the Font Software to a
-new environment.
-
-"Author" refers to any designer, engineer, programmer, technical
-writer or other person who contributed to the Font Software.
-
-PERMISSION & CONDITIONS
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of the Font Software, to use, study, copy, merge, embed, modify,
-redistribute, and sell modified and unmodified copies of the Font
-Software, subject to the following conditions:
-
-1) Neither the Font Software nor any of its individual components,
-in Original or Modified Versions, may be sold by itself.
-
-2) Original or Modified Versions of the Font Software may be bundled,
-redistributed and/or sold with any software, provided that each copy
-contains the above copyright notice and this license. These can be
-included either as stand-alone text files, human-readable headers or
-in the appropriate machine-readable metadata fields within text or
-binary files as long as those fields can be easily viewed by the user.
-
-3) No Modified Version of the Font Software may use the Reserved Font
-Name(s) unless explicit written permission is granted by the corresponding
-Copyright Holder. This restriction only applies to the primary font name as
-presented to the users.
-
-4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
-Software shall not be used to promote, endorse or advertise any
-Modified Version, except to acknowledge the contribution(s) of the
-Copyright Holder(s) and the Author(s) or with their explicit written
-permission.
-
-5) The Font Software, modified or unmodified, in part or in whole,
-must be distributed entirely under this license, and must not be
-distributed under any other license. The requirement for fonts to
-remain under this license does not apply to any document created
-using the Font Software.
-
-TERMINATION
-This license becomes null and void if any of the above conditions are
-not met.
-
-DISCLAIMER
-THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
-OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
-COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
-DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
-OTHER DEALINGS IN THE FONT SOFTWARE.
+See [verification and packaging requirements](LICENSES/README.md).

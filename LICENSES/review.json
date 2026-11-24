@@ -1,0 +1,14 @@
+{
+  "lock_sha256": "b4889ecbfd462f276fbc3aeb01ca712db146b111d859ce27b0c2699a54765ec9",
+  "inventory_sha256": "0fe69a7509db9b952924819eaa94ce97a99f8e04cdb091e3ae55792433da2563",
+  "historical_native_sha256": "41f6a670aaaf8bbad6b2b39b8c16c3bf56364c03207339e2fc5572cb29d96bce",
+  "source_notices_reviewed": false,
+  "native_artifact_reviewed": false,
+  "blockers": [
+    "Review the refreshed source notice inventory against the current lockfile and manifests; automated source verification does not renew human review.",
+    "Current release-candidate native linkage and distribution obligations are unqualified; the anchored native record covers only its historical binary hashes, not today's source or candidate.",
+    "Resolve exact-source licensing and any LGPL source/relink or applicable exception requirements for the selected glibc libc_nonshared.a(pthread_atfork.oS) and startup objects before distributing the recorded normal pair.",
+    "Desktop/GPU dynamic-loader and driver choices remain environment dependent and were not exercised by ELF inspection; any separately redistributed libraries or fonts require their own applicable materials.",
+    "Qualify the real Arch package with makepkg and the corresponding normal release binary pair; isolated packaging-contract fixtures and recipe-image archives are not release qualification."
+  ]
+}

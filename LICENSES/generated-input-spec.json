@@ -1,0 +1,38 @@
+[
+  {
+    "package": "spirv@0.4.0+sdk-1.4.341.0",
+    "repository": "gfx-rs/rspirv",
+    "revision": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4",
+    "package_path": "spirv",
+    "drivers": [".gitmodules", "autogen/src/main.rs"],
+    "input_repository": "KhronosGroup/SPIRV-Headers",
+    "input_revision": "04f10f650d514df88b76d25e83db360142c7b174",
+    "submodule": "autogen/external/SPIRV-Headers",
+    "inputs": ["LICENSE", "LICENSES/MIT.txt", "include/spirv/unified1/*.grammar.json"],
+    "published_generated": ["autogen_spirv.rs"]
+  },
+  {
+    "package": "ash@0.38.0+1.3.281",
+    "repository": "ash-rs/ash",
+    "revision": "b724b78dac8d83879ed7a1aad2b91bb9f2beb5cf",
+    "package_path": "ash",
+    "drivers": [".gitmodules", "generator/src/bin/generator.rs", "generator/src/lib.rs"],
+    "input_repository": "KhronosGroup/Vulkan-Headers",
+    "input_revision": "38899bf60605f0a2c50f7968e5c4c9826a824683",
+    "submodule": "generator/Vulkan-Headers",
+    "inputs": ["LICENSE.md", "LICENSES/Apache-2.0.txt", "LICENSES/MIT.txt", "registry/vk.xml", "include/vk_video/*.h", "include/vulkan/vk_platform.h"],
+    "published_generated": ["src/vk/*.rs", "src/extensions_generated.rs"]
+  },
+  {
+    "package": "x11rb-protocol@0.13.2",
+    "repository": "psychon/x11rb",
+    "revision": "1b73245acc5dce4c4987c80dd7589e7b60af3532",
+    "package_path": "x11rb-protocol",
+    "drivers": ["Makefile", "generator/src/main.rs"],
+    "input_repository": "psychon/x11rb",
+    "input_revision": "1b73245acc5dce4c4987c80dd7589e7b60af3532",
+    "submodule": null,
+    "inputs": ["xcb-proto-1.17.0/COPYING", "xcb-proto-1.17.0/src/*.xml"],
+    "published_generated": ["src/protocol/*.rs"]
+  }
+]

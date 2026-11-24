@@ -1,0 +1,2784 @@
+{
+  "repository": "psychon/x11rb",
+  "revision": "1b73245acc5dce4c4987c80dd7589e7b60af3532",
+  "sha": "1b73245acc5dce4c4987c80dd7589e7b60af3532",
+  "tree": [
+    {
+      "mode": "040000",
+      "path": ".github",
+      "sha": "dfd587ee2cc97d2e8794943c92faa0157a413f07",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/dfd587ee2cc97d2e8794943c92faa0157a413f07"
+    },
+    {
+      "mode": "040000",
+      "path": ".github/workflows",
+      "sha": "70ca4a924ccb7079f141198ca1e77adf5992680b",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/70ca4a924ccb7079f141198ca1e77adf5992680b"
+    },
+    {
+      "mode": "100644",
+      "path": ".github/workflows/CI.yml",
+      "sha": "fb976f1eb3b256e42adba3c19e418ca1fbd5798e",
+      "size": 10958,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fb976f1eb3b256e42adba3c19e418ca1fbd5798e"
+    },
+    {
+      "mode": "100644",
+      "path": ".gitignore",
+      "sha": "693699042b1a8ccf697636d3cd34b200f3a8278b",
+      "size": 30,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/693699042b1a8ccf697636d3cd34b200f3a8278b"
+    },
+    {
+      "mode": "100644",
+      "path": ".mergify.yml",
+      "sha": "6f436ecd83b393b29725c8603283597ed8531a37",
+      "size": 225,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6f436ecd83b393b29725c8603283597ed8531a37"
+    },
+    {
+      "mode": "100644",
+      "path": "Cargo.toml",
+      "sha": "fd0a97f3be4bf793caf57715ecbb9735ac17ad12",
+      "size": 216,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fd0a97f3be4bf793caf57715ecbb9735ac17ad12"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE-APACHE",
+      "sha": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "size": 11358,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d645695673349e3947e8e5ae42332d0ac3164cd7"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE-MIT",
+      "sha": "e531782964117389c00ca57bc0781b32cee021fe",
+      "size": 1058,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e531782964117389c00ca57bc0781b32cee021fe"
+    },
+    {
+      "mode": "100644",
+      "path": "Makefile",
+      "sha": "8faeea4b3a92f3345112c4069a968480710ac5b1",
+      "size": 420,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8faeea4b3a92f3345112c4069a968480710ac5b1"
+    },
+    {
+      "mode": "100644",
+      "path": "README.md",
+      "sha": "e12d300579f2a66512b08ccefa48ef033fcf65a6",
+      "size": 2606,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e12d300579f2a66512b08ccefa48ef033fcf65a6"
+    },
+    {
+      "mode": "040000",
+      "path": "cairo-example",
+      "sha": "2a5235b52fa3ddb2d39f8979c6398129ca4a99f7",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/2a5235b52fa3ddb2d39f8979c6398129ca4a99f7"
+    },
+    {
+      "mode": "100644",
+      "path": "cairo-example/Cargo.toml",
+      "sha": "3465e61dc5e07aee6ea0b5392420bc0fefd36b44",
+      "size": 326,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3465e61dc5e07aee6ea0b5392420bc0fefd36b44"
+    },
+    {
+      "mode": "040000",
+      "path": "cairo-example/src",
+      "sha": "42fb518026d8e0ca4b6220b5789b6e5b6a292e04",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/42fb518026d8e0ca4b6220b5789b6e5b6a292e04"
+    },
+    {
+      "mode": "100644",
+      "path": "cairo-example/src/main.rs",
+      "sha": "d9f507204f31b9a0aaeeceff0a4a1d9b00a01c5a",
+      "size": 10049,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d9f507204f31b9a0aaeeceff0a4a1d9b00a01c5a"
+    },
+    {
+      "mode": "100644",
+      "path": "clippy.toml",
+      "sha": "22fd4be7375de0885cdc7ad14641f72a03d7e9c7",
+      "size": 16,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/22fd4be7375de0885cdc7ad14641f72a03d7e9c7"
+    },
+    {
+      "mode": "100644",
+      "path": "codecov.yml",
+      "sha": "d781a044c93ff06f17de7f24f9c7274203fff305",
+      "size": 213,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d781a044c93ff06f17de7f24f9c7274203fff305"
+    },
+    {
+      "mode": "040000",
+      "path": "doc",
+      "sha": "1d9aee1ecba2d38fc1a81e58413ef79719c9f7b5",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/1d9aee1ecba2d38fc1a81e58413ef79719c9f7b5"
+    },
+    {
+      "mode": "100644",
+      "path": "doc/changelog.md",
+      "sha": "ee4270ab714c28ff7ed4cb83856f93fea8581384",
+      "size": 34380,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ee4270ab714c28ff7ed4cb83856f93fea8581384"
+    },
+    {
+      "mode": "100644",
+      "path": "doc/comparison.md",
+      "sha": "8a61bd9b6e7859b1e89ec56c4c2ce3a9197aff1a",
+      "size": 4887,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8a61bd9b6e7859b1e89ec56c4c2ce3a9197aff1a"
+    },
+    {
+      "mode": "100644",
+      "path": "doc/generated_code.md",
+      "sha": "ad0dc290023d06f483feb2cd12affeb7485839d9",
+      "size": 45425,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ad0dc290023d06f483feb2cd12affeb7485839d9"
+    },
+    {
+      "mode": "100644",
+      "path": "doc/making_a_release.md",
+      "sha": "f5b8f7f6173d11e4510f20aff76ea2e86b3f5e94",
+      "size": 657,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f5b8f7f6173d11e4510f20aff76ea2e86b3f5e94"
+    },
+    {
+      "mode": "040000",
+      "path": "extract-generated-code-doc",
+      "sha": "26a41978173fb7ab4fda67556773e7b0fb33ac88",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/26a41978173fb7ab4fda67556773e7b0fb33ac88"
+    },
+    {
+      "mode": "100644",
+      "path": "extract-generated-code-doc/Cargo.toml",
+      "sha": "8d182f770bf71d3755c9d842dbf8bff4c9f70d06",
+      "size": 226,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8d182f770bf71d3755c9d842dbf8bff4c9f70d06"
+    },
+    {
+      "mode": "040000",
+      "path": "extract-generated-code-doc/src",
+      "sha": "86ce815c503dea5c404c397128bb42f83aa135eb",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/86ce815c503dea5c404c397128bb42f83aa135eb"
+    },
+    {
+      "mode": "100644",
+      "path": "extract-generated-code-doc/src/doc.rs",
+      "sha": "b546a2d8caa5a6420680894ac15a95edb107b0a1",
+      "size": 13974,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b546a2d8caa5a6420680894ac15a95edb107b0a1"
+    },
+    {
+      "mode": "100644",
+      "path": "extract-generated-code-doc/src/main.rs",
+      "sha": "a1d7acfeb7aeb2deb40a244fa56a0cc515e8fe33",
+      "size": 2793,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a1d7acfeb7aeb2deb40a244fa56a0cc515e8fe33"
+    },
+    {
+      "mode": "040000",
+      "path": "generator",
+      "sha": "ea5c7dcb1ef39f14dc3e340d76115c1b0024e13d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/ea5c7dcb1ef39f14dc3e340d76115c1b0024e13d"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/Cargo.toml",
+      "sha": "fe02df9fd975d9f6939a447d5074f9568895c7e0",
+      "size": 271,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fe02df9fd975d9f6939a447d5074f9568895c7e0"
+    },
+    {
+      "mode": "040000",
+      "path": "generator/src",
+      "sha": "de1844e530aed4270bdabef187e0e0f207c6f718",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/de1844e530aed4270bdabef187e0e0f207c6f718"
+    },
+    {
+      "mode": "040000",
+      "path": "generator/src/generator",
+      "sha": "66fd9a92a9bf6a30dd5cf94da12c4afbb03f0cfd",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/66fd9a92a9bf6a30dd5cf94da12c4afbb03f0cfd"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/error_events.rs",
+      "sha": "d1330f3161a6c9ad504e80d837f8ca088b19ed49",
+      "size": 19028,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d1330f3161a6c9ad504e80d837f8ca088b19ed49"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/mod.rs",
+      "sha": "572518c94ecc5e5ac43d8ae5de0aa78d2023b040",
+      "size": 10299,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/572518c94ecc5e5ac43d8ae5de0aa78d2023b040"
+    },
+    {
+      "mode": "040000",
+      "path": "generator/src/generator/namespace",
+      "sha": "0ee90652d58abb26321690130eedf80ce5122dc9",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/0ee90652d58abb26321690130eedf80ce5122dc9"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/async_switch.rs",
+      "sha": "42f28848eb091bdf56a13efec7baf774b2c79f11",
+      "size": 903,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/42f28848eb091bdf56a13efec7baf774b2c79f11"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/expr_to_str.rs",
+      "sha": "2f62a955aba43f9c1be1211583516a4dbb7312d1",
+      "size": 12887,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/2f62a955aba43f9c1be1211583516a4dbb7312d1"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/header.rs",
+      "sha": "a9a3c2bd11b3d239f8752280ee0563da06a236cc",
+      "size": 6165,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a9a3c2bd11b3d239f8752280ee0563da06a236cc"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/helpers.rs",
+      "sha": "3d7298d444705001a9a9f6c7f642795fc37c2175",
+      "size": 22397,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3d7298d444705001a9a9f6c7f642795fc37c2175"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/mod.rs",
+      "sha": "1a2f019a60ce4075d300f9f79be377c3bc441dee",
+      "size": 61941,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1a2f019a60ce4075d300f9f79be377c3bc441dee"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/parse.rs",
+      "sha": "68c9ac5f2af391ec2cd1717ef43a83df8ef643c1",
+      "size": 13316,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/68c9ac5f2af391ec2cd1717ef43a83df8ef643c1"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/request.rs",
+      "sha": "46a37e589ee6f00d616a4920b625c83abdf99bd3",
+      "size": 61584,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/46a37e589ee6f00d616a4920b625c83abdf99bd3"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/resource_wrapper.rs",
+      "sha": "b043d9ab8f162ea31dc676e09f7dc84891614ec8",
+      "size": 13492,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b043d9ab8f162ea31dc676e09f7dc84891614ec8"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/serialize.rs",
+      "sha": "0ad050a3e052638fa169ac454ec336137735ddce",
+      "size": 18815,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0ad050a3e052638fa169ac454ec336137735ddce"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/struct_type.rs",
+      "sha": "24bb740a25c149bed27571a0d0f66719b5286178",
+      "size": 18569,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/24bb740a25c149bed27571a0d0f66719b5286178"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/namespace/switch.rs",
+      "sha": "70a458d59247f5ca1534e154f10c851e9bc715d3",
+      "size": 43181,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/70a458d59247f5ca1534e154f10c851e9bc715d3"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/output.rs",
+      "sha": "1e1b0de26360a47563b61dcf2d2684a14413607d",
+      "size": 1940,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1e1b0de26360a47563b61dcf2d2684a14413607d"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/requests_replies.rs",
+      "sha": "6f97d44cc2ee8bcc46b9bb1e642cebf10adc2b5b",
+      "size": 18306,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6f97d44cc2ee8bcc46b9bb1e642cebf10adc2b5b"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/resources.rs",
+      "sha": "c6f6d174417d2750c2c6c85b75b087c800cd05d9",
+      "size": 7035,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c6f6d174417d2750c2c6c85b75b087c800cd05d9"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/generator/special_cases.rs",
+      "sha": "8f19b4c8a654418babdb231c8356d608e45ada64",
+      "size": 6943,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8f19b4c8a654418babdb231c8356d608e45ada64"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/main.rs",
+      "sha": "768d872a167d4edd63360d4bb83998f4e4a48d25",
+      "size": 4921,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/768d872a167d4edd63360d4bb83998f4e4a48d25"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async",
+      "sha": "d41992f96f25aaef79a5d24bbd193ce9c1a12709",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/d41992f96f25aaef79a5d24bbd193ce9c1a12709"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/Cargo.toml",
+      "sha": "7cb5449ad737e2bf33eccb982f02e3df65734a23",
+      "size": 2840,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7cb5449ad737e2bf33eccb982f02e3df65734a23"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb-async/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb-async/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async/examples",
+      "sha": "13e904023618ca081857a5e73b478069a4cb0f03",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/13e904023618ca081857a5e73b478069a4cb0f03"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/examples/shared_memory_async.rs",
+      "sha": "30f28e8fa1dcba6ebb2c37aef03ce3984f367a0c",
+      "size": 5791,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/30f28e8fa1dcba6ebb2c37aef03ce3984f367a0c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/examples/xclock_utc_async.rs",
+      "sha": "1f2f5cf88ad568997e6e29da3d11bc31b66c203d",
+      "size": 10672,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1f2f5cf88ad568997e6e29da3d11bc31b66c203d"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async/src",
+      "sha": "688e4afe7ede2af912fec9b8c89f6ac585cb8047",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/688e4afe7ede2af912fec9b8c89f6ac585cb8047"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/blocking.rs",
+      "sha": "ad6614b0ea78138a98f610d78ddee158d2f1d471",
+      "size": 10557,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ad6614b0ea78138a98f610d78ddee158d2f1d471"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/connection.rs",
+      "sha": "c9bbde149c1f8397a5a4bd6bb89de947a860e2ba",
+      "size": 18151,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c9bbde149c1f8397a5a4bd6bb89de947a860e2ba"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/cookie.rs",
+      "sha": "6ea61feec0d225eb1a3524d9769736ba786987e0",
+      "size": 11354,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6ea61feec0d225eb1a3524d9769736ba786987e0"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/lib.rs",
+      "sha": "3923a6f74ebba6323ab41f497456bcd410c4da67",
+      "size": 3322,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3923a6f74ebba6323ab41f497456bcd410c4da67"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async/src/protocol",
+      "sha": "9dd507484a441c586a1b97359b17f881ea6f29e7",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/9dd507484a441c586a1b97359b17f881ea6f29e7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/bigreq.rs",
+      "sha": "ff5a85a7df482ab21136b9d6fb51114fd37a1684",
+      "size": 2560,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ff5a85a7df482ab21136b9d6fb51114fd37a1684"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/composite.rs",
+      "sha": "4dcc911f7f934eec15b949dc30355131a102b9f7",
+      "size": 13756,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4dcc911f7f934eec15b949dc30355131a102b9f7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/damage.rs",
+      "sha": "7eb1eb07a248d346fcaf5e5a8471d465e567c6de",
+      "size": 11582,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7eb1eb07a248d346fcaf5e5a8471d465e567c6de"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/dbe.rs",
+      "sha": "f62a3a88b7acfc6d1b198ee5afef277ac097fe96",
+      "size": 12978,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f62a3a88b7acfc6d1b198ee5afef277ac097fe96"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/dpms.rs",
+      "sha": "c3e4b748aa2c877ee1cc3f3a7317d6d90295fc8d",
+      "size": 7095,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c3e4b748aa2c877ee1cc3f3a7317d6d90295fc8d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/dri2.rs",
+      "sha": "2338bbc299d1c5788da151b24a7cf68cf80d43dc",
+      "size": 12925,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/2338bbc299d1c5788da151b24a7cf68cf80d43dc"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/dri3.rs",
+      "sha": "509ae673e89b46b99fab25577d263beb5ab6481c",
+      "size": 12009,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/509ae673e89b46b99fab25577d263beb5ab6481c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/ge.rs",
+      "sha": "638565c6b604463adc375b1b74858b837b029263",
+      "size": 2150,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/638565c6b604463adc375b1b74858b837b029263"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/glx.rs",
+      "sha": "363c7af6c94a9f42692f2bc58f2b1ea18077c446",
+      "size": 83990,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/363c7af6c94a9f42692f2bc58f2b1ea18077c446"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/mod.rs",
+      "sha": "83a7dfa71d889f3192403567f4b2052044730b46",
+      "size": 1921,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/83a7dfa71d889f3192403567f4b2052044730b46"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/present.rs",
+      "sha": "ec0fa038bace127c857a0e32e0d93e0aa5fd9297",
+      "size": 8336,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ec0fa038bace127c857a0e32e0d93e0aa5fd9297"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/randr.rs",
+      "sha": "783e45cd119578626d8c0bfe2d34736c0d389715",
+      "size": 40232,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/783e45cd119578626d8c0bfe2d34736c0d389715"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/record.rs",
+      "sha": "0c6107e3ad11b16c45ceebd013aee1286d09b3f2",
+      "size": 8075,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0c6107e3ad11b16c45ceebd013aee1286d09b3f2"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/render.rs",
+      "sha": "18b597448e4b52708c97cb2ff686bafb561a318e",
+      "size": 31313,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/18b597448e4b52708c97cb2ff686bafb561a318e"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/res.rs",
+      "sha": "931474322e7c6ad4e2db587a2ea52763a212afac",
+      "size": 5949,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/931474322e7c6ad4e2db587a2ea52763a212afac"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/screensaver.rs",
+      "sha": "6559fe90b6f2b4493d13f8fbbb141b2679cf32a4",
+      "size": 6314,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6559fe90b6f2b4493d13f8fbbb141b2679cf32a4"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/shape.rs",
+      "sha": "856f7795dfb7889038b5c9acda989e7dedc91f62",
+      "size": 9429,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/856f7795dfb7889038b5c9acda989e7dedc91f62"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/shm.rs",
+      "sha": "7dc14f9f2f559a923a4d560ae3599ce5a65d3290",
+      "size": 20128,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7dc14f9f2f559a923a4d560ae3599ce5a65d3290"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/sync.rs",
+      "sha": "7684eed7a31a3f9fd03a40372fc91d8c2994c9ca",
+      "size": 15587,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7684eed7a31a3f9fd03a40372fc91d8c2994c9ca"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xc_misc.rs",
+      "sha": "c7f430a9b6cb3976c54948a11b2345c4f793e1ee",
+      "size": 3386,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c7f430a9b6cb3976c54948a11b2345c4f793e1ee"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xevie.rs",
+      "sha": "adc31016cbc620718e33b7c39586df6996559beb",
+      "size": 4688,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/adc31016cbc620718e33b7c39586df6996559beb"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xf86dri.rs",
+      "sha": "d2ac2ef535d4b6678689f183d2479ceda316539b",
+      "size": 9729,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d2ac2ef535d4b6678689f183d2479ceda316539b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xf86vidmode.rs",
+      "sha": "0756d615283b34ebd615082ec65a481520fdb4af",
+      "size": 21089,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0756d615283b34ebd615082ec65a481520fdb4af"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xfixes.rs",
+      "sha": "33f9e8fed79311d5854d79838b263c67e6d2e080",
+      "size": 29487,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/33f9e8fed79311d5854d79838b263c67e6d2e080"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xinerama.rs",
+      "sha": "d519492ea7c81cb4ab15093ca058b1d56d77083c",
+      "size": 5354,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d519492ea7c81cb4ab15093ca058b1d56d77083c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xinput.rs",
+      "sha": "9a9c3cc08e11c4dac15b010fd5fc92f9162e3eaa",
+      "size": 61008,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9a9c3cc08e11c4dac15b010fd5fc92f9162e3eaa"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xkb.rs",
+      "sha": "17fc9737bd22d95767da41b454cb0cf6c40490f7",
+      "size": 32777,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/17fc9737bd22d95767da41b454cb0cf6c40490f7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xprint.rs",
+      "sha": "7765e73e5ff07e7f9d0ac3730c97831dcced63dd",
+      "size": 20579,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7765e73e5ff07e7f9d0ac3730c97831dcced63dd"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xproto.rs",
+      "sha": "308f7618b9363ba0a75e7d763499bb3cddc9cc24",
+      "size": 218708,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/308f7618b9363ba0a75e7d763499bb3cddc9cc24"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xselinux.rs",
+      "sha": "195efd8b8076259fa4999eb3dec264f8e57f31a6",
+      "size": 18846,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/195efd8b8076259fa4999eb3dec264f8e57f31a6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xtest.rs",
+      "sha": "9ca4f62d8af3d7e40a18aad937c8ef1f5f2b2840",
+      "size": 4445,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9ca4f62d8af3d7e40a18aad937c8ef1f5f2b2840"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xv.rs",
+      "sha": "a06295bdee0d93eb8c84e619ec9af6ed9d70e3d4",
+      "size": 19088,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a06295bdee0d93eb8c84e619ec9af6ed9d70e3d4"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/protocol/xvmc.rs",
+      "sha": "977fef5d69e69004cb208662a746cfdbd2a62d67",
+      "size": 8137,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/977fef5d69e69004cb208662a746cfdbd2a62d67"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async/src/rust_connection",
+      "sha": "6116f63af9423085cc5d9fd909fc5a26aa3acd07",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/6116f63af9423085cc5d9fd909fc5a26aa3acd07"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/extensions.rs",
+      "sha": "6a8e2793082ba559ab3ce2ba49fff7be147f274a",
+      "size": 4639,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6a8e2793082ba559ab3ce2ba49fff7be147f274a"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/mod.rs",
+      "sha": "c671f96454db53350b9f41c1f92fe9c4f4b5d7d8",
+      "size": 27476,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c671f96454db53350b9f41c1f92fe9c4f4b5d7d8"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/nb_connect.rs",
+      "sha": "e2fd3bd70cc6dca599f53ff2fc07589bef22ee2f",
+      "size": 4951,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e2fd3bd70cc6dca599f53ff2fc07589bef22ee2f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/shared_state.rs",
+      "sha": "28809fee3df1586593d182fb330d9ccb73c7bce6",
+      "size": 8238,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/28809fee3df1586593d182fb330d9ccb73c7bce6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/stream.rs",
+      "sha": "d563cc5f764f23065910dda23fcfd1c5eb136f06",
+      "size": 3586,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d563cc5f764f23065910dda23fcfd1c5eb136f06"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/src/rust_connection/write_buffer.rs",
+      "sha": "f265463c29f0604d43d1cc432b169d4fe98cb3c5",
+      "size": 6593,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f265463c29f0604d43d1cc432b169d4fe98cb3c5"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-async/tests",
+      "sha": "5c3fe631dad98802ad3e766aa21e1519f2de5b17",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/5c3fe631dad98802ad3e766aa21e1519f2de5b17"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-async/tests/connection_regression_tests.rs",
+      "sha": "c120c2b124f623df4b07a869ca765fad1e63b0a6",
+      "size": 3839,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c120c2b124f623df4b07a869ca765fad1e63b0a6"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol",
+      "sha": "cd287a7e8eab2bf9d692a599bb3e5ca55cb68e4a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/cd287a7e8eab2bf9d692a599bb3e5ca55cb68e4a"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/Cargo.toml",
+      "sha": "d20e89825ddb64be7d35860fd79a70e873c2be9e",
+      "size": 1914,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d20e89825ddb64be7d35860fd79a70e873c2be9e"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb-protocol/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb-protocol/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/benches",
+      "sha": "cbe92ff84d19e2b16a268a3dbc6064a4b1fe554a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/cbe92ff84d19e2b16a268a3dbc6064a4b1fe554a"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/benches/proto_connection.rs",
+      "sha": "f0504a7802b5d30cc6bcf2acd08b55e5b78087ae",
+      "size": 12084,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f0504a7802b5d30cc6bcf2acd08b55e5b78087ae"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/src",
+      "sha": "2261070681ff44ec7790e0469083870cdb209d02",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/2261070681ff44ec7790e0469083870cdb209d02"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/connect.rs",
+      "sha": "82399c7a45af1f27b45d7e9f554be40cb34ec28b",
+      "size": 12333,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/82399c7a45af1f27b45d7e9f554be40cb34ec28b"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/src/connection",
+      "sha": "e86c9d25bd7f61194cbb2c17184f12533cb23f95",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/e86c9d25bd7f61194cbb2c17184f12533cb23f95"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/connection/mod.rs",
+      "sha": "88508d5be99dae505a30b4f723d21b93cc3c20b0",
+      "size": 17473,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/88508d5be99dae505a30b4f723d21b93cc3c20b0"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/errors.rs",
+      "sha": "e5a59f1890a3f0063678c309a8c05429aedf64c6",
+      "size": 7794,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e5a59f1890a3f0063678c309a8c05429aedf64c6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/id_allocator.rs",
+      "sha": "b5fc73788c1a6b8b5afc211c2393c6a25a42a439",
+      "size": 5331,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b5fc73788c1a6b8b5afc211c2393c6a25a42a439"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/lib.rs",
+      "sha": "c653bc5bd2a066745dcef332eed187bddc22973c",
+      "size": 4518,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c653bc5bd2a066745dcef332eed187bddc22973c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/packet_reader.rs",
+      "sha": "df3f158599a9874aa643258d870dac52e17716eb",
+      "size": 8767,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/df3f158599a9874aa643258d870dac52e17716eb"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/src/parse_display",
+      "sha": "f5c796115e564e02d4b26f98520f5d1201950627",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/f5c796115e564e02d4b26f98520f5d1201950627"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/parse_display/connect_instruction.rs",
+      "sha": "813bdd859a87ceab57c65ffd4690b6d5cac5b305",
+      "size": 2817,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/813bdd859a87ceab57c65ffd4690b6d5cac5b305"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/parse_display/mod.rs",
+      "sha": "938720c12dd3cb134b980130b2bb39e13506995f",
+      "size": 20133,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/938720c12dd3cb134b980130b2bb39e13506995f"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/src/protocol",
+      "sha": "772e108f4003f11e7eaf59ce86fed5da5f272657",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/772e108f4003f11e7eaf59ce86fed5da5f272657"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/bigreq.rs",
+      "sha": "519a5d95ba658462e38f5a64478a01f85d30c5a5",
+      "size": 5967,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/519a5d95ba658462e38f5a64478a01f85d30c5a5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/composite.rs",
+      "sha": "9e611fd0f438af9f9b9574ed3904547006ae64bc",
+      "size": 34497,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9e611fd0f438af9f9b9574ed3904547006ae64bc"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/damage.rs",
+      "sha": "8d38eb1121abe569785fdc723eaaf7db572afddb",
+      "size": 28239,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8d38eb1121abe569785fdc723eaaf7db572afddb"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/dbe.rs",
+      "sha": "7adc7a0ecfbd2c368deae7b677ae5ad7753e1d25",
+      "size": 40399,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7adc7a0ecfbd2c368deae7b677ae5ad7753e1d25"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/dpms.rs",
+      "sha": "a5971ef4c56dbebab5ff68cbbfa484a7095a37e1",
+      "size": 38028,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a5971ef4c56dbebab5ff68cbbfa484a7095a37e1"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/dri2.rs",
+      "sha": "b40ddc2e575af239b8d3097551f936618aaa1534",
+      "size": 93084,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b40ddc2e575af239b8d3097551f936618aaa1534"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/dri3.rs",
+      "sha": "9ace3054ad5532e447ec0ab71d98cf5002ae8b04",
+      "size": 56523,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9ace3054ad5532e447ec0ab71d98cf5002ae8b04"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/ge.rs",
+      "sha": "e85bd9718123a7bb19c6f1d77224c1ba5724e7ae",
+      "size": 6839,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e85bd9718123a7bb19c6f1d77224c1ba5724e7ae"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/glx.rs",
+      "sha": "e7025672f89e282531e26924cb4c6f81bab1cb42",
+      "size": 505317,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e7025672f89e282531e26924cb4c6f81bab1cb42"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/mod.rs",
+      "sha": "42eae57ce079b54f1b3d6d851fde7e5ef1c374b7",
+      "size": 544756,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/42eae57ce079b54f1b3d6d851fde7e5ef1c374b7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/present.rs",
+      "sha": "b69782af60b8a7339001646dc1446927398205c1",
+      "size": 70364,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b69782af60b8a7339001646dc1446927398205c1"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/randr.rs",
+      "sha": "9e40dab6f0d728e5e26976a7486abac4a4b7f516",
+      "size": 297662,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9e40dab6f0d728e5e26976a7486abac4a4b7f516"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/record.rs",
+      "sha": "f59ecb6ba760807edeb27b923280bcbc586fe6b7",
+      "size": 46928,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f59ecb6ba760807edeb27b923280bcbc586fe6b7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/render.rs",
+      "sha": "9c89f6fd512c3a052020a8c9d9a3ef7f6d2b4b50",
+      "size": 202067,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9c89f6fd512c3a052020a8c9d9a3ef7f6d2b4b50"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/res.rs",
+      "sha": "e5848a826445136f9e83278e4d7f9bebfef52f80",
+      "size": 45454,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e5848a826445136f9e83278e4d7f9bebfef52f80"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/screensaver.rs",
+      "sha": "8c8d2cc9a5461eb53cf6555a97c85285010fc1b6",
+      "size": 49010,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8c8d2cc9a5461eb53cf6555a97c85285010fc1b6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/shape.rs",
+      "sha": "62a22eabacb58ebcd8b0f6887176afeb425f9d9c",
+      "size": 51034,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/62a22eabacb58ebcd8b0f6887176afeb425f9d9c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/shm.rs",
+      "sha": "b397687bf39c9871762369a03958f0888dc09b28",
+      "size": 48086,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b397687bf39c9871762369a03958f0888dc09b28"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/sync.rs",
+      "sha": "cef2706dc05148052413acd98fedb97dca941b8f",
+      "size": 104186,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/cef2706dc05148052413acd98fedb97dca941b8f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xc_misc.rs",
+      "sha": "448a8e43db1f9e9ab229e4e65e41c34b0cdd3448",
+      "size": 15710,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/448a8e43db1f9e9ab229e4e65e41c34b0cdd3448"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xevie.rs",
+      "sha": "e3b6cf7d7f7b0a6f368ad014bd8431ae15c6ab2b",
+      "size": 30045,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e3b6cf7d7f7b0a6f368ad014bd8431ae15c6ab2b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xf86dri.rs",
+      "sha": "52fcc6d1cac5913efdd3807fe2e626a4a90fbaf0",
+      "size": 58935,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/52fcc6d1cac5913efdd3807fe2e626a4a90fbaf0"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xf86vidmode.rs",
+      "sha": "a38bddc5397ccb24ec898e3909d5c30e6ffb6de7",
+      "size": 123844,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a38bddc5397ccb24ec898e3909d5c30e6ffb6de7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xfixes.rs",
+      "sha": "418c2a204123da867a926511baff3496c49cb739",
+      "size": 142158,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/418c2a204123da867a926511baff3496c49cb739"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xinerama.rs",
+      "sha": "7b3038b5de0316a9863634ca72c5b67868577855",
+      "size": 31159,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7b3038b5de0316a9863634ca72c5b67868577855"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xinput.rs",
+      "sha": "a491f04737e7107dd2f4d602615d4d98327935f8",
+      "size": 773314,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a491f04737e7107dd2f4d602615d4d98327935f8"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xkb.rs",
+      "sha": "56fd9fe9a571e44f94f3ba8e42c2ce11a362cc1d",
+      "size": 601415,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/56fd9fe9a571e44f94f3ba8e42c2ce11a362cc1d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xprint.rs",
+      "sha": "7b5437ab95fb5ae991e649bc1bb13a65d948a75a",
+      "size": 117591,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7b5437ab95fb5ae991e649bc1bb13a65d948a75a"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xproto.rs",
+      "sha": "259369e1fe558b08a2fb5a10cc4705456b4087b3",
+      "size": 979056,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/259369e1fe558b08a2fb5a10cc4705456b4087b3"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xselinux.rs",
+      "sha": "f5b32ce12638b7897cd69f3a61e5e61023a766fb",
+      "size": 107126,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f5b32ce12638b7897cd69f3a61e5e61023a766fb"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xtest.rs",
+      "sha": "6983c1b8e0022e1cf44ba1399c074b0b893689fb",
+      "size": 18425,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6983c1b8e0022e1cf44ba1399c074b0b893689fb"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xv.rs",
+      "sha": "ef80e1cabbcae4e7670c0d7e7bb938931034ab0e",
+      "size": 134210,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ef80e1cabbcae4e7670c0d7e7bb938931034ab0e"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/protocol/xvmc.rs",
+      "sha": "fd5fa979e1aac356a1d63b0ea902eeca89d7b816",
+      "size": 44730,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fd5fa979e1aac356a1d63b0ea902eeca89d7b816"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/src/resource_manager",
+      "sha": "abf0d6855c7aff93ace19d79af1334f66b726a35",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/abf0d6855c7aff93ace19d79af1334f66b726a35"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/resource_manager/matcher.rs",
+      "sha": "625232959c4c98b42a7abab2fa9e9be289dfa5c7",
+      "size": 20959,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/625232959c4c98b42a7abab2fa9e9be289dfa5c7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/resource_manager/mod.rs",
+      "sha": "c2565fed671f29915708f43ade200192658cd890",
+      "size": 16159,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c2565fed671f29915708f43ade200192658cd890"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/resource_manager/parser.rs",
+      "sha": "fc4fd41a5c4a4204450dd655a6f3e50d8d626372",
+      "size": 23045,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fc4fd41a5c4a4204450dd655a6f3e50d8d626372"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/test.rs",
+      "sha": "510fd1473932b98fb9999a6c2c0a07ae996095e9",
+      "size": 4476,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/510fd1473932b98fb9999a6c2c0a07ae996095e9"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/utils.rs",
+      "sha": "999bc37d522324c66f16714babfd6214794586b2",
+      "size": 7143,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/999bc37d522324c66f16714babfd6214794586b2"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/wrapper.rs",
+      "sha": "5bbe25b23071af3e866778b33a32e2d623de84c2",
+      "size": 2702,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5bbe25b23071af3e866778b33a32e2d623de84c2"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/x11_utils.rs",
+      "sha": "611cacbc0091c0b12873dc0d2cf8b4b3b56c723c",
+      "size": 25020,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/611cacbc0091c0b12873dc0d2cf8b4b3b56c723c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/src/xauth.rs",
+      "sha": "23b878dff3f5b06a721d0f91b8c3a868427add02",
+      "size": 13064,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/23b878dff3f5b06a721d0f91b8c3a868427add02"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb-protocol/tests",
+      "sha": "29d4a93eddd2509a689ce33d76f79242e03dbc8e",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/29d4a93eddd2509a689ce33d76f79242e03dbc8e"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/tests/enum_tests.rs",
+      "sha": "a225d146a73e43c8ca1c131bbad9b04dadcebd75",
+      "size": 4445,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a225d146a73e43c8ca1c131bbad9b04dadcebd75"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/tests/parsing_tests.rs",
+      "sha": "f4229b64814acdc75d2b698f6449ac9b3bcd7ec5",
+      "size": 5628,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f4229b64814acdc75d2b698f6449ac9b3bcd7ec5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb-protocol/tests/request_parsing_tests.rs",
+      "sha": "178027d992265dc0eef825e53115a974a2e015e4",
+      "size": 7899,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/178027d992265dc0eef825e53115a974a2e015e4"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb",
+      "sha": "0dbf77f8330050568c5e084868b1ac74c5c9cfad",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/0dbf77f8330050568c5e084868b1ac74c5c9cfad"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/Cargo.toml",
+      "sha": "b583b00d3d5fd9a743188eceeb8fad0cae8ecdfd",
+      "size": 4075,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b583b00d3d5fd9a743188eceeb8fad0cae8ecdfd"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "x11rb/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/examples",
+      "sha": "131e13770b89dab17b45bedbc3f08dd61827ce8f",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/131e13770b89dab17b45bedbc3f08dd61827ce8f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/check_unchecked_requests.rs",
+      "sha": "0b31462193c2f130058f48abb8f4a395aeb9d996",
+      "size": 3156,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0b31462193c2f130058f48abb8f4a395aeb9d996"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/display_ppm.rs",
+      "sha": "9558f318cd524bf851286100c1f4582362a589cc",
+      "size": 8508,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9558f318cd524bf851286100c1f4582362a589cc"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/generic_events.rs",
+      "sha": "cb5360b99f183334f60cfd6727eb61d35d9265d5",
+      "size": 2393,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/cb5360b99f183334f60cfd6727eb61d35d9265d5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/hypnomoire.rs",
+      "sha": "6084e29ed50bde8a8fcd2b1da7d932ae56d834d0",
+      "size": 7812,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6084e29ed50bde8a8fcd2b1da7d932ae56d834d0"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/examples/integration_test_util",
+      "sha": "5296e6dbef35790d2a6711f82ed6f2e5dbea305d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/5296e6dbef35790d2a6711f82ed6f2e5dbea305d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/integration_test_util/connect.rs",
+      "sha": "75a1ca88dbf3e91aa58e06b14114eef65b3d9e1b",
+      "size": 969,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/75a1ca88dbf3e91aa58e06b14114eef65b3d9e1b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/integration_test_util/util.rs",
+      "sha": "84cbc0e0f46acd1d6a7c512b95da36ce85ec58d6",
+      "size": 1799,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/84cbc0e0f46acd1d6a7c512b95da36ce85ec58d6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/list_fonts.rs",
+      "sha": "4a9993865d1b0c6a8fe9f20709d37c9d3b6c30d5",
+      "size": 1415,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4a9993865d1b0c6a8fe9f20709d37c9d3b6c30d5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/record.rs",
+      "sha": "5afff505e4b8129dba223358dc89bc7fc4eae4f5",
+      "size": 6379,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5afff505e4b8129dba223358dc89bc7fc4eae4f5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/shared_memory.rs",
+      "sha": "64c226423bb34712f5b5106d6c11bb4420da0309",
+      "size": 5103,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/64c226423bb34712f5b5106d6c11bb4420da0309"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/simple_window.rs",
+      "sha": "4f81f997741ca1d4bef5a5a3b3108fc1f17e60e2",
+      "size": 5130,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4f81f997741ca1d4bef5a5a3b3108fc1f17e60e2"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/simple_window_manager.rs",
+      "sha": "3a560e3db20c3933468c0e74e6d484a7f4763b9f",
+      "size": 15309,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3a560e3db20c3933468c0e74e6d484a7f4763b9f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/tutorial.rs",
+      "sha": "9d6b6c8b61f34f17fd3ae63fd7a2c7fcf51a28d1",
+      "size": 107770,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9d6b6c8b61f34f17fd3ae63fd7a2c7fcf51a28d1"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/xclock_utc.rs",
+      "sha": "b71810f867e5be7f1725edeea4a48a5115740ed4",
+      "size": 8284,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b71810f867e5be7f1725edeea4a48a5115740ed4"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/examples/xeyes.rs",
+      "sha": "98914223bd681851fdd9d0e88697cf72f6528fa8",
+      "size": 11066,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/98914223bd681851fdd9d0e88697cf72f6528fa8"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src",
+      "sha": "0d71d8b4d227e7d991d973663df3bc846909549a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/0d71d8b4d227e7d991d973663df3bc846909549a"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/connection",
+      "sha": "3b1512b29f712163b10746bcaa33b4b418e7edfe",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/3b1512b29f712163b10746bcaa33b4b418e7edfe"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/connection/impls.rs",
+      "sha": "24817f1672aa9f175a4a665c0f350f93b4745c3d",
+      "size": 7996,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/24817f1672aa9f175a4a665c0f350f93b4745c3d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/connection/mod.rs",
+      "sha": "670f82f618b92304519eb12bd2ac3103642be039",
+      "size": 24908,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/670f82f618b92304519eb12bd2ac3103642be039"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/cookie.rs",
+      "sha": "1a658888ce57e4998450766f70c7bb60cbe1e1e1",
+      "size": 15957,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1a658888ce57e4998450766f70c7bb60cbe1e1e1"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/cursor",
+      "sha": "f238e6899e14bc3cf31a0bb7ea0adbde661838fc",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/f238e6899e14bc3cf31a0bb7ea0adbde661838fc"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/cursor/find_cursor.rs",
+      "sha": "2b0d41701351b7d14ffa3bc946005bc5947ddf5f",
+      "size": 3259,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/2b0d41701351b7d14ffa3bc946005bc5947ddf5f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/cursor/mod.rs",
+      "sha": "b94b06f3080d238c21963cffcecd4882ee7ddb6e",
+      "size": 11219,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b94b06f3080d238c21963cffcecd4882ee7ddb6e"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/cursor/parse_cursor.rs",
+      "sha": "bfa188d53599df0e80f95c4e164f8ebd104fc3a7",
+      "size": 2701,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bfa188d53599df0e80f95c4e164f8ebd104fc3a7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/errors.rs",
+      "sha": "a86a966c580c2de6fbf050a3c5eeefad8bb2948b",
+      "size": 6232,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a86a966c580c2de6fbf050a3c5eeefad8bb2948b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/event_loop_integration.rs",
+      "sha": "7e4f9370dab7c046b737cdde18a70b6e14660393",
+      "size": 3965,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7e4f9370dab7c046b737cdde18a70b6e14660393"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/extension_manager.rs",
+      "sha": "778ea0bb053705655a0aacd52e972e2b316f1d2f",
+      "size": 12410,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/778ea0bb053705655a0aacd52e972e2b316f1d2f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/image.rs",
+      "sha": "e6fddccf65163003e46a43f75456894de32b27bc",
+      "size": 43513,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e6fddccf65163003e46a43f75456894de32b27bc"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/lib.rs",
+      "sha": "f6afd97a956990f5d3b91b1abe68fe9f69c7c4bd",
+      "size": 8489,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f6afd97a956990f5d3b91b1abe68fe9f69c7c4bd"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/properties.rs",
+      "sha": "8312d940b9749de3e92b06897b47c3a7fbfdc692",
+      "size": 28036,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8312d940b9749de3e92b06897b47c3a7fbfdc692"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/protocol",
+      "sha": "a587feafa73d76c86607fa78bd761bb741ac0892",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/a587feafa73d76c86607fa78bd761bb741ac0892"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/bigreq.rs",
+      "sha": "a2a8bb2d18b65f273874c7ec9cd16ccd78009c6c",
+      "size": 2434,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a2a8bb2d18b65f273874c7ec9cd16ccd78009c6c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/composite.rs",
+      "sha": "53048b08cc890a22396e9334605b23987add9b65",
+      "size": 13070,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/53048b08cc890a22396e9334605b23987add9b65"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/damage.rs",
+      "sha": "d4ecaf66a1b48d3399f19b9f941f2d3b0fabc1b5",
+      "size": 13823,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d4ecaf66a1b48d3399f19b9f941f2d3b0fabc1b5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/dbe.rs",
+      "sha": "79181d960561d18d89fe2db70388b7be1a6603e4",
+      "size": 12222,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/79181d960561d18d89fe2db70388b7be1a6603e4"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/dpms.rs",
+      "sha": "6dc610093f80c216574b75136b41a0265a77d69d",
+      "size": 6409,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6dc610093f80c216574b75136b41a0265a77d69d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/dri2.rs",
+      "sha": "84d78c22646465a49897db60824170a59e279e40",
+      "size": 11749,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/84d78c22646465a49897db60824170a59e279e40"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/dri3.rs",
+      "sha": "8bd8b3ef57b2b732e895cca16e4f0a4cd04af2ed",
+      "size": 11041,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8bd8b3ef57b2b732e895cca16e4f0a4cd04af2ed"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/ge.rs",
+      "sha": "0eb452b359684c3daa290d2547baeb768d33501b",
+      "size": 2024,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0eb452b359684c3daa290d2547baeb768d33501b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/glx.rs",
+      "sha": "6d9f0b4724ffb742789c64ff02cf42a1d4006a7b",
+      "size": 75814,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6d9f0b4724ffb742789c64ff02cf42a1d4006a7b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/mod.rs",
+      "sha": "83a7dfa71d889f3192403567f4b2052044730b46",
+      "size": 1921,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/83a7dfa71d889f3192403567f4b2052044730b46"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/present.rs",
+      "sha": "a337959b2ec8ef5f3bb041942d65892a2dff48d2",
+      "size": 7720,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a337959b2ec8ef5f3bb041942d65892a2dff48d2"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/randr.rs",
+      "sha": "bdd209f875ccac3cc6667cd8747396c8574e2b32",
+      "size": 36372,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bdd209f875ccac3cc6667cd8747396c8574e2b32"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/record.rs",
+      "sha": "3624cb60aa66ab10f26cc773dc5927cd1599b763",
+      "size": 10159,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3624cb60aa66ab10f26cc773dc5927cd1599b763"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/render.rs",
+      "sha": "267c232b1a5fd8a4cd38ade75319b3a02041a218",
+      "size": 40159,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/267c232b1a5fd8a4cd38ade75319b3a02041a218"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/res.rs",
+      "sha": "b0f937b29e2a1fa121cba8c361358f809e6d9674",
+      "size": 5333,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b0f937b29e2a1fa121cba8c361358f809e6d9674"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/screensaver.rs",
+      "sha": "9497484ec756b180369f22a72c58329918798970",
+      "size": 5768,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9497484ec756b180369f22a72c58329918798970"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/shape.rs",
+      "sha": "c6c659c1e9fabfa9a2419539aa0b9f23ee55b776",
+      "size": 8649,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c6c659c1e9fabfa9a2419539aa0b9f23ee55b776"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/shm.rs",
+      "sha": "5147f0422be2f95eadac76e1ffc7b6372fb6a27c",
+      "size": 23583,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5147f0422be2f95eadac76e1ffc7b6372fb6a27c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/sync.rs",
+      "sha": "390463a436a21b720946e18d67138da6162a832b",
+      "size": 23925,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/390463a436a21b720946e18d67138da6162a832b"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xc_misc.rs",
+      "sha": "102327773642923f536cc876f702147ba8b78aef",
+      "size": 3120,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/102327773642923f536cc876f702147ba8b78aef"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xevie.rs",
+      "sha": "51a40657876ebae5339d323334af87d3703751d1",
+      "size": 4282,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/51a40657876ebae5339d323334af87d3703751d1"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xf86dri.rs",
+      "sha": "951fd11b0e7ef410199ae51cf5ce6e6f63ef2318",
+      "size": 8833,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/951fd11b0e7ef410199ae51cf5ce6e6f63ef2318"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xf86vidmode.rs",
+      "sha": "00b27833bbb431110f554903db940bd590a15c41",
+      "size": 19143,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/00b27833bbb431110f554903db940bd590a15c41"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xfixes.rs",
+      "sha": "ac3bff53a1500be358eeeadc3f27aa9078353c91",
+      "size": 37590,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ac3bff53a1500be358eeeadc3f27aa9078353c91"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xinerama.rs",
+      "sha": "1a1f00fa740ffe04c69762075f55c8b68414a1f5",
+      "size": 4878,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1a1f00fa740ffe04c69762075f55c8b68414a1f5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xinput.rs",
+      "sha": "2841c0f1e0bd1c401714b254c846eb431232f346",
+      "size": 54582,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/2841c0f1e0bd1c401714b254c846eb431232f346"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xkb.rs",
+      "sha": "c85de7d10cb1b0df40519c7c829117befdb684d8",
+      "size": 30409,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c85de7d10cb1b0df40519c7c829117befdb684d8"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xprint.rs",
+      "sha": "1546fecf28409bbd634a4c6be6c1149eb8ec28ca",
+      "size": 18423,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1546fecf28409bbd634a4c6be6c1149eb8ec28ca"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xproto.rs",
+      "sha": "028cf560b1e174b6f2288a8180f109a3bd11fc6a",
+      "size": 226691,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/028cf560b1e174b6f2288a8180f109a3bd11fc6a"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xselinux.rs",
+      "sha": "9d5179063c22324e5f808637e59608c292114654",
+      "size": 16690,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9d5179063c22324e5f808637e59608c292114654"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xtest.rs",
+      "sha": "712a770fdb68e53c0350408d5a207e2e455ae1f5",
+      "size": 4109,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/712a770fdb68e53c0350408d5a207e2e455ae1f5"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xv.rs",
+      "sha": "636fa75484908f64b8845af8c21bebffbdc87c4d",
+      "size": 17514,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/636fa75484908f64b8845af8c21bebffbdc87c4d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/protocol/xvmc.rs",
+      "sha": "c073773f6d744733e174e92c715171d16440aac5",
+      "size": 7451,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c073773f6d744733e174e92c715171d16440aac5"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/resource_manager",
+      "sha": "414c8894443f1405e3b033331a9615f843cb0ae8",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/414c8894443f1405e3b033331a9615f843cb0ae8"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/resource_manager/mod.rs",
+      "sha": "bc7945328897eb4d3824276fa45e93b985ee497e",
+      "size": 3090,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bc7945328897eb4d3824276fa45e93b985ee497e"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/rust_connection",
+      "sha": "8e65fffb8d0afac3355f3b69ea4a2329972a431c",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/8e65fffb8d0afac3355f3b69ea4a2329972a431c"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/rust_connection/mod.rs",
+      "sha": "eb3a3d6b344e73e76d0691c376fdb7b8500a66bd",
+      "size": 33466,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/eb3a3d6b344e73e76d0691c376fdb7b8500a66bd"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/rust_connection/packet_reader.rs",
+      "sha": "b6df308885dac9b95d0768c2afe5612248da8969",
+      "size": 6614,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b6df308885dac9b95d0768c2afe5612248da8969"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/rust_connection/stream.rs",
+      "sha": "6ff00c4d02eed772faccfe86f7f64dfa506ca98e",
+      "size": 19972,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6ff00c4d02eed772faccfe86f7f64dfa506ca98e"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/rust_connection/write_buffer.rs",
+      "sha": "5fb97ff8191fe8d050b6825a36c87a785b92ce34",
+      "size": 7717,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5fb97ff8191fe8d050b6825a36c87a785b92ce34"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/test.rs",
+      "sha": "f99ef547ca322dfcf41ab6bbfebf2bb6dd3819c6",
+      "size": 1633,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f99ef547ca322dfcf41ab6bbfebf2bb6dd3819c6"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/tracing.rs",
+      "sha": "415bd64f64a631f11b3633eb91470a69ed7cddb1",
+      "size": 4157,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/415bd64f64a631f11b3633eb91470a69ed7cddb1"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/utils.rs",
+      "sha": "016fe5597bbc0dfdf6c05087c810a803b2baed06",
+      "size": 2872,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/016fe5597bbc0dfdf6c05087c810a803b2baed06"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/wrapper.rs",
+      "sha": "9643f2c5950dde4c793fdb13943a496016b22000",
+      "size": 4212,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9643f2c5950dde4c793fdb13943a496016b22000"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/x11_utils.rs",
+      "sha": "45de36aa1e96c18a924719e25cc5541b86300592",
+      "size": 5414,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/45de36aa1e96c18a924719e25cc5541b86300592"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/xcb_ffi",
+      "sha": "2e0ad57750c6005feba2ac02a46bc935830be985",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/2e0ad57750c6005feba2ac02a46bc935830be985"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/atomic_u64.rs",
+      "sha": "9ce37d5ef4102dfac170c592364f4d43172c5c3d",
+      "size": 955,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9ce37d5ef4102dfac170c592364f4d43172c5c3d"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/mod.rs",
+      "sha": "64d41adb6b68a0e0072f6807525f327d81eba9e4",
+      "size": 27966,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/64d41adb6b68a0e0072f6807525f327d81eba9e4"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/pending_errors.rs",
+      "sha": "93fd66cf045ecc7a773b992d35b6e406cb06ee0b",
+      "size": 2277,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/93fd66cf045ecc7a773b992d35b6e406cb06ee0b"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/src/xcb_ffi/raw_ffi",
+      "sha": "8493cea92e76979c0a579eeb92210aca177be727",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/8493cea92e76979c0a579eeb92210aca177be727"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/raw_ffi/ffi.rs",
+      "sha": "1155b00c414b692418ac82acef81145660519805",
+      "size": 7103,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/1155b00c414b692418ac82acef81145660519805"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/raw_ffi/mod.rs",
+      "sha": "5d49253c679b693256b88ba406ed570e384951d7",
+      "size": 3788,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5d49253c679b693256b88ba406ed570e384951d7"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/src/xcb_ffi/raw_ffi/test.rs",
+      "sha": "7433bf1a2852c75a4a605acfe9576f23b46c16dd",
+      "size": 4364,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7433bf1a2852c75a4a605acfe9576f23b46c16dd"
+    },
+    {
+      "mode": "040000",
+      "path": "x11rb/tests",
+      "sha": "a184c074e15ebfa2df63f96166b47b13b6242492",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/a184c074e15ebfa2df63f96166b47b13b6242492"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/tests/multithread_test.rs",
+      "sha": "157b279d1c4dce8fe9219cd68dc02b89127e2a9f",
+      "size": 7760,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/157b279d1c4dce8fe9219cd68dc02b89127e2a9f"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/tests/regression_tests.rs",
+      "sha": "64a8168413924cae8c60f404cd2b948bd28bff96",
+      "size": 9792,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/64a8168413924cae8c60f404cd2b948bd28bff96"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/tests/resource_manager.rs",
+      "sha": "d3cfb4add6ec29678fd067e9cd5e0feb28364933",
+      "size": 8973,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d3cfb4add6ec29678fd067e9cd5e0feb28364933"
+    },
+    {
+      "mode": "100644",
+      "path": "x11rb/tests/x11_utils.rs",
+      "sha": "3c1cd9373355b9d8a4bfd099e976dcec4b7bd212",
+      "size": 6480,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3c1cd9373355b9d8a4bfd099e976dcec4b7bd212"
+    },
+    {
+      "mode": "040000",
+      "path": "xcb-proto-1.17.0",
+      "sha": "26da96b71bc2753427bc54ca05f1706715d84b0c",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/26da96b71bc2753427bc54ca05f1706715d84b0c"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/.gitignore",
+      "sha": "91876c66a76a755eaada68c8d726ad34a013e74b",
+      "size": 297,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/91876c66a76a755eaada68c8d726ad34a013e74b"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/.gitlab-ci.yml",
+      "sha": "3b0ea3f5e8724e1cdc4c0685915135499b522ca5",
+      "size": 3464,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3b0ea3f5e8724e1cdc4c0685915135499b522ca5"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/COPYING",
+      "sha": "54bfbe5b02074d0c276959c9140072ccba0dc670",
+      "size": 1337,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/54bfbe5b02074d0c276959c9140072ccba0dc670"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/HACKING",
+      "sha": "e954a766a2f34b201de054ce27a6ee630441d4e5",
+      "size": 674,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/e954a766a2f34b201de054ce27a6ee630441d4e5"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/INSTALL",
+      "sha": "54caf7c190f28df0279ade5fee3d43b108480a14",
+      "size": 9240,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/54caf7c190f28df0279ade5fee3d43b108480a14"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/Makefile.am",
+      "sha": "8b57a83fef243a2f858a83ddbf21535833d4233f",
+      "size": 145,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8b57a83fef243a2f858a83ddbf21535833d4233f"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/NEWS",
+      "sha": "064453e2fa6f80777a4d2f6986328acc2345ec25",
+      "size": 12228,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/064453e2fa6f80777a4d2f6986328acc2345ec25"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/README.md",
+      "sha": "5ee075cf1ba6096b0cd29749e247dddec6d32a70",
+      "size": 2167,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5ee075cf1ba6096b0cd29749e247dddec6d32a70"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/TODO",
+      "sha": "add693c48f406cedf6e653be7d66ace77f3d7f6c",
+      "size": 609,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/add693c48f406cedf6e653be7d66ace77f3d7f6c"
+    },
+    {
+      "mode": "100755",
+      "path": "xcb-proto-1.17.0/autogen.sh",
+      "sha": "72cba586c025b6ea7bf5bc24e55d85736726de29",
+      "size": 349,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/72cba586c025b6ea7bf5bc24e55d85736726de29"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/configure.ac",
+      "sha": "60a1b783ee9bab9bbe198b529a65c11e6c7d2549",
+      "size": 652,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/60a1b783ee9bab9bbe198b529a65c11e6c7d2549"
+    },
+    {
+      "mode": "040000",
+      "path": "xcb-proto-1.17.0/doc",
+      "sha": "415a13c6d691149232435c86e99450cd49eeb908",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/415a13c6d691149232435c86e99450cd49eeb908"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/doc/xml-xcb.txt",
+      "sha": "baef734168015ea943d9084cf912596da31a1f6f",
+      "size": 17728,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/baef734168015ea943d9084cf912596da31a1f6f"
+    },
+    {
+      "mode": "040000",
+      "path": "xcb-proto-1.17.0/src",
+      "sha": "709d7b87ebb851a6be82f4022dd16c2a0637769b",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/709d7b87ebb851a6be82f4022dd16c2a0637769b"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/.gitattributes",
+      "sha": "8d345b069b6b6bd58aae7a8e538cef35d2b098a8",
+      "size": 15,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8d345b069b6b6bd58aae7a8e538cef35d2b098a8"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/Makefile.am",
+      "sha": "aa10860844c577790df15bb073f71a0c46365613",
+      "size": 562,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/aa10860844c577790df15bb073f71a0c46365613"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/bigreq.xml",
+      "sha": "ddd1e210e518e875841d9b3eabaf6942f5185482",
+      "size": 2229,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ddd1e210e518e875841d9b3eabaf6942f5185482"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/composite.xml",
+      "sha": "dcbf9a6d87d5e7970bde7753531a7b958ab8e1ee",
+      "size": 9180,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/dcbf9a6d87d5e7970bde7753531a7b958ab8e1ee"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/damage.xml",
+      "sha": "930090a3682066376a9c77eca2a946a33b81cc86",
+      "size": 7890,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/930090a3682066376a9c77eca2a946a33b81cc86"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/dbe.xml",
+      "sha": "8e891f45533dbdddf6c39e421972f9885a479092",
+      "size": 6947,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8e891f45533dbdddf6c39e421972f9885a479092"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/dpms.xml",
+      "sha": "814a14ec68200eb2b440c732ba24b0dd35fe45f6",
+      "size": 3642,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/814a14ec68200eb2b440c732ba24b0dd35fe45f6"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/dri2.xml",
+      "sha": "3b4c12e9b97e8eb47ad5b863f3250d4c976d3e5e",
+      "size": 9488,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3b4c12e9b97e8eb47ad5b863f3250d4c976d3e5e"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/dri3.xml",
+      "sha": "d681aae88abd834a5397fa20b4114e0fcae66413",
+      "size": 6170,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d681aae88abd834a5397fa20b4114e0fcae66413"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/ge.xml",
+      "sha": "3a6210d97d97c69c6eb3fa75bbad931e49f206d3",
+      "size": 1863,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3a6210d97d97c69c6eb3fa75bbad931e49f206d3"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/glx.xml",
+      "sha": "9abfc5b76cab0262cb31ec72b2b44254ba84fd30",
+      "size": 45391,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/9abfc5b76cab0262cb31ec72b2b44254ba84fd30"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/present.xml",
+      "sha": "bae445f52245a18987ceebe164c55164ee4e533e",
+      "size": 8489,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bae445f52245a18987ceebe164c55164ee4e533e"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/randr.xml",
+      "sha": "703d6ba250de6d2537a442d37097020c0f66c71c",
+      "size": 30366,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/703d6ba250de6d2537a442d37097020c0f66c71c"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/record.xml",
+      "sha": "74c16fe5b944f4161bde1a05ea9c719be87601f9",
+      "size": 5924,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/74c16fe5b944f4161bde1a05ea9c719be87601f9"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/render.xml",
+      "sha": "935fdcc81da3de9d7aeee09e5fc956964c48325f",
+      "size": 23693,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/935fdcc81da3de9d7aeee09e5fc956964c48325f"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/res.xml",
+      "sha": "be32ca18bf2af3865a1297c8afd5329157783748",
+      "size": 5912,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/be32ca18bf2af3865a1297c8afd5329157783748"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/screensaver.xml",
+      "sha": "2c43b4dbbf841fa2dd8a3b3505404ffddabbc107",
+      "size": 6678,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/2c43b4dbbf841fa2dd8a3b3505404ffddabbc107"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/shape.xml",
+      "sha": "d75549e0592f9c1557fbe9ab505281e72e48b947",
+      "size": 6039,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d75549e0592f9c1557fbe9ab505281e72e48b947"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/shm.xml",
+      "sha": "0f93a2cd0a40acc4614890524787ee66a43e750d",
+      "size": 14636,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0f93a2cd0a40acc4614890524787ee66a43e750d"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/sync.xml",
+      "sha": "33ce178717edba784471f5a57f34bdcb707c155d",
+      "size": 8390,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/33ce178717edba784471f5a57f34bdcb707c155d"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xc_misc.xml",
+      "sha": "139ca22f02f42d3401d01fe85e19dacb7f497927",
+      "size": 1162,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/139ca22f02f42d3401d01fe85e19dacb7f497927"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xcb.xsd",
+      "sha": "86a51c53665fb73ba66f8911afb2eb92666e56fa",
+      "size": 16334,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/86a51c53665fb73ba66f8911afb2eb92666e56fa"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xevie.xml",
+      "sha": "bafa9900b4bacdecd9432f7f0cb7fcc1b16c59b9",
+      "size": 2958,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bafa9900b4bacdecd9432f7f0cb7fcc1b16c59b9"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xf86dri.xml",
+      "sha": "5bfc5727aa31170dbdc281200855d12047279307",
+      "size": 5900,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5bfc5727aa31170dbdc281200855d12047279307"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xf86vidmode.xml",
+      "sha": "a165c11d959b811ac20c00e9124169160a27ed9f",
+      "size": 14673,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a165c11d959b811ac20c00e9124169160a27ed9f"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xfixes.xml",
+      "sha": "442bc02e16d62f6c88c7e1f9be92d4820ab42673",
+      "size": 13530,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/442bc02e16d62f6c88c7e1f9be92d4820ab42673"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xinerama.xml",
+      "sha": "b2747eeab51f718af42309a7ba80dc9f79b159de",
+      "size": 3453,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b2747eeab51f718af42309a7ba80dc9f79b159de"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xinput.xml",
+      "sha": "7f4074eb0ee3c92e7c4d2ea6fd3e556de07c98dc",
+      "size": 107533,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7f4074eb0ee3c92e7c4d2ea6fd3e556de07c98dc"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xkb.xml",
+      "sha": "8778c073f18fbed5ac51e90acd92d6da26db1e98",
+      "size": 91919,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8778c073f18fbed5ac51e90acd92d6da26db1e98"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xprint.xml",
+      "sha": "fa3bb7ff1ff75516bb1443a9b44f53a0c761a82b",
+      "size": 11114,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/fa3bb7ff1ff75516bb1443a9b44f53a0c761a82b"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xproto.xml",
+      "sha": "19a8a6ab82b34070bb93979269ab5ea1564d36d2",
+      "size": 206205,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/19a8a6ab82b34070bb93979269ab5ea1564d36d2"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xselinux.xml",
+      "sha": "a97a146847d184d671dd997c97e2a9a7d6360e76",
+      "size": 8260,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a97a146847d184d671dd997c97e2a9a7d6360e76"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xtest.xml",
+      "sha": "085d3a3dc4f24001fb2dbba71f7acb7ee0ab8be3",
+      "size": 3968,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/085d3a3dc4f24001fb2dbba71f7acb7ee0ab8be3"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xv.xml",
+      "sha": "6db133fa6c04772692c2438e5b952da847054655",
+      "size": 16061,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/6db133fa6c04772692c2438e5b952da847054655"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/src/xvmc.xml",
+      "sha": "ac80003f91ac5f3262704564ed5c1d77ebabbea0",
+      "size": 5363,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ac80003f91ac5f3262704564ed5c1d77ebabbea0"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcb-proto.pc.in",
+      "sha": "0822b182adf3486ae7b39a3d71079ba285bf19ab",
+      "size": 289,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0822b182adf3486ae7b39a3d71079ba285bf19ab"
+    },
+    {
+      "mode": "040000",
+      "path": "xcb-proto-1.17.0/xcbgen",
+      "sha": "8f411f31b9ac211439fe222b3379f473ccce9d8d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/8f411f31b9ac211439fe222b3379f473ccce9d8d"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/Makefile.am",
+      "sha": "d6c7adc7dba9541eb4620d63b822b88ee7a12242",
+      "size": 123,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d6c7adc7dba9541eb4620d63b822b88ee7a12242"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/__init__.py",
+      "sha": "8b137891791fe96927ad78e64b0aad7bded08bdc",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/8b137891791fe96927ad78e64b0aad7bded08bdc"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/align.py",
+      "sha": "5c4f5177dcb14753dabe6f0c8fee57781202efba",
+      "size": 6473,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5c4f5177dcb14753dabe6f0c8fee57781202efba"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/error.py",
+      "sha": "bbcd5013db973f75b7666e9e9d06ed543c3fb745",
+      "size": 116,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bbcd5013db973f75b7666e9e9d06ed543c3fb745"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/expr.py",
+      "sha": "bf46c636090d8bccb9b7ec157115a275622e9782",
+      "size": 6498,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/bf46c636090d8bccb9b7ec157115a275622e9782"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/matcher.py",
+      "sha": "0d57685018910e6464ff7735eb8decdaa88ec9ce",
+      "size": 4037,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/0d57685018910e6464ff7735eb8decdaa88ec9ce"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/state.py",
+      "sha": "ffbfc14ee615308f1130fbce16e60ecd6d765b90",
+      "size": 6906,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/ffbfc14ee615308f1130fbce16e60ecd6d765b90"
+    },
+    {
+      "mode": "100644",
+      "path": "xcb-proto-1.17.0/xcbgen/xtypes.py",
+      "sha": "81ca6e1083d27c8a88032f5f5f62ae669f0adfa0",
+      "size": 53475,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/81ca6e1083d27c8a88032f5f5f62ae669f0adfa0"
+    },
+    {
+      "mode": "040000",
+      "path": "xcbgen-rs",
+      "sha": "38d906b11da7fd91ee808d93c732c90d34621b19",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/38d906b11da7fd91ee808d93c732c90d34621b19"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/Cargo.toml",
+      "sha": "db5e31e242f2b8608fbdcad4d9d9bad3f1a0f38d",
+      "size": 233,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/db5e31e242f2b8608fbdcad4d9d9bad3f1a0f38d"
+    },
+    {
+      "mode": "040000",
+      "path": "xcbgen-rs/src",
+      "sha": "4f8c45b6c24066d5b45234d83d9057db8216ac67",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/4f8c45b6c24066d5b45234d83d9057db8216ac67"
+    },
+    {
+      "mode": "040000",
+      "path": "xcbgen-rs/src/defs",
+      "sha": "60f2dfec67859ecd102b5971072b65d52449416a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/60f2dfec67859ecd102b5971072b65d52449416a"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/alignment.rs",
+      "sha": "609902317fa1eebd4bea2150d66e9c59ce87ec6a",
+      "size": 16527,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/609902317fa1eebd4bea2150d66e9c59ce87ec6a"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/doc.rs",
+      "sha": "55464b814c9c04c03c48221a86bf2e67d80aaa34",
+      "size": 1300,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/55464b814c9c04c03c48221a86bf2e67d80aaa34"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/expression.rs",
+      "sha": "4fa598bc8a6bcb5e83e698156d4789e5c7e72b52",
+      "size": 5759,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4fa598bc8a6bcb5e83e698156d4789e5c7e72b52"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/fields.rs",
+      "sha": "999efc21638c7948c866ce807cdf5d5f179e4bdd",
+      "size": 13513,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/999efc21638c7948c866ce807cdf5d5f179e4bdd"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/mod.rs",
+      "sha": "f6562cf2d40777b3e18c6f712c546824666bc430",
+      "size": 12756,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/f6562cf2d40777b3e18c6f712c546824666bc430"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/defs/top_level.rs",
+      "sha": "b02aa85c03cd9ea70828f7ee0b488df211444494",
+      "size": 24387,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b02aa85c03cd9ea70828f7ee0b488df211444494"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/lib.rs",
+      "sha": "d942308e2a57bb4c62d6b5682b235a7e920e896c",
+      "size": 805,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/d942308e2a57bb4c62d6b5682b235a7e920e896c"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/parser.rs",
+      "sha": "3f15159c3e4c91df610801530dcc77784c003a39",
+      "size": 40135,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/3f15159c3e4c91df610801530dcc77784c003a39"
+    },
+    {
+      "mode": "040000",
+      "path": "xcbgen-rs/src/resolver",
+      "sha": "34665662fa124f3667d5e6a59b92aac569139dbe",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/34665662fa124f3667d5e6a59b92aac569139dbe"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/align_checker.rs",
+      "sha": "c5e4edb20e56cb600a13e376fddbc41e5b884079",
+      "size": 17879,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c5e4edb20e56cb600a13e376fddbc41e5b884079"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/extra_fields_inserter.rs",
+      "sha": "c44673f0f78fcc65ec710016cd70991917abdf91",
+      "size": 9075,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/c44673f0f78fcc65ec710016cd70991917abdf91"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/field_ref_resolver.rs",
+      "sha": "5185393d93fc92e2aa98bf0902925a00fd3ee589",
+      "size": 16527,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/5185393d93fc92e2aa98bf0902925a00fd3ee589"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/mod.rs",
+      "sha": "25ee6bf15f599e0f2161ac28152499af2ce3a07a",
+      "size": 5696,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/25ee6bf15f599e0f2161ac28152499af2ce3a07a"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/nesting_checker.rs",
+      "sha": "a0a6694f171349138ef27c2556c5bcde14c211d1",
+      "size": 4662,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a0a6694f171349138ef27c2556c5bcde14c211d1"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/param_ref_gatherer.rs",
+      "sha": "b7494f0700fff413e0a8ce044f578b413518969b",
+      "size": 4491,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b7494f0700fff413e0a8ce044f578b413518969b"
+    },
+    {
+      "mode": "100644",
+      "path": "xcbgen-rs/src/resolver/type_resolver.rs",
+      "sha": "a12f43aa6ad0ef66b940156e94ae101695c1dfe6",
+      "size": 18838,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/a12f43aa6ad0ef66b940156e94ae101695c1dfe6"
+    },
+    {
+      "mode": "040000",
+      "path": "xkbcommon-example",
+      "sha": "9ca3ffec7fb73c7bc5483698680839b2860a2c53",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/9ca3ffec7fb73c7bc5483698680839b2860a2c53"
+    },
+    {
+      "mode": "100644",
+      "path": "xkbcommon-example/Cargo.toml",
+      "sha": "829b95a2879e9095dfeb61fd51f87dff5d7e573e",
+      "size": 327,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/829b95a2879e9095dfeb61fd51f87dff5d7e573e"
+    },
+    {
+      "mode": "040000",
+      "path": "xkbcommon-example/src",
+      "sha": "fcd7aec3e6ed1921bbe90af23bf420c22a420ad4",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/fcd7aec3e6ed1921bbe90af23bf420c22a420ad4"
+    },
+    {
+      "mode": "100644",
+      "path": "xkbcommon-example/src/main.rs",
+      "sha": "7a75ac1c3b785203a627c9455b120b5d7de8999c",
+      "size": 5708,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/7a75ac1c3b785203a627c9455b120b5d7de8999c"
+    },
+    {
+      "mode": "040000",
+      "path": "xtrace-example",
+      "sha": "c108dd72466fc776854ea9d0fa0c5326f15cb15b",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/c108dd72466fc776854ea9d0fa0c5326f15cb15b"
+    },
+    {
+      "mode": "100644",
+      "path": "xtrace-example/Cargo.toml",
+      "sha": "04cdcf84b9297655d7d698fa0ff40d3f8b1ca6b4",
+      "size": 518,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/04cdcf84b9297655d7d698fa0ff40d3f8b1ca6b4"
+    },
+    {
+      "mode": "040000",
+      "path": "xtrace-example/src",
+      "sha": "a1a8a84199b5e68ce10ed79c4c0b18d0c7b41f17",
+      "type": "tree",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/trees/a1a8a84199b5e68ce10ed79c4c0b18d0c7b41f17"
+    },
+    {
+      "mode": "100644",
+      "path": "xtrace-example/src/connection.rs",
+      "sha": "4aede1946fe8aad8b5467a30accb07540d758cc7",
+      "size": 6094,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4aede1946fe8aad8b5467a30accb07540d758cc7"
+    },
+    {
+      "mode": "100644",
+      "path": "xtrace-example/src/connection_inner.rs",
+      "sha": "4674802816f0d1746da71a135237966f7c41fadc",
+      "size": 10297,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/4674802816f0d1746da71a135237966f7c41fadc"
+    },
+    {
+      "mode": "100644",
+      "path": "xtrace-example/src/forwarder.rs",
+      "sha": "847e7afe35bc86ff9460b4b433c0f79b1af7196e",
+      "size": 1396,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/847e7afe35bc86ff9460b4b433c0f79b1af7196e"
+    },
+    {
+      "mode": "100644",
+      "path": "xtrace-example/src/main.rs",
+      "sha": "b8425c14ebf32bd503ee37a1f97b02d0a4b3a022",
+      "size": 5514,
+      "type": "blob",
+      "url": "https://api.github.com/repos/psychon/x11rb/git/blobs/b8425c14ebf32bd503ee37a1f97b02d0a4b3a022"
+    }
+  ],
+  "truncated": false,
+  "url": "https://api.github.com/repos/psychon/x11rb/git/trees/1b73245acc5dce4c4987c80dd7589e7b60af3532"
+}

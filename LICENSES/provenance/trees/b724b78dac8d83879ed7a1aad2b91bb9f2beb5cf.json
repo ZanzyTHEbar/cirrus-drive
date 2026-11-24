@@ -1,0 +1,1596 @@
+{
+  "repository": "ash-rs/ash",
+  "revision": "b724b78dac8d83879ed7a1aad2b91bb9f2beb5cf",
+  "sha": "b724b78dac8d83879ed7a1aad2b91bb9f2beb5cf",
+  "tree": [
+    {
+      "mode": "040000",
+      "path": ".github",
+      "sha": "5cfce62c899ecad24e3b10e13ef65fb6cd626cda",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/5cfce62c899ecad24e3b10e13ef65fb6cd626cda"
+    },
+    {
+      "mode": "100644",
+      "path": ".github/dependabot.yaml",
+      "sha": "8be550a8bfeedaaa06e1b3c59189d314c449d191",
+      "size": 217,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/8be550a8bfeedaaa06e1b3c59189d314c449d191"
+    },
+    {
+      "mode": "040000",
+      "path": ".github/workflows",
+      "sha": "e0162e6fe6238186941cdec5e56bfe2c7915b4a0",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/e0162e6fe6238186941cdec5e56bfe2c7915b4a0"
+    },
+    {
+      "mode": "100644",
+      "path": ".github/workflows/ci.yml",
+      "sha": "8b8cd293727c475daaf8aa9879c17308dc4a536b",
+      "size": 3354,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/8b8cd293727c475daaf8aa9879c17308dc4a536b"
+    },
+    {
+      "mode": "100644",
+      "path": ".gitignore",
+      "sha": "3da1c9376d21059ae093f5aac7b42ab28c1f7967",
+      "size": 44,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3da1c9376d21059ae093f5aac7b42ab28c1f7967"
+    },
+    {
+      "mode": "100644",
+      "path": ".gitmodules",
+      "sha": "f59e7f906f5d29fa72ffb7b2b6ba2fa483a6a879",
+      "size": 141,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f59e7f906f5d29fa72ffb7b2b6ba2fa483a6a879"
+    },
+    {
+      "mode": "100644",
+      "path": "Cargo.toml",
+      "sha": "17b22f707b638a8f2e1147fdcc60671f53cd729d",
+      "size": 167,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/17b22f707b638a8f2e1147fdcc60671f53cd729d"
+    },
+    {
+      "mode": "100644",
+      "path": "Changelog.md",
+      "sha": "6eca1724304c49549d070ad0508d16aff1171f19",
+      "size": 26125,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/6eca1724304c49549d070ad0508d16aff1171f19"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE-APACHE",
+      "sha": "0078a142e8a012510cf0a939b48963984895dd95",
+      "size": 9691,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0078a142e8a012510cf0a939b48963984895dd95"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE-MIT",
+      "sha": "e17f80b38f2eebc7061c85d7f27992f1b360a369",
+      "size": 1047,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e17f80b38f2eebc7061c85d7f27992f1b360a369"
+    },
+    {
+      "mode": "100644",
+      "path": "README.md",
+      "sha": "6b46827a52334425abc840314c86f39eb752c1de",
+      "size": 11238,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/6b46827a52334425abc840314c86f39eb752c1de"
+    },
+    {
+      "mode": "040000",
+      "path": "analysis",
+      "sha": "1e2aa86bb882cbfea3b5cf2fdfe1954e3c137de1",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/1e2aa86bb882cbfea3b5cf2fdfe1954e3c137de1"
+    },
+    {
+      "mode": "100644",
+      "path": "analysis/Cargo.toml",
+      "sha": "64d058be9644042ed81f21b7c1715ef9816882e7",
+      "size": 79,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/64d058be9644042ed81f21b7c1715ef9816882e7"
+    },
+    {
+      "mode": "040000",
+      "path": "analysis/src",
+      "sha": "a9a6eac2b9f00baf18b8988ceb1bebd4774ece74",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/a9a6eac2b9f00baf18b8988ceb1bebd4774ece74"
+    },
+    {
+      "mode": "100644",
+      "path": "analysis/src/lib.rs",
+      "sha": "88cb859628489f01604e3e2d6b36a5af6bbb7e5b",
+      "size": 159,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/88cb859628489f01604e3e2d6b36a5af6bbb7e5b"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples",
+      "sha": "6f226299935c4bd5e98d550449aba97f1a19bbeb",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/6f226299935c4bd5e98d550449aba97f1a19bbeb"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/Cargo.toml",
+      "sha": "a93eaa145758021be76c0a7db0dd1e8c9c0b5aa6",
+      "size": 550,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a93eaa145758021be76c0a7db0dd1e8c9c0b5aa6"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/assets",
+      "sha": "c932e6dfac2724a954dfe097db8301520449b0a9",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/c932e6dfac2724a954dfe097db8301520449b0a9"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/assets/rust.png",
+      "sha": "ec71bd0cb87d4ccac8b24b163fe91ef92a752c8e",
+      "size": 38310,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/ec71bd0cb87d4ccac8b24b163fe91ef92a752c8e"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/shader",
+      "sha": "3bda3adea1d6fafa8155ae3c46a789a8167d291b",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/3bda3adea1d6fafa8155ae3c46a789a8167d291b"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/shader/texture",
+      "sha": "df8f2238da35ba0094414f3b21a203720e172f11",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/df8f2238da35ba0094414f3b21a203720e172f11"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/texture/frag.spv",
+      "sha": "3935b8cdacbaf49516d3a8fb0e9e73387540fc00",
+      "size": 880,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3935b8cdacbaf49516d3a8fb0e9e73387540fc00"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/texture/texture.frag",
+      "sha": "a7b3f185cf150c3f6f76924f73fac9f507d852e9",
+      "size": 396,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a7b3f185cf150c3f6f76924f73fac9f507d852e9"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/texture/texture.vert",
+      "sha": "0c07f3d7f34f87f37d4725235f56fcfcc1628db7",
+      "size": 279,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0c07f3d7f34f87f37d4725235f56fcfcc1628db7"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/texture/vert.spv",
+      "sha": "516de652cc0a46d4217fb120a3bbb1803f9e3907",
+      "size": 948,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/516de652cc0a46d4217fb120a3bbb1803f9e3907"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/shader/triangle",
+      "sha": "f7c93af5430079bc30bcb729b619a9030f6f59f2",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/f7c93af5430079bc30bcb729b619a9030f6f59f2"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/triangle/frag.spv",
+      "sha": "e1a850d82440c1021c6ff732fae6dd6eea16e628",
+      "size": 448,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e1a850d82440c1021c6ff732fae6dd6eea16e628"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/triangle/triangle.frag",
+      "sha": "299ad8f6a2800556beac12849b833992646ed394",
+      "size": 242,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/299ad8f6a2800556beac12849b833992646ed394"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/triangle/triangle.vert",
+      "sha": "836fc7a92dbaad350b31bb321d464b7bddf56a2f",
+      "size": 291,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/836fc7a92dbaad350b31bb321d464b7bddf56a2f"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/shader/triangle/vert.spv",
+      "sha": "8d8a6f1d53465143793f9490531950e43059cbf1",
+      "size": 852,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/8d8a6f1d53465143793f9490531950e43059cbf1"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/src",
+      "sha": "193586e617aa5fb16d496f4b78d31d1334d059a5",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/193586e617aa5fb16d496f4b78d31d1334d059a5"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-examples/src/bin",
+      "sha": "4db61fc51d91ae5db5f3565bba3870377d0bb51e",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/4db61fc51d91ae5db5f3565bba3870377d0bb51e"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/src/bin/texture.rs",
+      "sha": "9bea43a28793bf18d0ed73b490b5b52deb8d525a",
+      "size": 32850,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/9bea43a28793bf18d0ed73b490b5b52deb8d525a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/src/bin/triangle.rs",
+      "sha": "796dd9a7e132c193591a0c0243aed36c1d492837",
+      "size": 18459,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/796dd9a7e132c193591a0c0243aed36c1d492837"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-examples/src/lib.rs",
+      "sha": "e1c2e2670aa841ad36fe35cbd94d1078b3e0473c",
+      "size": 24298,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e1c2e2670aa841ad36fe35cbd94d1078b3e0473c"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-rewrite",
+      "sha": "6bddd80315e2421d164a6d7c8246d41b7af832bd",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/6bddd80315e2421d164a6d7c8246d41b7af832bd"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-rewrite/Cargo.toml",
+      "sha": "77cdc05e40ba23223a59d58cede77bb6477f4085",
+      "size": 1008,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/77cdc05e40ba23223a59d58cede77bb6477f4085"
+    },
+    {
+      "mode": "120000",
+      "path": "ash-rewrite/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "ash-rewrite/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-rewrite/build.rs",
+      "sha": "7ccdbc4b6e0182038dc215da2ebf62b60f632255",
+      "size": 799,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7ccdbc4b6e0182038dc215da2ebf62b60f632255"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-rewrite/src",
+      "sha": "8f9f0c25a8db3da751fb32b09c1fe061ae3109f0",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/8f9f0c25a8db3da751fb32b09c1fe061ae3109f0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-rewrite/src/lib.rs",
+      "sha": "8b137891791fe96927ad78e64b0aad7bded08bdc",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/8b137891791fe96927ad78e64b0aad7bded08bdc"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-window",
+      "sha": "16851d470dc4f9b34d3b5624d415a05e17aa11bf",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/16851d470dc4f9b34d3b5624d415a05e17aa11bf"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-window/Cargo.toml",
+      "sha": "fc04e14a14eb4cd315e68f84f520e61646fa4543",
+      "size": 979,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/fc04e14a14eb4cd315e68f84f520e61646fa4543"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-window/Changelog.md",
+      "sha": "fc00fcd6d969184fe125c0cd44af1b6452104352",
+      "size": 3239,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/fc00fcd6d969184fe125c0cd44af1b6452104352"
+    },
+    {
+      "mode": "120000",
+      "path": "ash-window/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "ash-window/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-window/README.md",
+      "sha": "307222874d79805bf883e33df4607121cab9221a",
+      "size": 2577,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/307222874d79805bf883e33df4607121cab9221a"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-window/examples",
+      "sha": "fa53fb3a83b48577d8f5f4052644536cee9159c5",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/fa53fb3a83b48577d8f5f4052644536cee9159c5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-window/examples/winit.rs",
+      "sha": "70537b26f3d2284bbe23ac751d191561be6a77d7",
+      "size": 3292,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/70537b26f3d2284bbe23ac751d191561be6a77d7"
+    },
+    {
+      "mode": "040000",
+      "path": "ash-window/src",
+      "sha": "7bab9eff9704544c42944a19b3c7a443832735f0",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/7bab9eff9704544c42944a19b3c7a443832735f0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash-window/src/lib.rs",
+      "sha": "edb001a291b2245165d0895ce12fc3a381d61aa8",
+      "size": 7596,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/edb001a291b2245165d0895ce12fc3a381d61aa8"
+    },
+    {
+      "mode": "040000",
+      "path": "ash",
+      "sha": "cde972dffe273d2cdcaed12399e8a5282b716f57",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/cde972dffe273d2cdcaed12399e8a5282b716f57"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/Cargo.toml",
+      "sha": "faa67d4aff5bfd6546ddf5a07a0f4234b641ac14",
+      "size": 1101,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/faa67d4aff5bfd6546ddf5a07a0f4234b641ac14"
+    },
+    {
+      "mode": "120000",
+      "path": "ash/LICENSE-APACHE",
+      "sha": "965b606f331b51d566b46025f9ff311a7aad0c12",
+      "size": 17,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/965b606f331b51d566b46025f9ff311a7aad0c12"
+    },
+    {
+      "mode": "120000",
+      "path": "ash/LICENSE-MIT",
+      "sha": "76219eb72e8524f15c21ec93b9b2592da49b5460",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/76219eb72e8524f15c21ec93b9b2592da49b5460"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/build.rs",
+      "sha": "7ccdbc4b6e0182038dc215da2ebf62b60f632255",
+      "size": 799,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7ccdbc4b6e0182038dc215da2ebf62b60f632255"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src",
+      "sha": "dc19b7ad523f890c5cfe2b405e4975793fe5febd",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/dc19b7ad523f890c5cfe2b405e4975793fe5febd"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/device.rs",
+      "sha": "0b24fee2dd2f2110894c7724e11a1dbad205ca0c",
+      "size": 94488,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0b24fee2dd2f2110894c7724e11a1dbad205ca0c"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/entry.rs",
+      "sha": "3a26b18a93c3695b6da991e9e3f1fed67b8ff427",
+      "size": 13712,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3a26b18a93c3695b6da991e9e3f1fed67b8ff427"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions",
+      "sha": "7f92c41f2cce68d6fe410eb36625d9479507e2a7",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/7f92c41f2cce68d6fe410eb36625d9479507e2a7"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/amd",
+      "sha": "e11c949ffae4eb94c965009d014587e52d347d77",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/e11c949ffae4eb94c965009d014587e52d347d77"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/amd/buffer_marker.rs",
+      "sha": "f01190e4433074f63729c2fde0498890e2b32c98",
+      "size": 712,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f01190e4433074f63729c2fde0498890e2b32c98"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/amd/mod.rs",
+      "sha": "2680d8ebe86cc4a2ea2220fe45cf94838015fd3b",
+      "size": 44,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2680d8ebe86cc4a2ea2220fe45cf94838015fd3b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/amd/shader_info.rs",
+      "sha": "52cc801cc256847b099264993e75cf41c4f4c30a",
+      "size": 2315,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/52cc801cc256847b099264993e75cf41c4f4c30a"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/amdx",
+      "sha": "230ddc2aad53b477fd240fd92ac1e46da621441d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/230ddc2aad53b477fd240fd92ac1e46da621441d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/amdx/mod.rs",
+      "sha": "4d7c131623d0150cbbc4ee62f1bfb2aebdef1575",
+      "size": 24,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/4d7c131623d0150cbbc4ee62f1bfb2aebdef1575"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/amdx/shader_enqueue.rs",
+      "sha": "d0f31ea3402780c7f52952c5d50e6b906aa16f23",
+      "size": 4261,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d0f31ea3402780c7f52952c5d50e6b906aa16f23"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/android",
+      "sha": "83de0f2574087ba874da7e23a0ec5462d5decc66",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/83de0f2574087ba874da7e23a0ec5462d5decc66"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/android/external_memory_android_hardware_buffer.rs",
+      "sha": "d94deb3d24c9ae02f4b0c7c54ab3e54ad5af2039",
+      "size": 1256,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d94deb3d24c9ae02f4b0c7c54ab3e54ad5af2039"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/android/mod.rs",
+      "sha": "9adb0141a2fbd024d773ad949b1d3e68b725b0ee",
+      "size": 49,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/9adb0141a2fbd024d773ad949b1d3e68b725b0ee"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/ext",
+      "sha": "501f8b8e225ddbf5b8cb7801c953a4c746e8b635",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/501f8b8e225ddbf5b8cb7801c953a4c746e8b635"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/acquire_drm_display.rs",
+      "sha": "9ed928f7336850f60362d5e30f57569a7408756d",
+      "size": 1094,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/9ed928f7336850f60362d5e30f57569a7408756d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/buffer_device_address.rs",
+      "sha": "52b074130c86385570800320efa62f0bbadc9544",
+      "size": 510,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/52b074130c86385570800320efa62f0bbadc9544"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/calibrated_timestamps.rs",
+      "sha": "3005d3b63f3b0a3541991d9625c8989a70492942",
+      "size": 1679,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3005d3b63f3b0a3541991d9625c8989a70492942"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/ext/debug_marker.rs",
+      "sha": "0e584fe2d921cf69dcaa14f618b404c1afdfab71",
+      "size": 1542,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0e584fe2d921cf69dcaa14f618b404c1afdfab71"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/ext/debug_report.rs",
+      "sha": "d29a322f505572b345ae8a01bdb822d9651cae9d",
+      "size": 1353,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d29a322f505572b345ae8a01bdb822d9651cae9d"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/ext/debug_utils.rs",
+      "sha": "ac697f423a1cf35e630b6ffdc47b907cad643b01",
+      "size": 4539,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/ac697f423a1cf35e630b6ffdc47b907cad643b01"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/descriptor_buffer.rs",
+      "sha": "a5e9ab857f335cd54abebae3cd28838d01b06e36",
+      "size": 6064,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a5e9ab857f335cd54abebae3cd28838d01b06e36"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/extended_dynamic_state.rs",
+      "sha": "dfe882679055059392e0155c4ce73c146f582ddd",
+      "size": 5689,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/dfe882679055059392e0155c4ce73c146f582ddd"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/extended_dynamic_state2.rs",
+      "sha": "708d73410436faedb9aeeecc1d48ec99a82a2664",
+      "size": 2100,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/708d73410436faedb9aeeecc1d48ec99a82a2664"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/extended_dynamic_state3.rs",
+      "sha": "e7461d8063b0c3a775950c2b1883af230f63f3b0",
+      "size": 13853,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e7461d8063b0c3a775950c2b1883af230f63f3b0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/full_screen_exclusive.rs",
+      "sha": "f2b9791f73284912977ce36e4573eda0c44c967c",
+      "size": 2238,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f2b9791f73284912977ce36e4573eda0c44c967c"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/hdr_metadata.rs",
+      "sha": "10c90ec623872d4890b97509842ef95055409f1d",
+      "size": 652,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/10c90ec623872d4890b97509842ef95055409f1d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/headless_surface.rs",
+      "sha": "a3066e81c62a13396945942260c61cc761c5481b",
+      "size": 856,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a3066e81c62a13396945942260c61cc761c5481b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/host_image_copy.rs",
+      "sha": "204896407adf9d368dc99e88f8b43ae65b97d502",
+      "size": 2789,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/204896407adf9d368dc99e88f8b43ae65b97d502"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/image_compression_control.rs",
+      "sha": "436431bd0d9edcba7149f10ca43928a105fc057b",
+      "size": 1205,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/436431bd0d9edcba7149f10ca43928a105fc057b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/image_drm_format_modifier.rs",
+      "sha": "c07e1471994255c7e0fedba2eec071c09a304f2d",
+      "size": 659,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/c07e1471994255c7e0fedba2eec071c09a304f2d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/mesh_shader.rs",
+      "sha": "eecf84c669fb8395e5326cc5ba1013ab858bcc7b",
+      "size": 2411,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/eecf84c669fb8395e5326cc5ba1013ab858bcc7b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/metal_surface.rs",
+      "sha": "99bcb6195b75a9b3d58fa3eb6404f2a665caf68a",
+      "size": 838,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/99bcb6195b75a9b3d58fa3eb6404f2a665caf68a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/mod.rs",
+      "sha": "ac1171c7c74f84d043176dceaaf028d1a3e6a751",
+      "size": 879,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/ac1171c7c74f84d043176dceaaf028d1a3e6a751"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/pipeline_properties.rs",
+      "sha": "3ef7d40653936c99a9f918eec4e606d7d5baad79",
+      "size": 749,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3ef7d40653936c99a9f918eec4e606d7d5baad79"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/private_data.rs",
+      "sha": "535fe37cb5df933146b4484ac981e7a2eb6fa2c2",
+      "size": 2397,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/535fe37cb5df933146b4484ac981e7a2eb6fa2c2"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/sample_locations.rs",
+      "sha": "b467f8cf70cbd4ed6aacd8f82f054acd92d2157e",
+      "size": 1148,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b467f8cf70cbd4ed6aacd8f82f054acd92d2157e"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/shader_object.rs",
+      "sha": "27e53c58027196f85682d7e88e6e92499704f753",
+      "size": 24884,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/27e53c58027196f85682d7e88e6e92499704f753"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/swapchain_maintenance1.rs",
+      "sha": "5314742261e5d6f81f8b4f2ebb0bf8f6138fec7a",
+      "size": 556,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/5314742261e5d6f81f8b4f2ebb0bf8f6138fec7a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/tooling_info.rs",
+      "sha": "0f00f08b8256f8c310531937f98990c9cdd98728",
+      "size": 675,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0f00f08b8256f8c310531937f98990c9cdd98728"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/ext/vertex_input_dynamic_state.rs",
+      "sha": "2e7fd7d6e15319393299031b5d1df88b7f1ef29e",
+      "size": 878,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2e7fd7d6e15319393299031b5d1df88b7f1ef29e"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/google",
+      "sha": "85c7f3cc758af4d89d0fa35e7b6d9c4d3b31dbd5",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/85c7f3cc758af4d89d0fa35e7b6d9c4d3b31dbd5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/google/display_timing.rs",
+      "sha": "06de20926da650487647f521210150c719d6e397",
+      "size": 1170,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/06de20926da650487647f521210150c719d6e397"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/google/mod.rs",
+      "sha": "7768a8620fd2c4f0fb09f4f84ecf59f395af65e0",
+      "size": 24,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7768a8620fd2c4f0fb09f4f84ecf59f395af65e0"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/khr",
+      "sha": "e4911bfa59600dcaba8642c10d59e69cfc10a61e",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/e4911bfa59600dcaba8642c10d59e69cfc10a61e"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/acceleration_structure.rs",
+      "sha": "87e98c04926c981ce06f030d8f588e6e498c5c2f",
+      "size": 10414,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/87e98c04926c981ce06f030d8f588e6e498c5c2f"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/android_surface.rs",
+      "sha": "6aa5267f63f35de656096314cfc5980f1423f853",
+      "size": 850,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/6aa5267f63f35de656096314cfc5980f1423f853"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/buffer_device_address.rs",
+      "sha": "b68f6930733d5447f4077756ed30dd6525db191a",
+      "size": 1235,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b68f6930733d5447f4077756ed30dd6525db191a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/calibrated_timestamps.rs",
+      "sha": "2ed93a45c489f387d9d29c5255a59bddb2218fe5",
+      "size": 1682,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2ed93a45c489f387d9d29c5255a59bddb2218fe5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/cooperative_matrix.rs",
+      "sha": "d8c0ef51009b4ac30e6df8c1e898d85b96a4e5fa",
+      "size": 824,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d8c0ef51009b4ac30e6df8c1e898d85b96a4e5fa"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/copy_commands2.rs",
+      "sha": "e04107d8e4e40cfedb7439bbfe2b1f46c8c3e6c8",
+      "size": 2366,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e04107d8e4e40cfedb7439bbfe2b1f46c8c3e6c8"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/create_renderpass2.rs",
+      "sha": "7ff94dc7084d29a4cfe908982dd15bfa33c5758d",
+      "size": 2128,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7ff94dc7084d29a4cfe908982dd15bfa33c5758d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/deferred_host_operations.rs",
+      "sha": "3f71788cc6c0385b91d81d65c15c9fac5810c955",
+      "size": 2324,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3f71788cc6c0385b91d81d65c15c9fac5810c955"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/device_group.rs",
+      "sha": "537c40270c664d033a0f4436465a709a66b267b1",
+      "size": 5817,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/537c40270c664d033a0f4436465a709a66b267b1"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/device_group_creation.rs",
+      "sha": "ad85ee079fd4e5982be15a19aaa85a371c632647",
+      "size": 1538,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/ad85ee079fd4e5982be15a19aaa85a371c632647"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/display.rs",
+      "sha": "801efbb2117cc64d4661a2c51855f4a55845b195",
+      "size": 4322,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/801efbb2117cc64d4661a2c51855f4a55845b195"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/display_swapchain.rs",
+      "sha": "b5d3e8b423380fefd1e4dbb1b5b960ce76c30158",
+      "size": 959,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b5d3e8b423380fefd1e4dbb1b5b960ce76c30158"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/draw_indirect_count.rs",
+      "sha": "00a97113f2ff594872019359df7d614545fc966f",
+      "size": 1510,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/00a97113f2ff594872019359df7d614545fc966f"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/dynamic_rendering.rs",
+      "sha": "2d06be76b426f6ac0f87baa4ccfd4826ab69fd12",
+      "size": 779,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2d06be76b426f6ac0f87baa4ccfd4826ab69fd12"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/dynamic_rendering_local_read.rs",
+      "sha": "bfd22649c21d6373cbeeea999b6560b84fc6f8c7",
+      "size": 1052,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/bfd22649c21d6373cbeeea999b6560b84fc6f8c7"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_fence_fd.rs",
+      "sha": "8b7334accc87aeaee416baeb8c9a0932b285f166",
+      "size": 900,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/8b7334accc87aeaee416baeb8c9a0932b285f166"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_fence_win32.rs",
+      "sha": "e2c2e058d639742a98d0d517d53c13a12d2963f2",
+      "size": 1024,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e2c2e058d639742a98d0d517d53c13a12d2963f2"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_memory_fd.rs",
+      "sha": "f77e382cc280e8ce474bc743ec0218ecff579c5d",
+      "size": 1064,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f77e382cc280e8ce474bc743ec0218ecff579c5d"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_memory_win32.rs",
+      "sha": "4bf2fc1f87a4bf9c1689598fdbd24545dad79bcf",
+      "size": 1278,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/4bf2fc1f87a4bf9c1689598fdbd24545dad79bcf"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_semaphore_fd.rs",
+      "sha": "181ea3613f28fd368c6c986451afc472aa3d2b0a",
+      "size": 963,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/181ea3613f28fd368c6c986451afc472aa3d2b0a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/external_semaphore_win32.rs",
+      "sha": "889887e1b58da4b0d5737aba9b4c0f244cdb16e0",
+      "size": 1064,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/889887e1b58da4b0d5737aba9b4c0f244cdb16e0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/get_memory_requirements2.rs",
+      "sha": "a530ac4ca8496c29439e5d91749b9359fc4a14c9",
+      "size": 2529,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a530ac4ca8496c29439e5d91749b9359fc4a14c9"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/get_physical_device_properties2.rs",
+      "sha": "3c0e88d64fcf1128c9d80e1a2792e75bafecd10e",
+      "size": 5857,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3c0e88d64fcf1128c9d80e1a2792e75bafecd10e"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/get_surface_capabilities2.rs",
+      "sha": "135334c107f567a081e0519a718fc1322c85b852",
+      "size": 2507,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/135334c107f567a081e0519a718fc1322c85b852"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/line_rasterization.rs",
+      "sha": "47a3a1bcfff1cddb2d500d1ad2234db9b7c5f083",
+      "size": 616,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/47a3a1bcfff1cddb2d500d1ad2234db9b7c5f083"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/maintenance1.rs",
+      "sha": "c00405ff1828a6cf7ea371e470bc255faeedf2bf",
+      "size": 496,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/c00405ff1828a6cf7ea371e470bc255faeedf2bf"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/maintenance3.rs",
+      "sha": "0203a1dacfe45538170027fe09a15f53cbc1a5b7",
+      "size": 574,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0203a1dacfe45538170027fe09a15f53cbc1a5b7"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/maintenance4.rs",
+      "sha": "68f472715e8b93b6138b0bbb344ee776be4c9374",
+      "size": 2629,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/68f472715e8b93b6138b0bbb344ee776be4c9374"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/maintenance5.rs",
+      "sha": "93b417a68f23a715d8db53a15f8bb0eaca01fee3",
+      "size": 2639,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/93b417a68f23a715d8db53a15f8bb0eaca01fee3"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/maintenance6.rs",
+      "sha": "696ff6f3c00f29c63416fe697b73c0693c88f6b2",
+      "size": 2880,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/696ff6f3c00f29c63416fe697b73c0693c88f6b2"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/mod.rs",
+      "sha": "5552598beaf5a1c7f8ac817586d278626d071340",
+      "size": 1246,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/5552598beaf5a1c7f8ac817586d278626d071340"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/performance_query.rs",
+      "sha": "f5bcbc0ada09314f7058261a47ce0b4e0b5829dc",
+      "size": 3841,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f5bcbc0ada09314f7058261a47ce0b4e0b5829dc"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/pipeline_executable_properties.rs",
+      "sha": "d10b2c6ff000cfc0a155166dbe58595f17fb6e8c",
+      "size": 2013,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d10b2c6ff000cfc0a155166dbe58595f17fb6e8c"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/present_wait.rs",
+      "sha": "7ade6fbdffe8263675e77179f0841a035d051171",
+      "size": 552,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7ade6fbdffe8263675e77179f0841a035d051171"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/push_descriptor.rs",
+      "sha": "bf742937b5e86f47379a12c5535ea80da6eba4f4",
+      "size": 1431,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/bf742937b5e86f47379a12c5535ea80da6eba4f4"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/ray_tracing_maintenance1.rs",
+      "sha": "97e1f8cafadd39edbe9106e148ecd8f686bd31b1",
+      "size": 736,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/97e1f8cafadd39edbe9106e148ecd8f686bd31b1"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/ray_tracing_pipeline.rs",
+      "sha": "2e41eda2649d4dd8594d38896519c8dc5d58157c",
+      "size": 5792,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2e41eda2649d4dd8594d38896519c8dc5d58157c"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/sampler_ycbcr_conversion.rs",
+      "sha": "48e9cad5ff3cebd242b4eac73aa7a0f87c76fba7",
+      "size": 1432,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/48e9cad5ff3cebd242b4eac73aa7a0f87c76fba7"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/surface.rs",
+      "sha": "c8218f26731c9b383ec9b54ad7f64c83f818c202",
+      "size": 2960,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/c8218f26731c9b383ec9b54ad7f64c83f818c202"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/swapchain.rs",
+      "sha": "861242d9b99aa2baa25fdc82f072b8b6ec856072",
+      "size": 7306,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/861242d9b99aa2baa25fdc82f072b8b6ec856072"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/synchronization2.rs",
+      "sha": "2cfeef7a74369d8da5c37c150df601d2e3406fd5",
+      "size": 2647,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2cfeef7a74369d8da5c37c150df601d2e3406fd5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/khr/timeline_semaphore.rs",
+      "sha": "01af37554319f352bbce4052c2516dc72e0984e5",
+      "size": 1283,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/01af37554319f352bbce4052c2516dc72e0984e5"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/wayland_surface.rs",
+      "sha": "b5d91b488a14b83f217ba2cc120b35592d4f6b07",
+      "size": 1410,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b5d91b488a14b83f217ba2cc120b35592d4f6b07"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/win32_surface.rs",
+      "sha": "1aa359f7d47d60753ce26de301a88a2e57fd0273",
+      "size": 1327,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/1aa359f7d47d60753ce26de301a88a2e57fd0273"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/xcb_surface.rs",
+      "sha": "5623026a92584f972dd89b7e867b10a10d506815",
+      "size": 1442,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/5623026a92584f972dd89b7e867b10a10d506815"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/khr/xlib_surface.rs",
+      "sha": "ddd01f0603951750004b44c5f255d57d01348b9b",
+      "size": 1430,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/ddd01f0603951750004b44c5f255d57d01348b9b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/mod.rs",
+      "sha": "9311c52f5331573831a5334e3450b09143174641",
+      "size": 123,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/9311c52f5331573831a5334e3450b09143174641"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/mvk",
+      "sha": "2aa8c51b6ce053bb5848dd5145a1af2e0bf7193b",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/2aa8c51b6ce053bb5848dd5145a1af2e0bf7193b"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/mvk/ios_surface.rs",
+      "sha": "e3e60f647619199de3ca2667768cdc0ff710ace1",
+      "size": 826,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e3e60f647619199de3ca2667768cdc0ff710ace1"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/mvk/macos_surface.rs",
+      "sha": "d8a8735366852f4f1ed78b716d05a34c41a22d86",
+      "size": 840,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/d8a8735366852f4f1ed78b716d05a34c41a22d86"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/mvk/mod.rs",
+      "sha": "180f753b058dbbb19f1515c9bdd4a4454abacc91",
+      "size": 44,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/180f753b058dbbb19f1515c9bdd4a4454abacc91"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/nn",
+      "sha": "80958aa9c94749e196cfd793864b7a7489f53d7a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/80958aa9c94749e196cfd793864b7a7489f53d7a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nn/mod.rs",
+      "sha": "6c1b7b9379b2d76b137a82315a03f3dea4945f59",
+      "size": 20,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/6c1b7b9379b2d76b137a82315a03f3dea4945f59"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nn/vi_surface.rs",
+      "sha": "0e2b41acbf0a8f58d2ee7f37b752ed6cdd4d4e56",
+      "size": 815,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0e2b41acbf0a8f58d2ee7f37b752ed6cdd4d4e56"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/extensions/nv",
+      "sha": "464147fb7599126a93afc58c9b9c53f5d3df16f3",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/464147fb7599126a93afc58c9b9c53f5d3df16f3"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/copy_memory_indirect.rs",
+      "sha": "14f117ed34cc0bf39659dfa0926f4fdf60739e64",
+      "size": 1913,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/14f117ed34cc0bf39659dfa0926f4fdf60739e64"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/coverage_reduction_mode.rs",
+      "sha": "61161ef54ee81e1ab03099f551c2d7b93c76bfb0",
+      "size": 2054,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/61161ef54ee81e1ab03099f551c2d7b93c76bfb0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/cuda_kernel_launch.rs",
+      "sha": "f1fa7115f539dee58256688b1b6d52fb5fe003ff",
+      "size": 2934,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f1fa7115f539dee58256688b1b6d52fb5fe003ff"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/device_diagnostic_checkpoints.rs",
+      "sha": "a2aef0508807504714c5ba1fef189442a5366d29",
+      "size": 1690,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a2aef0508807504714c5ba1fef189442a5366d29"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/device_generated_commands_compute.rs",
+      "sha": "b559131732ab0baaedc488cf74180e15a823a22f",
+      "size": 1570,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b559131732ab0baaedc488cf74180e15a823a22f"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/low_latency2.rs",
+      "sha": "f20f1c8dae090835a9b47e1ae23e7d71657d1503",
+      "size": 2075,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f20f1c8dae090835a9b47e1ae23e7d71657d1503"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/memory_decompression.rs",
+      "sha": "9f68385d9b4598255145c8fcc4996c1cbd583918",
+      "size": 1221,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/9f68385d9b4598255145c8fcc4996c1cbd583918"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/nv/mesh_shader.rs",
+      "sha": "b431f9cfc3871317a8137764f595552f1bed355a",
+      "size": 1724,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b431f9cfc3871317a8137764f595552f1bed355a"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions/nv/mod.rs",
+      "sha": "b2b6f99045a0e77bfe428a33f7000567af71e3aa",
+      "size": 267,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b2b6f99045a0e77bfe428a33f7000567af71e3aa"
+    },
+    {
+      "mode": "100755",
+      "path": "ash/src/extensions/nv/ray_tracing.rs",
+      "sha": "69140267c3559d3db4fcb9a59a8b1128945e2a02",
+      "size": 8613,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/69140267c3559d3db4fcb9a59a8b1128945e2a02"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/extensions_generated.rs",
+      "sha": "e831437d53ecc9713994036c66faab99edb86f36",
+      "size": 921347,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e831437d53ecc9713994036c66faab99edb86f36"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/instance.rs",
+      "sha": "79995e19e1ed7dc8cdfa5c6dd6b06866e63b8868",
+      "size": 20378,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/79995e19e1ed7dc8cdfa5c6dd6b06866e63b8868"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/lib.rs",
+      "sha": "2f829d16709899f2ad0cefc66fa59f7d4b70b25c",
+      "size": 7103,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/2f829d16709899f2ad0cefc66fa59f7d4b70b25c"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/prelude.rs",
+      "sha": "1341960f4f2ba90e530e6f88ac6bb9de830ba842",
+      "size": 4480,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/1341960f4f2ba90e530e6f88ac6bb9de830ba842"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/tables.rs",
+      "sha": "142d8334b304faa663116c826f31b3ef0b3741a5",
+      "size": 186328,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/142d8334b304faa663116c826f31b3ef0b3741a5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/util.rs",
+      "sha": "006bdd164c647faf2e289b050a702e86cc9713b0",
+      "size": 4601,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/006bdd164c647faf2e289b050a702e86cc9713b0"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk.rs",
+      "sha": "312741709c9102a258f1e90c6d90206d6f2eeebb",
+      "size": 1688,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/312741709c9102a258f1e90c6d90206d6f2eeebb"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/src/vk",
+      "sha": "af2417c364b334ccc83757a3a51adef2a35b4e46",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/af2417c364b334ccc83757a3a51adef2a35b4e46"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/aliases.rs",
+      "sha": "3a62e1ff67174f52f0b13413f3aa8bfb8e601731",
+      "size": 19616,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/3a62e1ff67174f52f0b13413f3aa8bfb8e601731"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/bitflags.rs",
+      "sha": "bceb0d5ba421a8918573d34a618a2c5fbb3de683",
+      "size": 92158,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/bceb0d5ba421a8918573d34a618a2c5fbb3de683"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/const_debugs.rs",
+      "sha": "bb9481e7018ce844dfe8080c2ad47453074d8162",
+      "size": 350342,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/bb9481e7018ce844dfe8080c2ad47453074d8162"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/constants.rs",
+      "sha": "7b4701560a1cec52d78606696cea1c048f46e878",
+      "size": 1341,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/7b4701560a1cec52d78606696cea1c048f46e878"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/definitions.rs",
+      "sha": "451f6b06e30f6e11baea79c0247802ff1b9495d9",
+      "size": 2158261,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/451f6b06e30f6e11baea79c0247802ff1b9495d9"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/enums.rs",
+      "sha": "643ca0259a03e3c5a51cad7924cff92b6e2b7bb5",
+      "size": 111412,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/643ca0259a03e3c5a51cad7924cff92b6e2b7bb5"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/extensions.rs",
+      "sha": "075883d91126d8ba4b5325d1fb911147723bcd8b",
+      "size": 378304,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/075883d91126d8ba4b5325d1fb911147723bcd8b"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/feature_extensions.rs",
+      "sha": "4b1820c9a726ec20270ae96851eae71ee96c66c3",
+      "size": 26314,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/4b1820c9a726ec20270ae96851eae71ee96c66c3"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/features.rs",
+      "sha": "cda77a97d9d88fe9ae4a1c5f47a671f2c09219ba",
+      "size": 31884,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/cda77a97d9d88fe9ae4a1c5f47a671f2c09219ba"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/macros.rs",
+      "sha": "a9b76f8d32229f05a0bac9c87aad3028dbf73f78",
+      "size": 4855,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a9b76f8d32229f05a0bac9c87aad3028dbf73f78"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/native.rs",
+      "sha": "a44e9b7c8733f5f4b41bc08518da52e7d1c63656",
+      "size": 438947,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/a44e9b7c8733f5f4b41bc08518da52e7d1c63656"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/platform_types.rs",
+      "sha": "b6bccb2976e47ce563b9ce777bb1d3de9dbdbf22",
+      "size": 1868,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/b6bccb2976e47ce563b9ce777bb1d3de9dbdbf22"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/src/vk/prelude.rs",
+      "sha": "5f77f1472d17a7fee76358c178ed0c7b44d6108c",
+      "size": 3619,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/5f77f1472d17a7fee76358c178ed0c7b44d6108c"
+    },
+    {
+      "mode": "040000",
+      "path": "ash/tests",
+      "sha": "76174d5dfb783c7aa797a7b064692d148d522b64",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/76174d5dfb783c7aa797a7b064692d148d522b64"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/tests/constant_size_arrays.rs",
+      "sha": "826180b59ea382f7df94d4b9fb4fd711290e5e36",
+      "size": 1009,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/826180b59ea382f7df94d4b9fb4fd711290e5e36"
+    },
+    {
+      "mode": "100644",
+      "path": "ash/tests/display.rs",
+      "sha": "f4131fdc7c579500de6ea1c82654053088b36425",
+      "size": 366,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/f4131fdc7c579500de6ea1c82654053088b36425"
+    },
+    {
+      "mode": "100644",
+      "path": "bors.toml",
+      "sha": "1b711da4812674e4399c540f57f1a8f1cee15cd5",
+      "size": 50,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/1b711da4812674e4399c540f57f1a8f1cee15cd5"
+    },
+    {
+      "mode": "040000",
+      "path": "generator-rewrite",
+      "sha": "488b8ee73a08d6641fb23c31cea7b3b3884728c7",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/488b8ee73a08d6641fb23c31cea7b3b3884728c7"
+    },
+    {
+      "mode": "100644",
+      "path": "generator-rewrite/Cargo.toml",
+      "sha": "08e458ac00860aae4bedfdc2331f226ee8b6ad17",
+      "size": 140,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/08e458ac00860aae4bedfdc2331f226ee8b6ad17"
+    },
+    {
+      "mode": "040000",
+      "path": "generator-rewrite/src",
+      "sha": "85322c4fb1dd36695fbdb50ae5b10536ee0a87cc",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/85322c4fb1dd36695fbdb50ae5b10536ee0a87cc"
+    },
+    {
+      "mode": "100644",
+      "path": "generator-rewrite/src/main.rs",
+      "sha": "0d35dbe2f3d0d0d1bb8c181dfbc5fbb4d600ffeb",
+      "size": 102,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/0d35dbe2f3d0d0d1bb8c181dfbc5fbb4d600ffeb"
+    },
+    {
+      "mode": "040000",
+      "path": "generator",
+      "sha": "52c9f413fa9b760eafbe934d90ddc73468d1abf4",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/52c9f413fa9b760eafbe934d90ddc73468d1abf4"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/Cargo.toml",
+      "sha": "437aa576f622d42c22a7ad4cb850ddf3a329e26f",
+      "size": 594,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/437aa576f622d42c22a7ad4cb850ddf3a329e26f"
+    },
+    {
+      "mode": "160000",
+      "path": "generator/Vulkan-Headers",
+      "sha": "38899bf60605f0a2c50f7968e5c4c9826a824683",
+      "type": "commit"
+    },
+    {
+      "mode": "040000",
+      "path": "generator/src",
+      "sha": "a28076601c08bed6979606c3f52ad57c979ebc88",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/a28076601c08bed6979606c3f52ad57c979ebc88"
+    },
+    {
+      "mode": "040000",
+      "path": "generator/src/bin",
+      "sha": "71ce67815fd943891a6ba3175b7d760a24391287",
+      "type": "tree",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/trees/71ce67815fd943891a6ba3175b7d760a24391287"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/bin/generator.rs",
+      "sha": "e9fde6a9469f87c9a38c0ab4c27012ff82283775",
+      "size": 320,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/e9fde6a9469f87c9a38c0ab4c27012ff82283775"
+    },
+    {
+      "mode": "100644",
+      "path": "generator/src/lib.rs",
+      "sha": "243f1da845450840ca4d0ef5ca83c34ec745cae6",
+      "size": 123626,
+      "type": "blob",
+      "url": "https://api.github.com/repos/ash-rs/ash/git/blobs/243f1da845450840ca4d0ef5ca83c34ec745cae6"
+    }
+  ],
+  "truncated": false,
+  "url": "https://api.github.com/repos/ash-rs/ash/git/trees/b724b78dac8d83879ed7a1aad2b91bb9f2beb5cf"
+}

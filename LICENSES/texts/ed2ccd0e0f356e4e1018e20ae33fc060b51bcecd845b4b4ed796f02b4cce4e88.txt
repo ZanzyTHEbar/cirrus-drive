@@ -1,0 +1,4 @@
+"copyright": [
+    "SPDX-FileCopyrightText: 2022-2025 Arm Ltd.",
+    "SPDX-License-Identifier: MIT"
+  ]

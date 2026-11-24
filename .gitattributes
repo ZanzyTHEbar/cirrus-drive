@@ -1,0 +1,3 @@
+# These notice texts are retained byte-for-byte and named by their SHA256.
+# Preserve upstream line endings so checkout and staging keep those bindings.
+/LICENSES/texts/** -text

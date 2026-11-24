@@ -1,0 +1,8 @@
+[
+  {"package":"dav-xml@0.2.0","repository":"veeso/dav-xml","revision":"06ec52ce619c095436a03cd78fcc29908103c53b","path":"LICENSE-APACHE","git_blob":"33666dddf769353b76c10d87bef9d11f3ba08325"},
+  {"package":"dav-xml@0.2.0","repository":"veeso/dav-xml","revision":"06ec52ce619c095436a03cd78fcc29908103c53b","path":"LICENSE-MIT","git_blob":"0d1e7f41c81ddd8c6248f92a64f5015c6bc4147b"},
+  {"package":"profiling@1.0.18","repository":"aclysma/profiling","revision":"8271551172eb6fa4cba47369aedd93790c623df9","path":"LICENSE-APACHE","git_blob":"139dce95d473c201a8561ef17536314d8b8cda65"},
+  {"package":"profiling@1.0.18","repository":"aclysma/profiling","revision":"8271551172eb6fa4cba47369aedd93790c623df9","path":"LICENSE-MIT","git_blob":"6a84e059ad8b43e03c2b06bc2af4dc1d8442808d"},
+  {"package":"spirv@0.4.0+sdk-1.4.341.0","repository":"gfx-rs/rspirv","revision":"8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4","path":"LICENSE","git_blob":"d645695673349e3947e8e5ae42332d0ac3164cd7"},
+  {"package":"taffy@0.15.1","repository":"DioxusLabs/taffy","revision":"0064bd54cbe38bf1d8bcd6ec6ab0704d45fb048a","path":"LICENSE","git_blob":"f6b3d8f95569d0dfca076b6b24901b2a4a89aca8"}
+]

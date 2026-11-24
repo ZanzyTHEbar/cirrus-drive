@@ -1,0 +1,7 @@
+
+        This file is part of the plugins of the Qt Toolkit.
+        SPDX-FileCopyrightText: 2012 Digia Plc and/or its subsidiary(-ies).
+        Contact: http://www.qt-project.org/legal
+
+        SPDX-License-Identifier: BSD-3-Clause
+    

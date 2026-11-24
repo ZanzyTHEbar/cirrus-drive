@@ -1,0 +1,4 @@
+
+Copyright (C) 2002-2004 Carl D. Worth, Jamey Sharp, Bart Massey, Josh Triplett
+All Rights Reserved.  See the file COPYING in this directory
+for licensing information.

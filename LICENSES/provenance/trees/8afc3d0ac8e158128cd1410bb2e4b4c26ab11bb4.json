@@ -1,0 +1,854 @@
+{
+  "repository": "gfx-rs/rspirv",
+  "revision": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4",
+  "sha": "8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4",
+  "tree": [
+    {
+      "mode": "040000",
+      "path": ".github",
+      "sha": "3ba4d6287594c28f1f692b78b49488cc43f7ee02",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/3ba4d6287594c28f1f692b78b49488cc43f7ee02"
+    },
+    {
+      "mode": "040000",
+      "path": ".github/workflows",
+      "sha": "48aa690d1d04c4f030f0b1b2212add2798248b3d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/48aa690d1d04c4f030f0b1b2212add2798248b3d"
+    },
+    {
+      "mode": "100644",
+      "path": ".github/workflows/ci.yaml",
+      "sha": "afed0a369a211bacc0eb6929d7ee9bcfc0402f2f",
+      "size": 2018,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/afed0a369a211bacc0eb6929d7ee9bcfc0402f2f"
+    },
+    {
+      "mode": "100644",
+      "path": ".github/workflows/publish.yaml",
+      "sha": "fac6ad10c6b8cac0344c3c4250573167ac72340a",
+      "size": 526,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/fac6ad10c6b8cac0344c3c4250573167ac72340a"
+    },
+    {
+      "mode": "100644",
+      "path": ".gitignore",
+      "sha": "58651f0ac1db7ca1948461744f8bd139f9e33e56",
+      "size": 48,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/58651f0ac1db7ca1948461744f8bd139f9e33e56"
+    },
+    {
+      "mode": "100644",
+      "path": ".gitmodules",
+      "sha": "2cdb36d644ee695e9f7d4d6435cc0355b84c227e",
+      "size": 141,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2cdb36d644ee695e9f7d4d6435cc0355b84c227e"
+    },
+    {
+      "mode": "100644",
+      "path": "CONTRIBUTING.md",
+      "sha": "e4c991aa4ef356ed158e21d60a511fd22080d18b",
+      "size": 2401,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/e4c991aa4ef356ed158e21d60a511fd22080d18b"
+    },
+    {
+      "mode": "100644",
+      "path": "Cargo.toml",
+      "sha": "5644ddca31aa2cfb2927c2df15af68e5676b60ec",
+      "size": 60,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/5644ddca31aa2cfb2927c2df15af68e5676b60ec"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE",
+      "sha": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "size": 11358,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/d645695673349e3947e8e5ae42332d0ac3164cd7"
+    },
+    {
+      "mode": "100644",
+      "path": "MAINTENANCE.md",
+      "sha": "2ddd64f762bcfff2e400902eccea4323bcf544df",
+      "size": 445,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2ddd64f762bcfff2e400902eccea4323bcf544df"
+    },
+    {
+      "mode": "100644",
+      "path": "README.md",
+      "sha": "f59ddc99049e6c6e1898c006ed2ca1a94f91a937",
+      "size": 7587,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/f59ddc99049e6c6e1898c006ed2ca1a94f91a937"
+    },
+    {
+      "mode": "040000",
+      "path": "autogen",
+      "sha": "c0d9906a19db71a0a37a2d4efda9986e949affef",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/c0d9906a19db71a0a37a2d4efda9986e949affef"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/Cargo.toml",
+      "sha": "10a0174d9f6398b772f0f23ba7af6f92077a89e4",
+      "size": 514,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/10a0174d9f6398b772f0f23ba7af6f92077a89e4"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/README.md",
+      "sha": "14c399999baec886ff17b70e6f50157e2271ed1f",
+      "size": 200,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/14c399999baec886ff17b70e6f50157e2271ed1f"
+    },
+    {
+      "mode": "040000",
+      "path": "autogen/external",
+      "sha": "e1d9823fee7b5c9b5df8b29dea0709e1376d2a16",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/e1d9823fee7b5c9b5df8b29dea0709e1376d2a16"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/external/README.md",
+      "sha": "926ceda227a6c50dac8a05a3236fe64ec3e61a38",
+      "size": 325,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/926ceda227a6c50dac8a05a3236fe64ec3e61a38"
+    },
+    {
+      "mode": "160000",
+      "path": "autogen/external/SPIRV-Headers",
+      "sha": "04f10f650d514df88b76d25e83db360142c7b174",
+      "type": "commit"
+    },
+    {
+      "mode": "040000",
+      "path": "autogen/src",
+      "sha": "c206d8acb9ede7c41612aa08a512af9fff40d350",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/c206d8acb9ede7c41612aa08a512af9fff40d350"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/binary.rs",
+      "sha": "bc71a06f699995517b77fd94b51e561f4dd5eb78",
+      "size": 13906,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/bc71a06f699995517b77fd94b51e561f4dd5eb78"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/dr.rs",
+      "sha": "8fe39d704d7cfe2d01cac3aefb467c74e1d923a8",
+      "size": 37368,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/8fe39d704d7cfe2d01cac3aefb467c74e1d923a8"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/header.rs",
+      "sha": "4073b243cd20114f0708838caa80df7158911219",
+      "size": 13498,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/4073b243cd20114f0708838caa80df7158911219"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/main.rs",
+      "sha": "210ff7915b84c125b4de1eb89ba1afe7549f7d67",
+      "size": 14073,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/210ff7915b84c125b4de1eb89ba1afe7549f7d67"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/sr.rs",
+      "sha": "3910a9105f4b1b6bfc377034af5160708029294c",
+      "size": 20718,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3910a9105f4b1b6bfc377034af5160708029294c"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/structs.rs",
+      "sha": "b1070ebd4c04e6e68312fd1d6fbcfb7c7fdedb2f",
+      "size": 4157,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/b1070ebd4c04e6e68312fd1d6fbcfb7c7fdedb2f"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/table.rs",
+      "sha": "aea98e681a3e03319b471a1eefe281479426fe00",
+      "size": 7548,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/aea98e681a3e03319b471a1eefe281479426fe00"
+    },
+    {
+      "mode": "100644",
+      "path": "autogen/src/utils.rs",
+      "sha": "7afe5507e9458ef14a5fec59f763df88220a5661",
+      "size": 3441,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/7afe5507e9458ef14a5fec59f763df88220a5661"
+    },
+    {
+      "mode": "040000",
+      "path": "dis",
+      "sha": "fbbe24ecd3ced87efd0b992060322957f091ba32",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/fbbe24ecd3ced87efd0b992060322957f091ba32"
+    },
+    {
+      "mode": "100644",
+      "path": "dis/Cargo.toml",
+      "sha": "b6a2817335e5216a232ddca73301f27a26ee05e2",
+      "size": 431,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/b6a2817335e5216a232ddca73301f27a26ee05e2"
+    },
+    {
+      "mode": "100644",
+      "path": "dis/README.md",
+      "sha": "8f100e23458ccfc5ce8ffc0cb3b44ef4f69be3dd",
+      "size": 155,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/8f100e23458ccfc5ce8ffc0cb3b44ef4f69be3dd"
+    },
+    {
+      "mode": "100644",
+      "path": "dis/main.rs",
+      "sha": "20298cca7412de0bba3d9cbaeecd07924adf6599",
+      "size": 704,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/20298cca7412de0bba3d9cbaeecd07924adf6599"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv",
+      "sha": "e4b10b73698b7a8ab9a637b5ba4ae650e0438c32",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/e4b10b73698b7a8ab9a637b5ba4ae650e0438c32"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/Cargo.toml",
+      "sha": "e06ac572ecad7bccf5aaff97f6dc61b53e93fb39",
+      "size": 581,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/e06ac572ecad7bccf5aaff97f6dc61b53e93fb39"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/README.md",
+      "sha": "c5912206417ae0b47f710c859a76a7658a5f96e5",
+      "size": 2202,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/c5912206417ae0b47f710c859a76a7658a5f96e5"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/binary",
+      "sha": "06c3ab7670be010f444fb1058a4d0b4d40666f46",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/06c3ab7670be010f444fb1058a4d0b4d40666f46"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/assemble.rs",
+      "sha": "643a9043f3566d1d76dcb9376f40a7da22cd1a9d",
+      "size": 15243,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/643a9043f3566d1d76dcb9376f40a7da22cd1a9d"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/autogen_decode_operand.rs",
+      "sha": "2996aec568180d4dffa3e7335e884cf41779e890",
+      "size": 26756,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2996aec568180d4dffa3e7335e884cf41779e890"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/autogen_disas_operand.rs",
+      "sha": "2198ee89d45678c842bc08220b6b0c6c286b17c4",
+      "size": 18307,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2198ee89d45678c842bc08220b6b0c6c286b17c4"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/autogen_error.rs",
+      "sha": "704a169293ce03a978a22fc69c36f2232484ba7e",
+      "size": 16117,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/704a169293ce03a978a22fc69c36f2232484ba7e"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/autogen_parse_operand.rs",
+      "sha": "89c0b62aa41e06744e0f0acd4d4fcc1db8925ddc",
+      "size": 36699,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/89c0b62aa41e06744e0f0acd4d4fcc1db8925ddc"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/decoder.rs",
+      "sha": "76eb30c577b2bacb0a92f68055002b52298fe330",
+      "size": 13039,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/76eb30c577b2bacb0a92f68055002b52298fe330"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/disassemble.rs",
+      "sha": "884bb4ac5ad59a853851b6066ed0879c15facca3",
+      "size": 18543,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/884bb4ac5ad59a853851b6066ed0879c15facca3"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/mod.rs",
+      "sha": "3684b4b9ba0207752282abb74d049220fb7164b0",
+      "size": 962,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3684b4b9ba0207752282abb74d049220fb7164b0"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/parser.rs",
+      "sha": "249c8d6e8d70d016b215978b08512b0765e2950d",
+      "size": 44253,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/249c8d6e8d70d016b215978b08512b0765e2950d"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/binary/tracker.rs",
+      "sha": "54c1da564c35c89c45eb2dd9c053cfe8ce8f573a",
+      "size": 3871,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/54c1da564c35c89c45eb2dd9c053cfe8ce8f573a"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/dr",
+      "sha": "60ae2f09c6eb51060d0b8b67f7cf67c86e99f17d",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/60ae2f09c6eb51060d0b8b67f7cf67c86e99f17d"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/autogen_operand.rs",
+      "sha": "7807e697a8fb7630cd6818de226a36314c99f4da",
+      "size": 220300,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/7807e697a8fb7630cd6818de226a36314c99f4da"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/dr/build",
+      "sha": "f2b31b0945d85941d6afeaba59644ab2f4420de2",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/f2b31b0945d85941d6afeaba59644ab2f4420de2"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_annotation.rs",
+      "sha": "e833d7e1db4d2faf0190f441315b23f1f795c287",
+      "size": 5409,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/e833d7e1db4d2faf0190f441315b23f1f795c287"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_constant.rs",
+      "sha": "9b089f41eb4f72ca3dd22881e1ebe1be195bec4c",
+      "size": 8545,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/9b089f41eb4f72ca3dd22881e1ebe1be195bec4c"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_debug.rs",
+      "sha": "5bc8fc6f04caa8e909ea7bb8960a48fa9ff64536",
+      "size": 3173,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/5bc8fc6f04caa8e909ea7bb8960a48fa9ff64536"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_norm_insts.rs",
+      "sha": "a1f947b0cabc6efeada2ec57ea337b0beca028ff",
+      "size": 919359,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/a1f947b0cabc6efeada2ec57ea337b0beca028ff"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_terminator.rs",
+      "sha": "60d80a7c1199a0fec6afcffff840201d5af1008f",
+      "size": 13125,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/60d80a7c1199a0fec6afcffff840201d5af1008f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/autogen_type.rs",
+      "sha": "e080cd185c758d310fd648b82ec44a30db3eea6e",
+      "size": 44603,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/e080cd185c758d310fd648b82ec44a30db3eea6e"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/build/mod.rs",
+      "sha": "62d6b8713a5a86b615a89096234dab2a001d8362",
+      "size": 45180,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/62d6b8713a5a86b615a89096234dab2a001d8362"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/constructs.rs",
+      "sha": "a169071843dc2e2428fc120f9c7629fc5abb956a",
+      "size": 12947,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/a169071843dc2e2428fc120f9c7629fc5abb956a"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/loader.rs",
+      "sha": "af21f1e918f3f16f65fc547e1468202a025dfd8c",
+      "size": 12881,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/af21f1e918f3f16f65fc547e1468202a025dfd8c"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/dr/mod.rs",
+      "sha": "fa9f41637f2d4bc8619b78c3f2b276adfa19ba86",
+      "size": 1365,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/fa9f41637f2d4bc8619b78c3f2b276adfa19ba86"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/grammar",
+      "sha": "f56af1b7ec756cb48d75ab3fd319e2de1937dae0",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/f56af1b7ec756cb48d75ab3fd319e2de1937dae0"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_arm_motion_engine_100.rs",
+      "sha": "69f2f01fe81800379b4196b6f02edcda52edb295",
+      "size": 1465,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/69f2f01fe81800379b4196b6f02edcda52edb295"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_debuginfo.rs",
+      "sha": "15e4761444aad9d48ec10f1e1dc33f0cc634cddd",
+      "size": 11402,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/15e4761444aad9d48ec10f1e1dc33f0cc634cddd"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_glsl_std_450.rs",
+      "sha": "14fdc55abb88d4edfcc24456a268480bda7b8ced",
+      "size": 9461,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/14fdc55abb88d4edfcc24456a268480bda7b8ced"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_nonsemantic_clspvreflection.rs",
+      "sha": "94fafc1bb9d53f56dc5b35b5e762bef2d60131cb",
+      "size": 14066,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/94fafc1bb9d53f56dc5b35b5e762bef2d60131cb"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_nonsemantic_debugbreak.rs",
+      "sha": "1bb7073be820c3ecf95b259bbfd5c2962e986932",
+      "size": 480,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/1bb7073be820c3ecf95b259bbfd5c2962e986932"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_nonsemantic_debugprintf.rs",
+      "sha": "db520f978aaf24aac446559da230e982cbf03087",
+      "size": 535,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/db520f978aaf24aac446559da230e982cbf03087"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_nonsemantic_shader_debuginfo_100.rs",
+      "sha": "e558a97921ed7e827f0895c3b4e7c00cfe4bc32b",
+      "size": 14825,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/e558a97921ed7e827f0895c3b4e7c00cfe4bc32b"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_nonsemantic_vkspreflection.rs",
+      "sha": "89ac54e99aee0861c5bf3fd32ae3ab219ff54639",
+      "size": 3768,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/89ac54e99aee0861c5bf3fd32ae3ab219ff54639"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_opencl_debuginfo_100.rs",
+      "sha": "8f4489f6c570ff79c8769a5419a8e0928c3a89e9",
+      "size": 14337,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/8f4489f6c570ff79c8769a5419a8e0928c3a89e9"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_opencl_std_100.rs",
+      "sha": "2db8dc522e6252d904ad2ab66f514596a16de33f",
+      "size": 20973,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2db8dc522e6252d904ad2ab66f514596a16de33f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_spv_amd_gcn_shader.rs",
+      "sha": "1fdd5bf9a8dab159852485e1c5baefd29bb8f43d",
+      "size": 835,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/1fdd5bf9a8dab159852485e1c5baefd29bb8f43d"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_spv_amd_shader_ballot.rs",
+      "sha": "1319f00ceb94b03b336732da587b65fe6128d6d2",
+      "size": 1134,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/1319f00ceb94b03b336732da587b65fe6128d6d2"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_spv_amd_shader_explicit_vertex_parameter.rs",
+      "sha": "209e823bd29d08f4ff097aa3d60fdfc67099c8b2",
+      "size": 690,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/209e823bd29d08f4ff097aa3d60fdfc67099c8b2"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_spv_amd_shader_trinary_minmax.rs",
+      "sha": "2cb03fa0173f89293a90aabb2e8b5c799ba1704f",
+      "size": 2373,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2cb03fa0173f89293a90aabb2e8b5c799ba1704f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_table.rs",
+      "sha": "2b0f44a6a3aa01997cb427dfebfc765c50bbeeb6",
+      "size": 197607,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2b0f44a6a3aa01997cb427dfebfc765c50bbeeb6"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_tables.rs",
+      "sha": "df3eed79ba506640a506c6e93c03179d91f050a0",
+      "size": 4140,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/df3eed79ba506640a506c6e93c03179d91f050a0"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/autogen_tosa_001000_1.rs",
+      "sha": "6c57ba6ef1efe12bf7440170fcdb81859b9f9858",
+      "size": 10789,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/6c57ba6ef1efe12bf7440170fcdb81859b9f9858"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/mod.rs",
+      "sha": "3b0bed8e29c3f93c5b1710ced34ebe3c24b126c4",
+      "size": 386,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3b0bed8e29c3f93c5b1710ced34ebe3c24b126c4"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/reflect.rs",
+      "sha": "dc2d89ffb082230051d8a06902cd844aa6e67f48",
+      "size": 1927,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/dc2d89ffb082230051d8a06902cd844aa6e67f48"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/grammar/syntax.rs",
+      "sha": "ff04f7efb20a026894b16f910b07bce0789f6642",
+      "size": 4547,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/ff04f7efb20a026894b16f910b07bce0789f6642"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/lib.rs",
+      "sha": "3c187ee7d1e272dc2a9070da0bc94d2df9855f29",
+      "size": 2803,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3c187ee7d1e272dc2a9070da0bc94d2df9855f29"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/lift",
+      "sha": "04f2edaa3a9576ab3a2597cddec7add27899d4c5",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/04f2edaa3a9576ab3a2597cddec7add27899d4c5"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/lift/autogen_context.rs",
+      "sha": "6ef926c6d62f6895c1a668b8e072387df4711b0c",
+      "size": 759503,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/6ef926c6d62f6895c1a668b8e072387df4711b0c"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/lift/mod.rs",
+      "sha": "3dfe2bd617dc20f52355bc496088b9418d66ed26",
+      "size": 13245,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3dfe2bd617dc20f52355bc496088b9418d66ed26"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/lift/storage.rs",
+      "sha": "cef150b3d529113414fdb5833db7bf6b2971b94e",
+      "size": 1799,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/cef150b3d529113414fdb5833db7bf6b2971b94e"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/release.toml",
+      "sha": "9d82eb0253756c488ec3d6df1b7bdea1f0a298d9",
+      "size": 328,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/9d82eb0253756c488ec3d6df1b7bdea1f0a298d9"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/sr",
+      "sha": "92b7696a03ba023de5a79b93549562a4963d9cc6",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/92b7696a03ba023de5a79b93549562a4963d9cc6"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/autogen_decoration.rs",
+      "sha": "3f5c6e602fdaedab847190b5a9188008f8b8b247",
+      "size": 4471,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/3f5c6e602fdaedab847190b5a9188008f8b8b247"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/autogen_instructions.rs",
+      "sha": "745d33f6bbce552c29a9d740b4caf1fea2b0d67f",
+      "size": 2452,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/745d33f6bbce552c29a9d740b4caf1fea2b0d67f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/autogen_ops.rs",
+      "sha": "79915fdda64535a992f3a6d7d61a25cb94d092c0",
+      "size": 98408,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/79915fdda64535a992f3a6d7d61a25cb94d092c0"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/autogen_types.rs",
+      "sha": "2d5626209364e0b5fa3f4debaa5b6b2651bbb3ec",
+      "size": 2957,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/2d5626209364e0b5fa3f4debaa5b6b2651bbb3ec"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/constants.rs",
+      "sha": "d4ef528e757b279832be24a8bb64498a979def80",
+      "size": 1960,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/d4ef528e757b279832be24a8bb64498a979def80"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/mod.rs",
+      "sha": "30337c2e5c27685502fe999d48f5f9b74cf24c1f",
+      "size": 423,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/30337c2e5c27685502fe999d48f5f9b74cf24c1f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/module.rs",
+      "sha": "18852c98fb11681d135383dba506a2886909f6d5",
+      "size": 1766,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/18852c98fb11681d135383dba506a2886909f6d5"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/storage.rs",
+      "sha": "7e2daf184e354dd9db188e7bbc19eb0b0c8f3669",
+      "size": 3650,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/7e2daf184e354dd9db188e7bbc19eb0b0c8f3669"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/sr/types.rs",
+      "sha": "954c6334751dccfe43b7034f40cd7dde60068cce",
+      "size": 2396,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/954c6334751dccfe43b7034f40cd7dde60068cce"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/tests",
+      "sha": "dc98e220e81f2f162a7583649f4580ecd07627c9",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/dc98e220e81f2f162a7583649f4580ecd07627c9"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/tests/spirv_blobs.rs",
+      "sha": "f1f2564772f1101907c9c3d6132c0402ebc9ebfa",
+      "size": 1324,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/f1f2564772f1101907c9c3d6132c0402ebc9ebfa"
+    },
+    {
+      "mode": "040000",
+      "path": "rspirv/utils",
+      "sha": "a06a6681f427a794c10295b3afcc5056946e506f",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/a06a6681f427a794c10295b3afcc5056946e506f"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/utils/mod.rs",
+      "sha": "0522aad972610247fba0cdfb746c6925a59b61d0",
+      "size": 91,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/0522aad972610247fba0cdfb746c6925a59b61d0"
+    },
+    {
+      "mode": "100644",
+      "path": "rspirv/utils/version.rs",
+      "sha": "707fe16666aa147f8dfee7cd4df5c76ceeba875d",
+      "size": 265,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/707fe16666aa147f8dfee7cd4df5c76ceeba875d"
+    },
+    {
+      "mode": "100644",
+      "path": "rustfmt.toml",
+      "sha": "022ae3b59eab06d4e9c08a7c324ebc7c566a8f1a",
+      "size": 91,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/022ae3b59eab06d4e9c08a7c324ebc7c566a8f1a"
+    },
+    {
+      "mode": "040000",
+      "path": "spirv-blobs",
+      "sha": "96233b34ccba706a9f89dca87a9282a3cd836e0a",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/96233b34ccba706a9f89dca87a9282a3cd836e0a"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv-blobs/.gitignore",
+      "sha": "d6b7ef32c8478a48c3994dcadc86837f4371184d",
+      "size": 14,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/d6b7ef32c8478a48c3994dcadc86837f4371184d"
+    },
+    {
+      "mode": "040000",
+      "path": "spirv",
+      "sha": "aa34af01a1bd970901cabec713773a68d8028a39",
+      "type": "tree",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/aa34af01a1bd970901cabec713773a68d8028a39"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv/Cargo.toml",
+      "sha": "d625405b9fefc9db73adaaa5389092cfb6ef27af",
+      "size": 610,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/d625405b9fefc9db73adaaa5389092cfb6ef27af"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv/README.md",
+      "sha": "ac81f54f1cba4c7385643e6b28a845501a057fb2",
+      "size": 1040,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/ac81f54f1cba4c7385643e6b28a845501a057fb2"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv/autogen_spirv.rs",
+      "sha": "ca7fc4514ec50b0d8c37479831628ee48473638b",
+      "size": 250588,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/ca7fc4514ec50b0d8c37479831628ee48473638b"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv/lib.rs",
+      "sha": "ba2a92973b10060a06d401255a44692ae47d56d1",
+      "size": 515,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/ba2a92973b10060a06d401255a44692ae47d56d1"
+    },
+    {
+      "mode": "100644",
+      "path": "spirv/release.toml",
+      "sha": "bd5789db7574f7d1287a24cb7bfbfbdcb697f9be",
+      "size": 504,
+      "type": "blob",
+      "url": "https://api.github.com/repos/gfx-rs/rspirv/git/blobs/bd5789db7574f7d1287a24cb7bfbfbdcb697f9be"
+    }
+  ],
+  "truncated": false,
+  "url": "https://api.github.com/repos/gfx-rs/rspirv/git/trees/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4"
+}

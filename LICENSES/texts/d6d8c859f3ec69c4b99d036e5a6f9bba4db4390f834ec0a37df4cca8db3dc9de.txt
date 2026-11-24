@@ -1,0 +1,6 @@
+
+    A dummy copyright to make the parser work
+
+    Including a few more lines.
+    Of text.
+  

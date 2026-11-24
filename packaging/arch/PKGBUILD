@@ -1,7 +1,7 @@
 # Package a previously built, target-compatible release. See README.md.
 pkgname=cirrus-drive
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Experimental OpenCloud desktop client (disposable data only)'
 arch=('x86_64')
 license=('Apache-2.0')
@@ -10,11 +10,12 @@ optdepends=('vulkan-driver: Vulkan implementation required for the window'
             'xdg-desktop-portal: browser login, folder picker and appearance settings'
             'secret-service: credential storage')
 options=(!strip)
-source=('cirrus-daemon' 'cirrus-ui' 'cirrus-drive.service' 'cirrus-drive.desktop')
+source=('cirrus-daemon' 'cirrus-ui' 'cirrus-drive.service' 'cirrus-drive.desktop' 'cirrus-notices.tar.gz')
 sha256sums=("${CIRRUS_DAEMON_SHA256:?set CIRRUS_DAEMON_SHA256}"
             "${CIRRUS_UI_SHA256:?set CIRRUS_UI_SHA256}"
             "${CIRRUS_SERVICE_SHA256:?set CIRRUS_SERVICE_SHA256}"
-            "${CIRRUS_DESKTOP_SHA256:?set CIRRUS_DESKTOP_SHA256}")
+            "${CIRRUS_DESKTOP_SHA256:?set CIRRUS_DESKTOP_SHA256}"
+            "${CIRRUS_NOTICES_SHA256:?set CIRRUS_NOTICES_SHA256}")
 
 package() {
     local status=0
@@ -23,6 +24,24 @@ package() {
         error 'Refusing fault-injection or incompatible daemon binary'
         return 1
     fi
+    # makepkg verifies/extracts the checksum-pinned local notice archive.
+    # Retain experimental/incomplete-review warnings until release qualification.
+    local notices="$srcdir/cirrus-notices" hash relative
+    (cd "$notices" && sha256sum --strict --check LICENSES/SHA256SUMS) || return 1
+    for relative in LICENSE THIRD_PARTY_NOTICES.md LICENSES/inventory.json LICENSES/INDEX.md LICENSES/review.json; do
+        [[ -f "$notices/$relative" ]] || return 1
+    done
+    while read -r hash relative; do
+        if [[ ! $hash =~ ^[0-9a-f]{64}$ || ! $relative =~ ^[A-Za-z0-9._+@/-]+$ ||
+              "/$relative/" == */../* || "/$relative/" == */./* || $relative == *//* ||
+              ( $relative != LICENSE && $relative != THIRD_PARTY_NOTICES.md && $relative != LICENSES/* ) ||
+              ! -f "$notices/$relative" || -L "$notices/$relative" ]]; then
+            error 'Invalid notice bundle path'
+            return 1
+        fi
+        install -Dm644 "$notices/$relative" "$pkgdir/usr/share/licenses/cirrus-drive/$relative" || return 1
+    done < "$notices/LICENSES/SHA256SUMS"
+    install -Dm644 "$notices/LICENSES/SHA256SUMS" "$pkgdir/usr/share/licenses/cirrus-drive/LICENSES/SHA256SUMS" || return 1
     install -Dm755 "$srcdir/cirrus-daemon" "$pkgdir/usr/bin/cirrus-daemon"
     install -Dm755 "$srcdir/cirrus-ui" "$pkgdir/usr/bin/cirrus-ui"
     install -Dm644 "$srcdir/cirrus-drive.service" "$pkgdir/usr/lib/systemd/user/cirrus-drive.service"

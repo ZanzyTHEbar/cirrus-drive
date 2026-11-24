@@ -1,0 +1,1032 @@
+{
+  "binaries": {
+    "cirrus-daemon": {
+      "archive_input_basenames": [
+        "libaddr2line-09755979c57b7e64.rlib",
+        "libadler2-dca52f01a59c33e7.rlib",
+        "libaes-e9a87db76adae52d.rlib",
+        "liballoc-1ad4f876c768bda9.rlib",
+        "libasync_executor-7c55269b88fb4c25.rlib",
+        "libasync_io-a073c98729849bbd.rlib",
+        "libasync_lock-fc0dee83c1ef4cf5.rlib",
+        "libasync_process-66989031ad95f2ef.rlib",
+        "libasync_signal-1a1b05d639c8a109.rlib",
+        "libasync_task-27fdac0ba532bb1e.rlib",
+        "libatomic_waker-169f766165a8585d.rlib",
+        "libbase64-532f6bd7568b10fb.rlib",
+        "libbase64-671f04a74130facc.rlib",
+        "libbase64-9e740c72a4866227.rlib",
+        "libbase64ct-ef637ca6587b685f.rlib",
+        "libblocking-0e41d38a612f3abc.rlib",
+        "libbytes-1704c36cc949e2f0.rlib",
+        "libbytestring-e86e285abd4b4ec4.rlib",
+        "libc_nonshared.a",
+        "libchrono-f13e1a6cc60d9ff4.rlib",
+        "libcirrus_account-5fd8e1543ef77f57.rlib",
+        "libcirrus_daemon-ab6014eaca936f40.rlib",
+        "libcirrus_discovery-0025aff205326433.rlib",
+        "libcirrus_fuse-cb4efe5628c45c90.rlib",
+        "libcirrus_runtime-079951679ad3b446.rlib",
+        "libcompiler_builtins-2d2ab9fb0fe1def5.rlib",
+        "libconst_oid-ed96b3a1220392c3.rlib",
+        "libcore-df1bddb45adbe94b.rlib",
+        "libcrypto_bigint-24b784dd6f7d6437.rlib",
+        "libcrypto_common-c1da1b8169ed4733.rlib",
+        "libcurve25519_dalek-daaff4db11d627cf.rlib",
+        "libdav_xml-56ae538ff36dbf0d.rlib",
+        "libder-1ada8b14c9544253.rlib",
+        "libed25519-efc0190b1e353ca6.rlib",
+        "libed25519_dalek-cb2f9bdf92350972.rlib",
+        "liberrno-852d00a0b0569de3.rlib",
+        "libevent_listener-a2fcbc621b00c900.rlib",
+        "libfastrand-f7ef496091d2d74e.rlib",
+        "libfoldhash-c8ac647650561c46.rlib",
+        "libform_urlencoded-6ffb109ea6db63ae.rlib",
+        "libfuser-9cf16892b41bf671.rlib",
+        "libfutures_channel-f0cf57d4d90261bb.rlib",
+        "libfutures_core-a08f9eceddc04eb7.rlib",
+        "libfutures_lite-58d9036916f56240.rlib",
+        "libgeneric_array-c80d1b442d61cd08.rlib",
+        "libgetrandom-4cff908a416acd03.rlib",
+        "libgetrandom-6f63346486396cdb.rlib",
+        "libgimli-9a1fede77fbbf2f0.rlib",
+        "libhashbrown-143c77bb957d9940.rlib",
+        "libhex-1a24ad8e658c37ff.rlib",
+        "libhttp-a52acbca95597016.rlib",
+        "libhttparse-f496c106f0d3fafc.rlib",
+        "libhttpdate-250961d4f4f9d065.rlib",
+        "libhyper-ac134aa2c987e72d.rlib",
+        "libhyper_rustls-f0e6b6d714d3dc98.rlib",
+        "libhyper_util-e6103597eeff2aa1.rlib",
+        "libiana_time_zone-26a0afaf4824af3e.rlib",
+        "libicu_collections-adfff921c8754a20.rlib",
+        "libicu_locale_core-6240bdd719a97df9.rlib",
+        "libicu_normalizer-f9aab66ba083c74a.rlib",
+        "libicu_provider-7426f4edf8165e30.rlib",
+        "libidna-beca44cd45708bcb.rlib",
+        "libipnet-8618793ff130a11b.rlib",
+        "libitoa-3f1e1c9af425c136.rlib",
+        "liblibsqlite3_sys-25291626d14efa33.rlib",
+        "liblog-db836913df48a5a4.rlib",
+        "libmemchr-0e3477fb2664a277.rlib",
+        "libmemchr-f44de480fcddb292.rlib",
+        "libmime-f351a49417287a2f.rlib",
+        "libminiz_oxide-e44eaef1807e5fc0.rlib",
+        "libmio-9df9c00f35d6da14.rlib",
+        "libnix-c7b9190587390a07.rlib",
+        "libnum_bigint-4f37491e4da747ed.rlib",
+        "libnum_bigint_dig-c3a301363b63b7bd.rlib",
+        "liboauth2-bb616a96f1619de1.rlib",
+        "libobject-7ff85ea729a864ff.rlib",
+        "libonce_cell-3d2a79f4d6b37c6d.rlib",
+        "libopenidconnect-15e6a8e81ec2262d.rlib",
+        "libp256-15ed404e536c12c8.rlib",
+        "libp384-282571066ab479a4.rlib",
+        "libpage_size-c97646f792af9772.rlib",
+        "libpanic_unwind-549498e8b2e4d924.rlib",
+        "libparking-37437ec4770546b7.rlib",
+        "libparking_lot-eddbd55e4b96039b.rlib",
+        "libparking_lot_core-46b21751a7817eab.rlib",
+        "libpem_rfc7468-c2d9320099651a8f.rlib",
+        "libpercent_encoding-3279a37cc5d62c73.rlib",
+        "libpkcs1-2edbc077a68ff0cc.rlib",
+        "libpkcs8-2bf4220f6e0d165f.rlib",
+        "libpolling-e4036dcec7301208.rlib",
+        "libproc_macro-90f1d29c414141c0.rlib",
+        "libproc_macro2-8a033b0104b16a31.rlib",
+        "libquick_xml-457fdc0f9a34edcd.rlib",
+        "libquote-e829ae826d50117c.rlib",
+        "librand-3f019680a11b797e.rlib",
+        "librand_chacha-e148ce8b3004155f.rlib",
+        "librand_core-00822a77d67582c5.rlib",
+        "libreqwest-cc3534437df5a891.rlib",
+        "libring-af7214af1418c50d.rlib",
+        "librsa-357a06410da56ae6.rlib",
+        "librusqlite-619ef80c8070c89f.rlib",
+        "librustc_demangle-cfd0ab54bb33760e.rlib",
+        "librustix-b3d9b08c33847ac0.rlib",
+        "librustls-0e60a521e29b6e5a.rlib",
+        "librustls_pki_types-4e6667d2c4350085.rlib",
+        "libsecret_service-44f159d272f8b11e.rlib",
+        "libserde-a965762f85e482a6.rlib",
+        "libserde_core-a063b13d9cb9a5b1.rlib",
+        "libserde_json-516b6fc849d9464f.rlib",
+        "libserde_path_to_error-1ea8caf186699002.rlib",
+        "libserde_plain-ef090d2f5c8a45fb.rlib",
+        "libserde_value-b1622b275d92bc53.rlib",
+        "libserde_with-97f657e277081bb5.rlib",
+        "libsha1-7fd18eeb40aead48.rlib",
+        "libsha2-2f0bb0ac53f79adf.rlib",
+        "libsha2-804ffdf3d4f47b5f.rlib",
+        "libsignal_hook_registry-3dfc0f33d47a93ae.rlib",
+        "libsignature-9af5cee48351c74a.rlib",
+        "libsocket2-0fa0be635a4f84f4.rlib",
+        "libspki-e1a8be7855ff3fb1.rlib",
+        "libstd-64f5f36fb0927694.rlib",
+        "libstd_detect-f99feda5ce9e492a.rlib",
+        "libsyn-3dbebb7ac575d0f9.rlib",
+        "libtime-18e801a57b816ddc.rlib",
+        "libtokio-ff00c17e5931dceb.rlib",
+        "libtower-299fe11c1a793eef.rlib",
+        "libtower_http-c234e6dc3287145c.rlib",
+        "libtracing-fb9d81acd33b98d5.rlib",
+        "libtracing_core-eb2b844764caa1ff.rlib",
+        "libuntrusted-6046503770adb7b5.rlib",
+        "liburl-1c7f49ec1bdfe858.rlib",
+        "libutf8_iter-679e2f68779213a2.rlib",
+        "libuuid-f8246919f5681a1f.rlib",
+        "libwant-6e8ed907bc5883ae.rlib",
+        "libwebpki-67ff00f1158b50fe.rlib",
+        "libwriteable-faac2bd4ff8661e3.rlib",
+        "libzbus-b2e31c37dedcde69.rlib",
+        "libzbus_names-57a42a1698001f73.rlib",
+        "libzcheapstr-405144a783446ac4.rlib",
+        "libzeroize-70052381146efdd8.rlib",
+        "libzerotrie-ea29b486be312ac7.rlib",
+        "libzmij-fb8a68db9eaf9dcb.rlib",
+        "libzvariant-a39e3c22c882f287.rlib",
+        "libzvariant_utils-2d0464d56daf53dc.rlib"
+      ],
+      "bytes": 19185832,
+      "glibc_floor": "2.39",
+      "link_map_sha256": "eeae73c08d28321b435ce746b57148bb3f8af9a4b34c07d7790dd31da3f3450c",
+      "needed": [
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        "ld-linux-x86-64.so.2"
+      ],
+      "sha256": "648fc484493a4066c6ef8dff2e516ed96031735b00f40b4718ebc9b45e7d7871",
+      "system_libraries": [
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
+          "soname": "ld-linux-x86-64.so.2"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7",
+          "soname": "libc.so.6"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libgcc-s1:amd64@16-20260322-1ubuntu1",
+          "sha256": "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee",
+          "soname": "libgcc_s.so.1"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8",
+          "soname": "libm.so.6"
+        }
+      ],
+      "system_static_inputs": [
+        "Scrt1.o",
+        "crtbeginS.o",
+        "crtendS.o",
+        "crti.o",
+        "crtn.o",
+        "libc_nonshared.a(pthread_atfork.oS)"
+      ]
+    },
+    "cirrus-ui": {
+      "archive_input_basenames": [
+        "libaddr2line-09755979c57b7e64.rlib",
+        "libadler2-dca52f01a59c33e7.rlib",
+        "libahash-cb448754cdcde5e8.rlib",
+        "liballoc-1ad4f876c768bda9.rlib",
+        "libarboard-6f0d95fc461a6ddd.rlib",
+        "libarrayvec-75018c429b7a36af.rlib",
+        "libash-6dc446fa43471e60.rlib",
+        "libasync_executor-7c55269b88fb4c25.rlib",
+        "libasync_io-a073c98729849bbd.rlib",
+        "libasync_lock-fc0dee83c1ef4cf5.rlib",
+        "libasync_process-66989031ad95f2ef.rlib",
+        "libasync_signal-1a1b05d639c8a109.rlib",
+        "libasync_task-27fdac0ba532bb1e.rlib",
+        "libatomic_waker-169f766165a8585d.rlib",
+        "libbit_vec-407d987770eb0675.rlib",
+        "libblocking-0e41d38a612f3abc.rlib",
+        "libbytemuck-d5df1dd801750987.rlib",
+        "libbytes-1704c36cc949e2f0.rlib",
+        "libbytestring-e86e285abd4b4ec4.rlib",
+        "libcalloop-235f7111d4a6dfc5.rlib",
+        "libchrono-f13e1a6cc60d9ff4.rlib",
+        "libcirrus_account-5fd8e1543ef77f57.rlib",
+        "libcirrus_daemon-ab6014eaca936f40.rlib",
+        "libcirrus_discovery-0025aff205326433.rlib",
+        "libcirrus_fuse-cb4efe5628c45c90.rlib",
+        "libcirrus_runtime-079951679ad3b446.rlib",
+        "libcirrus_ui-2180b9c67cbf5eb1.rlib",
+        "libcodespan_reporting-d8f3b13b8d48c295.rlib",
+        "libcompiler_builtins-2d2ab9fb0fe1def5.rlib",
+        "libcore-df1bddb45adbe94b.rlib",
+        "libcrc32fast-7caec53c03cf9ba7.rlib",
+        "libcurve25519_dalek-daaff4db11d627cf.rlib",
+        "libdav_xml-56ae538ff36dbf0d.rlib",
+        "libder-1ada8b14c9544253.rlib",
+        "libed25519-efc0190b1e353ca6.rlib",
+        "libed25519_dalek-cb2f9bdf92350972.rlib",
+        "liberrno-852d00a0b0569de3.rlib",
+        "libevent_listener-a2fcbc621b00c900.rlib",
+        "libfastrand-f7ef496091d2d74e.rlib",
+        "libfdeflate-4009b3f021b9a5d7.rlib",
+        "libfixedbitset-c34a3eb05917086d.rlib",
+        "libflate2-540b4fada28502fc.rlib",
+        "libfoldhash-da3805bb81549e60.rlib",
+        "libfont_types-6410a297730a24b6.rlib",
+        "libfontique-ef3880a3e82c6bff.rlib",
+        "libform_urlencoded-6ffb109ea6db63ae.rlib",
+        "libfuser-9cf16892b41bf671.rlib",
+        "libfutures_core-a08f9eceddc04eb7.rlib",
+        "libfutures_lite-58d9036916f56240.rlib",
+        "libgethostname-c2677a68a421c0d1.rlib",
+        "libgetrandom-374f1ec4fa8968f5.rlib",
+        "libgetrandom-6f63346486396cdb.rlib",
+        "libgimli-9a1fede77fbbf2f0.rlib",
+        "libgpu_allocator-99b0de2303c2f0ca.rlib",
+        "libhalf-b3c0956bfd1c0652.rlib",
+        "libharfrust-3c115539a9f814dc.rlib",
+        "libhashbrown-143c77bb957d9940.rlib",
+        "libhex-1a24ad8e658c37ff.rlib",
+        "libhttp-a52acbca95597016.rlib",
+        "libhttparse-f496c106f0d3fafc.rlib",
+        "libhyper-ac134aa2c987e72d.rlib",
+        "libhyper_rustls-f0e6b6d714d3dc98.rlib",
+        "libhyper_util-e6103597eeff2aa1.rlib",
+        "libiana_time_zone-26a0afaf4824af3e.rlib",
+        "libicu_collections-adfff921c8754a20.rlib",
+        "libicu_locale_core-6240bdd719a97df9.rlib",
+        "libicu_normalizer-f9aab66ba083c74a.rlib",
+        "libicu_properties-0fa341e2d0969e4e.rlib",
+        "libicu_provider-7426f4edf8165e30.rlib",
+        "libicu_segmenter-24a42fa7c3a319cc.rlib",
+        "libidna-beca44cd45708bcb.rlib",
+        "libimage-f3517be35fb2634d.rlib",
+        "libipnet-8618793ff130a11b.rlib",
+        "libitoa-3f1e1c9af425c136.rlib",
+        "liblibloading-80d2f09efadb50b4.rlib",
+        "liblibm-d113e8549636a9de.rlib",
+        "liblinebender_resource_handle-b7f88fea406c57c2.rlib",
+        "liblock_api-dbff0a63415ad025.rlib",
+        "liblog-db836913df48a5a4.rlib",
+        "libmemchr-0e3477fb2664a277.rlib",
+        "libmemchr-f44de480fcddb292.rlib",
+        "libmemmap2-c0d95342bffe7790.rlib",
+        "libmime-f351a49417287a2f.rlib",
+        "libminiz_oxide-bdae782b02b75023.rlib",
+        "libminiz_oxide-e44eaef1807e5fc0.rlib",
+        "libmio-9df9c00f35d6da14.rlib",
+        "libmoxcms-f01ca02720200797.rlib",
+        "libnaga-4fbc07a6c08dccd7.rlib",
+        "libnaga_types-8767168af0853188.rlib",
+        "libnix-c7b9190587390a07.rlib",
+        "libnom-0619e953a67b97c1.rlib",
+        "libnum_bigint-4f37491e4da747ed.rlib",
+        "libnum_bigint_dig-c3a301363b63b7bd.rlib",
+        "liboauth2-bb616a96f1619de1.rlib",
+        "libobject-7ff85ea729a864ff.rlib",
+        "libonce_cell-3d2a79f4d6b37c6d.rlib",
+        "libopenidconnect-15e6a8e81ec2262d.rlib",
+        "libos_pipe-95cf608038465113.rlib",
+        "libpanic_unwind-549498e8b2e4d924.rlib",
+        "libparking-37437ec4770546b7.rlib",
+        "libparking_lot-eddbd55e4b96039b.rlib",
+        "libparking_lot_core-46b21751a7817eab.rlib",
+        "libparlance-caf33208d8228fa7.rlib",
+        "libparley-1cb239530000a73c.rlib",
+        "libparley_data-08c8159a6a5ad3a9.rlib",
+        "libparley_emoji-fbec0679be5c666a.rlib",
+        "libparley_engine-e173461660575ec5.rlib",
+        "libpem_rfc7468-c2d9320099651a8f.rlib",
+        "libpercent_encoding-3279a37cc5d62c73.rlib",
+        "libpetgraph-cf3eaa6c08211c74.rlib",
+        "libpkcs1-2edbc077a68ff0cc.rlib",
+        "libpkcs8-2bf4220f6e0d165f.rlib",
+        "libpng-4393ba9a3e42c81e.rlib",
+        "libpolling-e4036dcec7301208.rlib",
+        "libpollster-c81110ebb353a2f1.rlib",
+        "libportable_atomic-2ba2c370d72988d8.rlib",
+        "libproc_macro-90f1d29c414141c0.rlib",
+        "libproc_macro2-8a033b0104b16a31.rlib",
+        "libquick_xml-457fdc0f9a34edcd.rlib",
+        "libquote-e829ae826d50117c.rlib",
+        "librand-3f019680a11b797e.rlib",
+        "librand_core-00822a77d67582c5.rlib",
+        "libraw_window_handle-d02ce86688ac56ff.rlib",
+        "libread_fonts-b04a6cf0767a1906.rlib",
+        "libreqwest-cc3534437df5a891.rlib",
+        "libring-af7214af1418c50d.rlib",
+        "librsa-357a06410da56ae6.rlib",
+        "librune-8bffb82bbb0bd23c.rlib",
+        "librune_motion-e981dea84c22b2e6.rlib",
+        "librune_staging-6f5e4e580022ebc0.rlib",
+        "librusqlite-619ef80c8070c89f.rlib",
+        "librustc_demangle-cfd0ab54bb33760e.rlib",
+        "librustix-2c26e9b07107fa8e.rlib",
+        "librustix-b3d9b08c33847ac0.rlib",
+        "librustls-0e60a521e29b6e5a.rlib",
+        "librustls_pki_types-4e6667d2c4350085.rlib",
+        "libscoped_tls-852a9de32cad4a8e.rlib",
+        "libsctk_adwaita-712f36cbc42d8b8d.rlib",
+        "libsecret_service-44f159d272f8b11e.rlib",
+        "libserde-a965762f85e482a6.rlib",
+        "libserde_core-a063b13d9cb9a5b1.rlib",
+        "libserde_json-516b6fc849d9464f.rlib",
+        "libserde_path_to_error-1ea8caf186699002.rlib",
+        "libserde_plain-ef090d2f5c8a45fb.rlib",
+        "libserde_value-b1622b275d92bc53.rlib",
+        "libsignal_hook_registry-3dfc0f33d47a93ae.rlib",
+        "libsignature-9af5cee48351c74a.rlib",
+        "libsimd_adler32-cf697bcb1b414424.rlib",
+        "libskrifa-53262bd7824cdcd2.rlib",
+        "libsmithay_client_toolkit-175e351fe2df4974.rlib",
+        "libsmol_str-8bb276829d5c3f12.rlib",
+        "libsocket2-0fa0be635a4f84f4.rlib",
+        "libspki-e1a8be7855ff3fb1.rlib",
+        "libstd-64f5f36fb0927694.rlib",
+        "libstd_detect-f99feda5ce9e492a.rlib",
+        "libswash-c38a464a4146a452.rlib",
+        "libsyn-3dbebb7ac575d0f9.rlib",
+        "libtaffy-d0c967a2abc5f91e.rlib",
+        "libtime-18e801a57b816ddc.rlib",
+        "libtiny_skia-0b5cfc2b9da60302.rlib",
+        "libtiny_skia_path-a896fbb66d283213.rlib",
+        "libtokio-ff00c17e5931dceb.rlib",
+        "libtower-299fe11c1a793eef.rlib",
+        "libtower_http-c234e6dc3287145c.rlib",
+        "libtracing-fb9d81acd33b98d5.rlib",
+        "libtracing_core-eb2b844764caa1ff.rlib",
+        "libtree_magic_mini-6cf7c44fbc09dec8.rlib",
+        "libunicode_ident-75c801c26a74f43e.rlib",
+        "libunicode_segmentation-5ccd35ab818de5a5.rlib",
+        "libunicode_width-8bd6122c31ccd090.rlib",
+        "liburl-1c7f49ec1bdfe858.rlib",
+        "libutf8_iter-679e2f68779213a2.rlib",
+        "libuuid-f8246919f5681a1f.rlib",
+        "libwant-6e8ed907bc5883ae.rlib",
+        "libwayland_backend-e1b4b4481ad3e93c.rlib",
+        "libwayland_client-2bcf20bbe64f8e2c.rlib",
+        "libwayland_cursor-423a82da67f041c0.rlib",
+        "libwayland_protocols-dd51cd947eedb70b.rlib",
+        "libwayland_protocols_plasma-be555592603fda02.rlib",
+        "libwayland_protocols_wlr-4b4d6aada126964f.rlib",
+        "libwayland_sys-a19616b115d89cdb.rlib",
+        "libwebpki-67ff00f1158b50fe.rlib",
+        "libwgpu-53a363a0caf8e32a.rlib",
+        "libwgpu_core-201b7b126dbaeb07.rlib",
+        "libwgpu_hal-b3bc7a08588d86ff.rlib",
+        "libwgpu_naga_bridge-5a9aa29654e762b8.rlib",
+        "libwgpu_types-e4d335db6e409f44.rlib",
+        "libwinit-301e7e3b26c7bcbd.rlib",
+        "libwl_clipboard_rs-d5a98ade8b91b935.rlib",
+        "libwriteable-faac2bd4ff8661e3.rlib",
+        "libx11_dl-75ca36bbdbffce9c.rlib",
+        "libx11rb-01ee6fcd0426f8f3.rlib",
+        "libx11rb_protocol-c0107442b05c00a6.rlib",
+        "libxcursor-68e5140a36ec301c.rlib",
+        "libxkbcommon-b4bbf5d39621aeb1.rlib",
+        "libxkbcommon_dl-e3effe56586e6731.rlib",
+        "libyazi-dfc5499ce8605914.rlib",
+        "libzbus-32cbea1c5a747ebe.rlib",
+        "libzbus-b2e31c37dedcde69.rlib",
+        "libzbus_names-57a42a1698001f73.rlib",
+        "libzbus_utils-c6208f8f31947173.rlib",
+        "libzcheapstr-405144a783446ac4.rlib",
+        "libzeno-440f6323543ad181.rlib",
+        "libzeroize-70052381146efdd8.rlib",
+        "libzerotrie-ea29b486be312ac7.rlib",
+        "libzmij-fb8a68db9eaf9dcb.rlib",
+        "libzruntime-e4130985f43564c2.rlib",
+        "libzune_core-81984ef944b494d8.rlib",
+        "libzune_jpeg-a0c2ab9bdaa351f3.rlib",
+        "libzvariant-a39e3c22c882f287.rlib",
+        "libzvariant_utils-2d0464d56daf53dc.rlib"
+      ],
+      "bytes": 33805624,
+      "glibc_floor": "2.43",
+      "link_map_sha256": "29805a8b7adc859bedc4d6788f3189bdc60e940eb367a7a624e44ff08c6aba87",
+      "needed": [
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        "ld-linux-x86-64.so.2"
+      ],
+      "sha256": "040ea3880fbc97b8f725b3c7be3acc72720a7db5a8de5394feed91dac580e87a",
+      "system_libraries": [
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
+          "soname": "ld-linux-x86-64.so.2"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7",
+          "soname": "libc.so.6"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libgcc-s1:amd64@16-20260322-1ubuntu1",
+          "sha256": "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee",
+          "soname": "libgcc_s.so.1"
+        },
+        {
+          "kind": "observed ELF loader dependency; system supplied, not redistributed",
+          "package": "libc6:amd64@2.43-2ubuntu2.4",
+          "sha256": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8",
+          "soname": "libm.so.6"
+        }
+      ],
+      "system_static_inputs": [
+        "Scrt1.o",
+        "crtbeginS.o",
+        "crtendS.o",
+        "crti.o",
+        "crtn.o"
+      ]
+    }
+  },
+  "build_command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--locked",
+    "--release",
+    "--workspace",
+    "--jobs",
+    "2",
+    "--message-format=json-render-diagnostics",
+    "-vv"
+  ],
+  "documents": [
+    {
+      "file": "native/c31d10900fdb95d1889005145a2205bb75e3bc018d3ec8265b81364901748e09.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libc6/copyright",
+          "package": "libc6:amd64",
+          "version": "2.43-2ubuntu2.4"
+        },
+        {
+          "document": "usr/share/doc/libc6-dev/copyright",
+          "package": "libc6-dev:amd64",
+          "version": "2.43-2ubuntu2.4"
+        }
+      ],
+      "sha256": "c31d10900fdb95d1889005145a2205bb75e3bc018d3ec8265b81364901748e09"
+    },
+    {
+      "file": "native/110535522396708cea37c72a802c5e7e81391139f5f7985631c93ef242b206a4.txt",
+      "origins": [
+        {
+          "common_license": "GFDL-1.3"
+        },
+        {
+          "common_license": "GFDL-1.3"
+        }
+      ],
+      "sha256": "110535522396708cea37c72a802c5e7e81391139f5f7985631c93ef242b206a4"
+    },
+    {
+      "file": "native/edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6.txt",
+      "origins": [
+        {
+          "common_license": "GPL-2"
+        },
+        {
+          "common_license": "GPL-2"
+        }
+      ],
+      "sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6"
+    },
+    {
+      "file": "native/3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986.txt",
+      "origins": [
+        {
+          "common_license": "GPL-3"
+        },
+        {
+          "common_license": "GPL"
+        },
+        {
+          "common_license": "GPL-3"
+        },
+        {
+          "common_license": "GPL-3"
+        },
+        {
+          "common_license": "GPL"
+        },
+        {
+          "common_license": "GPL-3"
+        }
+      ],
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "file": "native/cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24.txt",
+      "origins": [
+        {
+          "common_license": "LGPL-2"
+        },
+        {
+          "common_license": "LGPL-2"
+        }
+      ],
+      "sha256": "cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24"
+    },
+    {
+      "file": "native/20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95.txt",
+      "origins": [
+        {
+          "common_license": "LGPL-2.1"
+        },
+        {
+          "common_license": "LGPL-2.1"
+        }
+      ],
+      "sha256": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95"
+    },
+    {
+      "file": "native/e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118.txt",
+      "origins": [
+        {
+          "common_license": "LGPL-3"
+        },
+        {
+          "common_license": "LGPL-3"
+        }
+      ],
+      "sha256": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+    },
+    {
+      "file": "native/d7815dd2364180835891947d96d808878204dea45b8597602a7952332195fbea.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libgcc-s1/copyright",
+          "package": "libgcc-s1:amd64",
+          "version": "16-20260322-1ubuntu1"
+        }
+      ],
+      "sha256": "d7815dd2364180835891947d96d808878204dea45b8597602a7952332195fbea"
+    },
+    {
+      "file": "native/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+      "origins": [
+        {
+          "common_license": "Apache-2.0"
+        },
+        {
+          "common_license": "Apache-2.0"
+        },
+        {
+          "common_license": "Apache-2.0"
+        }
+      ],
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "file": "native/b7fd9b73ea99602016a326e0b62e6646060d18febdd065ceca8bb482208c3d88.txt",
+      "origins": [
+        {
+          "common_license": "Artistic"
+        },
+        {
+          "common_license": "Artistic"
+        }
+      ],
+      "sha256": "b7fd9b73ea99602016a326e0b62e6646060d18febdd065ceca8bb482208c3d88"
+    },
+    {
+      "file": "native/2652c22ba086f92e55ae4a9f9c890ad4766ffd7814a73d318e22a597edf857a4.txt",
+      "origins": [
+        {
+          "common_license": "GFDL-1.2"
+        },
+        {
+          "common_license": "GFDL-1.2"
+        }
+      ],
+      "sha256": "2652c22ba086f92e55ae4a9f9c890ad4766ffd7814a73d318e22a597edf857a4"
+    },
+    {
+      "file": "native/41a2d69df964174fb042b6513e99b72177318e94ca0c29a813e6f3155a9c5048.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libgcc-15-dev/copyright",
+          "package": "libgcc-15-dev:amd64",
+          "version": "15.2.0-16ubuntu1"
+        }
+      ],
+      "sha256": "41a2d69df964174fb042b6513e99b72177318e94ca0c29a813e6f3155a9c5048"
+    },
+    {
+      "file": "native/c579213e28f67944a7e407816b8a8e1d2d2406b3d820e420aa923807c450dc07.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libvulkan1/copyright",
+          "package": "libvulkan1:amd64",
+          "version": "1.4.341.0-1"
+        }
+      ],
+      "sha256": "c579213e28f67944a7e407816b8a8e1d2d2406b3d820e420aa923807c450dc07"
+    },
+    {
+      "file": "native/99ade79b69c41bfb14b8a0567e9c0acdd858d6d8ad7d3ca4f9da1cfd000954b1.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libwayland-client0/copyright",
+          "package": "libwayland-client0:amd64",
+          "version": "1.24.0-2"
+        }
+      ],
+      "sha256": "99ade79b69c41bfb14b8a0567e9c0acdd858d6d8ad7d3ca4f9da1cfd000954b1"
+    },
+    {
+      "file": "native/5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libxkbcommon0/copyright",
+          "package": "libxkbcommon0:amd64",
+          "version": "1.13.1-1"
+        },
+        {
+          "document": "usr/share/doc/libxkbcommon-x11-0/copyright",
+          "package": "libxkbcommon-x11-0:amd64",
+          "version": "1.13.1-1"
+        }
+      ],
+      "sha256": "5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88"
+    },
+    {
+      "file": "native/0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libx11-6/copyright",
+          "package": "libx11-6:amd64",
+          "version": "2:1.8.13-1ubuntu0.1"
+        },
+        {
+          "document": "usr/share/doc/libx11-xcb1/copyright",
+          "package": "libx11-xcb1:amd64",
+          "version": "2:1.8.13-1ubuntu0.1"
+        }
+      ],
+      "sha256": "0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e"
+    },
+    {
+      "file": "native/817abc0ccc9e2591057be256b0f6d80edb134221ced29dd545a9eafaf40b423c.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libxcursor1/copyright",
+          "package": "libxcursor1:amd64",
+          "version": "1:1.2.3-1build1"
+        }
+      ],
+      "sha256": "817abc0ccc9e2591057be256b0f6d80edb134221ced29dd545a9eafaf40b423c"
+    },
+    {
+      "file": "native/c812f9c54513ae593aab9580b54a4b18219648df7068d49ca1daa47f522ba3fa.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libxi6/copyright",
+          "package": "libxi6:amd64",
+          "version": "2:1.8.2-2"
+        }
+      ],
+      "sha256": "c812f9c54513ae593aab9580b54a4b18219648df7068d49ca1daa47f522ba3fa"
+    },
+    {
+      "file": "native/4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libxcb1/copyright",
+          "package": "libxcb1:amd64",
+          "version": "1.17.0-2ubuntu1"
+        }
+      ],
+      "sha256": "4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80"
+    },
+    {
+      "file": "native/498035c1e93c9d12306f4ba8f37686c2a527657f8b17969ec6d11c1af87e543d.txt",
+      "origins": [
+        {
+          "document": "usr/share/doc/libglib2.0-0t64/copyright",
+          "package": "libglib2.0-0t64:amd64",
+          "version": "2.88.0-1ubuntu0.1"
+        }
+      ],
+      "sha256": "498035c1e93c9d12306f4ba8f37686c2a527657f8b17969ec6d11c1af87e543d"
+    },
+    {
+      "file": "native/a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499.txt",
+      "origins": [
+        {
+          "common_license": "CC0-1.0"
+        }
+      ],
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+    }
+  ],
+  "extra_link_flags": "per-binary linker-map diagnostics; private output paths omitted",
+  "fault_injection": false,
+  "project_files": {
+    "Cargo.lock": "6e30360fa60eee1453d4596f086d2228665ef23c0172fa7af8544069464181d1",
+    "Cargo.toml": "ecf804e502242746a7ca920fd18c12926ae804a00ced394a343d555c5141266b",
+    "crates/cirrus-account/Cargo.toml": "9d72b2587bc643d9cc380f846b0a45daae1f8067eb59c2f2cd907d4f22ebb323",
+    "crates/cirrus-account/src/browser.rs": "86d7438711f91f9b7f32740545d7c79e228c49527c69a89808abc6d9f35cfc75",
+    "crates/cirrus-account/src/cache.rs": "434b0fe95d21845c5629e4c0a456228b2049aea1f20ec925b0a94d92a8ed04c9",
+    "crates/cirrus-account/src/callback.rs": "c1d4599b92ded24af3f7ea1000ffe96e16ea289ddd684b10f69349ea47d3ee2b",
+    "crates/cirrus-account/src/dav.rs": "4d4dd387fe01bbdb97764f69ec0f92fe97d1d9f751e703a6c57f8cebf184f245",
+    "crates/cirrus-account/src/dav/listing.rs": "325700139d32a63f9812d56e2bd31f84fde59c41a1b4df436cd6b6c07de660ac",
+    "crates/cirrus-account/src/directory.rs": "22f653b8e40fab993438e82cb139ab4a04465de19b0eafd85d9d475100ddb730",
+    "crates/cirrus-account/src/executor.rs": "50605866614a307edd32b6f4a4ee9f38eb13c38c06ea7f79bceff81289e485ef",
+    "crates/cirrus-account/src/http.rs": "b32b6dfe86efd45c6fdfde48f89539630898bffdfad74f5712a4a80399bb2733",
+    "crates/cirrus-account/src/lib.rs": "8f80749d3def3c1c7ed58261aa92d816ba6214f16abca0a2a92863971e067e95",
+    "crates/cirrus-account/src/offline.rs": "e3b077c242552332c054ec6bf5a71ddaf84362052870e05fafd29adf98ab05c5",
+    "crates/cirrus-account/src/offline/overlay.rs": "a34548affd7704ff0c50ea34b9b31a1d0b39cb35ff3e6daa477e36990ab5969e",
+    "crates/cirrus-account/src/offline/overlay/integrity.rs": "716db6d543b77be2c159b2f0ef02dc535a048544a283c0c655b8cc3b263430d3",
+    "crates/cirrus-account/src/offline/pin_move.rs": "cd188e2864ff4d2e82c0d7d100eeae6c319b435d78e5dc75d70ce7bb10481728",
+    "crates/cirrus-account/src/offline/publication.rs": "7d5128e6d131ab09b916cf5b93e01bbfe44bc9edcfb24d23171061b02e91eb59",
+    "crates/cirrus-account/src/offline/upload.rs": "45cb9139929803fb2b6e9d6ec44900691d9f2b34d4edc625679971aabc4432ea",
+    "crates/cirrus-account/src/ownership.rs": "d776b61832f9a65a44b474bf528ab84057354c7eabf391ca062d729680e1d1d0",
+    "crates/cirrus-account/src/recovery.rs": "9d6634fddc853ec3fe1b17994dbf4ef36d9dc9bc50c6298cf4a172c92fbcc3d2",
+    "crates/cirrus-account/src/secrets.rs": "41d00e9af6b1bc50a16b99c23bfe3d462952055260fb58ab7796969b4782986d",
+    "crates/cirrus-account/src/storage.rs": "d554591c6cb7b5bf672372781f58f2648e3972a84bf715557df34d5aaaded653",
+    "crates/cirrus-account/src/storage/limits.rs": "c634f25a3ecdd85c229378adb02e903b383cd29c8c590c714b5c3f756018e6e2",
+    "crates/cirrus-account/src/storage/namespace.rs": "2e18ba84e1d22b2f6e6cbeccb7bd5bfdd4687d4363949f4dd8d02b17575f229b",
+    "crates/cirrus-account/src/storage/sql_reservation.rs": "89ba6d8c1b3227ec4b4f2cc5a271a5182253a2868d761b1b7df4ed3d861f5b04",
+    "crates/cirrus-account/src/sync.rs": "270d3125cc0752c9599d68fd924f60e1aa8aaf3bda761aef1a5d3edc0e8896d5",
+    "crates/cirrus-account/src/upload.rs": "693d4876e46157bf2875bb4c0818f3687fae41c936788dccadc0b45f744e666e",
+    "crates/cirrus-daemon/Cargo.toml": "2bf20b8e3f3b19ea4278d89a8c0a8fb9f997fa3552e24bb21df362c96b60dc01",
+    "crates/cirrus-daemon/src/lib.rs": "d748ef6557ad694a71eb990f418fcb9e6e3e65a8bffa934ccc0512aad56c35b1",
+    "crates/cirrus-daemon/src/local.rs": "ebf0711294634e4d6f2cce5f6146576f60df01ed39a1e5fe2109006b9ca0a906",
+    "crates/cirrus-daemon/src/main.rs": "1e60d8c6f9ffd11a2ab32f45b83f4ffb2a5c5b73fb8da62e70ffd5e2094ab962",
+    "crates/cirrus-daemon/src/scheduler.rs": "deab41c9693df65d22e381bf2886193654e64c6b7d74bdb8941a08e37e63553c",
+    "crates/cirrus-daemon/tests/local_service.rs": "ad7a805f84904b749adaec3ec2fd6fe08f48ea0c2976d74bc8465544687b0bed",
+    "crates/cirrus-daemon/tests/runtime_check.rs": "1ddbc9b8d2bf18a3a3ac0e359ee545edc472cacfca8199da383375fd017a0cea",
+    "crates/cirrus-discovery/Cargo.toml": "c0f4bff87a8db791dd0a542cf5c069b02a02f72cf8cfb10dcbb9118a020f1ace",
+    "crates/cirrus-discovery/src/lib.rs": "98c912781b4ebe7b6f604b14546f101d62e6e89b960555e8865d25ffbcf9c001",
+    "crates/cirrus-fuse/Cargo.toml": "07f970330e0e2015b47ad306217f8f6f7bee41480862bda055cae29c7e300266",
+    "crates/cirrus-fuse/src/lib.rs": "d657a1ac6ca09c21c4990a4c6159ce7ddc0315a79520c015dab7062faebb5427",
+    "crates/cirrus-fuse/src/recovery.rs": "208b2f9ab34d12f2d2ff12954e70f091bcc89b3aa10a384033827155858dadaf",
+    "crates/cirrus-runtime/Cargo.toml": "4825d8b7c8260dbb1bd693f683347fd98b30801456013eee517812abc0c5d11e",
+    "crates/cirrus-runtime/src/lib.rs": "03c68baa205636d106f0f4be5b5c0d81282afefa997db964e0545cfdf375d165",
+    "crates/cirrus-ui/Cargo.toml": "465713821870b9ef397c84bd2bd6f32670ff1253b8050a1c3a74ab22ae39014b",
+    "crates/cirrus-ui/src/lib.rs": "096619fc2c1c47e353ea8b569f6a0379b95eed0a0a929e7eaa66b6328937fce2",
+    "crates/cirrus-ui/src/main.rs": "5177eab6a8435f7a79fe02e2d3ff0cbbdb093abfa930a6fbf9799022ea9fc3ca",
+    "crates/cirrus-ui/src/settings.rs": "d4422d0d86c9420a29d2369d2d24aa9a59ed032f275e526c1ff64ea14418c208",
+    "rust-toolchain.toml": "85db324345b7937c49ea2ac8b962d741f710719f4f751cab809985cbe6afbe3c"
+  },
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "qualification": {
+    "status": "historical-only",
+    "current_artifact_qualified": false
+  },
+  "schema": 2,
+  "scope": "ELF and real linker-map observations for this binary pair, plus separately labelled source-declared dynamic-loader candidates; no UI/GPU session or arbitrary driver/plugin inventory",
+  "source_content_digest": "a63da467fdfbd3b7816fbf28fd8fa57714722860ad112f22af30bfad40329c7c",
+  "source_declared_loaders": [
+    {
+      "available_on_build_host": true,
+      "note": "Vulkan loader; drivers/ICDs are selected by the runtime environment",
+      "package": "libvulkan1:amd64@1.4.341.0-1",
+      "sha256": "def4af45e9e5784cf65eaaaa289530a5c73546b01015da4c0920ef0a144fe189",
+      "soname": "libvulkan.so.1",
+      "source": "ash@0.38.0+1.3.281/src/entry.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "selected client+dlopen features; server/egl features are not selected",
+      "package": "libwayland-client0:amd64@1.24.0-2",
+      "sha256": "f27b9eecd96d76ae49ec9f7d4da17dcc43df3411ef3d432ce56d710c8b62930c",
+      "soname": "libwayland-client.so.0",
+      "source": "wayland-sys@0.31.11/src/client.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "keyboard library dynamically loaded",
+      "package": "libxkbcommon0:amd64@1.13.1-1",
+      "sha256": "8b7d244ea1df8b1c073069344f8c705bab90d6b6bcafb96f1c2eccc2312f4946",
+      "soname": "libxkbcommon.so.0",
+      "source": "xkbcommon-dl@0.4.2/src/lib.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "selected x11 feature",
+      "package": "libxkbcommon-x11-0:amd64@1.13.1-1",
+      "sha256": "b6df348078e99c8ba85f4aa4203fecff6a1e3e2b668c5bc815f6dad686560c51",
+      "soname": "libxkbcommon-x11.so.0",
+      "source": "xkbcommon-dl@0.4.2/src/x11.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "Xlib/Xcursor/Xlib_xcb/XInput2::open in xdisplay.rs",
+      "package": "libx11-6:amd64@2:1.8.13-1ubuntu0.1",
+      "sha256": "badd43566333da97d916ab365c61227751d49cd5c0df5d49dabdbd67b8c6fd19",
+      "soname": "libX11.so.6",
+      "source": "winit@0.30.13/src/platform_impl/linux/x11/ffi.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "Xlib/Xcursor/Xlib_xcb/XInput2::open in xdisplay.rs",
+      "package": "libxcursor1:amd64@1:1.2.3-1build1",
+      "sha256": "0d8321ceafa73ca8f3921221055051be4e4a2ad75aa59f946578182e1ca45832",
+      "soname": "libXcursor.so.1",
+      "source": "winit@0.30.13/src/platform_impl/linux/x11/ffi.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "Xlib/Xcursor/Xlib_xcb/XInput2::open in xdisplay.rs",
+      "package": "libx11-xcb1:amd64@2:1.8.13-1ubuntu0.1",
+      "sha256": "6a9047ac83e4e1afb8032e62332aa449e7c6307c731f621054c9c0573a460899",
+      "soname": "libX11-xcb.so.1",
+      "source": "winit@0.30.13/src/platform_impl/linux/x11/ffi.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "Xlib/Xcursor/Xlib_xcb/XInput2::open in xdisplay.rs",
+      "package": "libxi6:amd64@2:1.8.2-2",
+      "sha256": "05aeb2b462c5bd22e969a47c269c7fe0c77edd7bc1e89f3f0dead169f5df222c",
+      "soname": "libXi.so.6",
+      "source": "winit@0.30.13/src/platform_impl/linux/x11/ffi.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "selected dl-libxcb feature",
+      "package": "libxcb1:amd64@1.17.0-2ubuntu1",
+      "sha256": "6af94be329e17e57f1cc0f5e4afb5bdfe669a5168accdc31b03274110b937b41",
+      "soname": "libxcb.so.1",
+      "source": "x11rb@0.13.2/src/xcb_ffi/raw_ffi/ffi.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": true,
+      "note": "optional GIO desktop preferences access",
+      "package": "libglib2.0-0t64:amd64@2.88.0-1ubuntu0.1",
+      "sha256": "015bde05a0741bbc56b5af15f87eac3eb6e25767c69d8a499686a533b69a35d4",
+      "soname": "libgio-2.0.so.0",
+      "source": "rune@f401bce5a9658413b559760c0c6774c4421324a9/src/preferences.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    },
+    {
+      "available_on_build_host": false,
+      "note": "default hook disabled when debug_assertions=false; Unix RTLD_NOLOAD only",
+      "soname": "librenderdoc.so",
+      "source": "wgpu-hal@30.0.1/src/auxil/renderdoc.rs",
+      "status": "source-declared possibility, not observed loaded by this headless qualification"
+    }
+  ],
+  "system_package_documents": [
+    {
+      "copyright": "native/c31d10900fdb95d1889005145a2205bb75e3bc018d3ec8265b81364901748e09.txt",
+      "package": "libc6:amd64",
+      "version": "2.43-2ubuntu2.4"
+    },
+    {
+      "copyright": "native/d7815dd2364180835891947d96d808878204dea45b8597602a7952332195fbea.txt",
+      "package": "libgcc-s1:amd64",
+      "version": "16-20260322-1ubuntu1"
+    },
+    {
+      "copyright": "native/c31d10900fdb95d1889005145a2205bb75e3bc018d3ec8265b81364901748e09.txt",
+      "package": "libc6-dev:amd64",
+      "version": "2.43-2ubuntu2.4"
+    },
+    {
+      "copyright": "native/41a2d69df964174fb042b6513e99b72177318e94ca0c29a813e6f3155a9c5048.txt",
+      "package": "libgcc-15-dev:amd64",
+      "version": "15.2.0-16ubuntu1"
+    },
+    {
+      "copyright": "native/c579213e28f67944a7e407816b8a8e1d2d2406b3d820e420aa923807c450dc07.txt",
+      "package": "libvulkan1:amd64",
+      "version": "1.4.341.0-1"
+    },
+    {
+      "copyright": "native/99ade79b69c41bfb14b8a0567e9c0acdd858d6d8ad7d3ca4f9da1cfd000954b1.txt",
+      "package": "libwayland-client0:amd64",
+      "version": "1.24.0-2"
+    },
+    {
+      "copyright": "native/5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88.txt",
+      "package": "libxkbcommon0:amd64",
+      "version": "1.13.1-1"
+    },
+    {
+      "copyright": "native/5eeaeb1b6e029a0274e1573765bb0bae2926ef96a3679203faa4fd00fdaeaa88.txt",
+      "package": "libxkbcommon-x11-0:amd64",
+      "version": "1.13.1-1"
+    },
+    {
+      "copyright": "native/0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e.txt",
+      "package": "libx11-6:amd64",
+      "version": "2:1.8.13-1ubuntu0.1"
+    },
+    {
+      "copyright": "native/817abc0ccc9e2591057be256b0f6d80edb134221ced29dd545a9eafaf40b423c.txt",
+      "package": "libxcursor1:amd64",
+      "version": "1:1.2.3-1build1"
+    },
+    {
+      "copyright": "native/0b380a7fd5b2228f26e9585e56f14812efd3350f3df307507d2bc055dfd8de3e.txt",
+      "package": "libx11-xcb1:amd64",
+      "version": "2:1.8.13-1ubuntu0.1"
+    },
+    {
+      "copyright": "native/c812f9c54513ae593aab9580b54a4b18219648df7068d49ca1daa47f522ba3fa.txt",
+      "package": "libxi6:amd64",
+      "version": "2:1.8.2-2"
+    },
+    {
+      "copyright": "native/4f7cb9db6bf6542f5417e3d674c780d3a5fd12291a54d63054fb576ee0cfae80.txt",
+      "package": "libxcb1:amd64",
+      "version": "1.17.0-2ubuntu1"
+    },
+    {
+      "copyright": "native/498035c1e93c9d12306f4ba8f37686c2a527657f8b17969ec6d11c1af87e543d.txt",
+      "package": "libglib2.0-0t64:amd64",
+      "version": "2.88.0-1ubuntu0.1"
+    }
+  ],
+  "system_static_inputs": [
+    {
+      "archive_member": null,
+      "binaries": [
+        "cirrus-daemon",
+        "cirrus-ui"
+      ],
+      "file": "Scrt1.o",
+      "file_sha256": "75c40260f996747732aeaac415985947403f7992916bc5d35465e1f9e6c93082",
+      "package": "libc6-dev:amd64@2.43-2ubuntu2.4"
+    },
+    {
+      "archive_member": "pthread_atfork.oS",
+      "binaries": [
+        "cirrus-daemon"
+      ],
+      "file": "libc_nonshared.a",
+      "file_sha256": "8fc3f78f6a5cac0cbe80a4fd96a00dcf5269425941fa33a0f2b7d25b96941662",
+      "package": "libc6-dev:amd64@2.43-2ubuntu2.4"
+    },
+    {
+      "archive_member": null,
+      "binaries": [
+        "cirrus-daemon",
+        "cirrus-ui"
+      ],
+      "file": "crtbeginS.o",
+      "file_sha256": "178f90d86c9bf8c3bf0746e288bed4af492c4b65397d54caf386a9b807d8e2c5",
+      "package": "libgcc-15-dev:amd64@15.2.0-16ubuntu1"
+    },
+    {
+      "archive_member": null,
+      "binaries": [
+        "cirrus-daemon",
+        "cirrus-ui"
+      ],
+      "file": "crti.o",
+      "file_sha256": "077ccb6c68db1794da3ee262c4a16a3c6f8e902845dd0829110ad4b7065e5aa3",
+      "package": "libc6-dev:amd64@2.43-2ubuntu2.4"
+    },
+    {
+      "archive_member": null,
+      "binaries": [
+        "cirrus-daemon",
+        "cirrus-ui"
+      ],
+      "file": "crtn.o",
+      "file_sha256": "a2266079f95b84ccc2162ebbf279bcd78858a748aa1882e0bdb912316c76a58f",
+      "package": "libc6-dev:amd64@2.43-2ubuntu2.4"
+    },
+    {
+      "archive_member": null,
+      "binaries": [
+        "cirrus-daemon",
+        "cirrus-ui"
+      ],
+      "file": "crtendS.o",
+      "file_sha256": "b4b7d9001893f0baf4ebfbe12df8d5cf0dd7f69643a5caae04d956d1a443b246",
+      "package": "libgcc-15-dev:amd64@15.2.0-16ubuntu1"
+    }
+  ],
+  "target": "x86_64-unknown-linux-gnu",
+  "unresolved": [
+    "Establish exact licensing/source and LGPL source/relink or applicable exception closure for the selected glibc libc_nonshared.a(pthread_atfork.oS) and startup objects before distributing this pair.",
+    "Qualify a real Arch package with supported makepkg tooling; recipe filesystem images are not makepkg artifacts.",
+    "Desktop/GPU runtime library selection is environment dependent; no window/GPU session or bundled driver/font redistribution was qualified."
+  ]
+}

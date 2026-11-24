@@ -1,0 +1,4 @@
+
+Copyright (C) 2004 Mikko Torni and Josh Triplett.
+All Rights Reserved.  See the file COPYING in this directory
+for licensing information.

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import pwd
 import re
 import sqlite3
@@ -48,6 +49,53 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def notice_name(name):
+    path = PurePosixPath(name)
+    if (not re.fullmatch(r"[A-Za-z0-9._+@/-]+", name) or path.is_absolute()
+            or path.as_posix() != name or ".." in path.parts
+            or (name not in ("LICENSE", "THIRD_PARTY_NOTICES.md") and not name.startswith("LICENSES/"))):
+        raise ValueError("unsafe notice path")
+    return name
+
+
+def notice_bundle():
+    checksum_file = ROOT / "LICENSES/SHA256SUMS"
+    contents = {}
+    for line in checksum_file.read_text().splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if not match:
+            raise ValueError("invalid notice checksum manifest")
+        checksum, name = match.groups()
+        notice_name(name)
+        if name in contents or name == "LICENSES/SHA256SUMS":
+            raise ValueError("duplicate or self-referencing notice checksum")
+        path = ROOT / name
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != ROOT and ROOT in parent.parents):
+            raise ValueError("notice source contains a symlink")
+        data = path.read_bytes()
+        if digest(data) != checksum:
+            raise ValueError(f"notice source changed: {name}")
+        contents[name] = data
+    if not {"LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/inventory.json", "LICENSES/INDEX.md", "LICENSES/review.json"} <= contents.keys():
+        raise ValueError("notice bundle is incomplete")
+    contents["LICENSES/SHA256SUMS"] = checksum_file.read_bytes()
+    return contents
+
+
+def notice_targets(prefix, physical, names):
+    base = physical(prefix / "share/licenses/cirrus-drive")
+    result = {}
+    for name in names:
+        path = base / notice_name(name)
+        current = path.parent
+        while current != physical(prefix).parent:
+            if current.is_symlink():
+                raise ValueError("notice destination contains a symlink")
+            current = current.parent
+        result["notice:" + name] = path
+    return result
+
+
 def regular(path):
     info = path.lstat()
     return stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
@@ -73,7 +121,9 @@ def create(path, data, mode):
 def install(args):
     if args:
         raise ValueError("usage: install.sh")
-    _, prefix, _, _, targets, manifest = locations()
+    _, prefix, _, physical, targets, manifest = locations()
+    notices = notice_bundle()
+    targets.update(notice_targets(prefix, physical, notices))
     bindir = Path(os.environ.get("CIRRUS_BIN_DIR", str(ROOT / "target/debug")))
     sources = [bindir / "cirrus-daemon", bindir / "cirrus-ui"]
     if not all(path.is_file() and os.access(path, os.X_OK) for path in sources):
@@ -88,6 +138,7 @@ def install(args):
     desktop = (HERE / "cirrus-drive.desktop").read_text().replace("Exec=cirrus-ui\n", f"Exec={prefix}/bin/cirrus-ui\n")
     contents = {"daemon": sources[0].read_bytes(), "ui": sources[1].read_bytes(),
                 "service": service.encode(), "desktop": desktop.encode()}
+    contents.update({"notice:" + name: data for name, data in notices.items()})
     if manifest.exists() or manifest.is_symlink() or any(path.exists() or path.is_symlink() for path in targets.values()):
         raise ValueError("installation target already exists; no existing files were replaced")
     written = []
@@ -227,10 +278,15 @@ def stop_daemon(daemon, dest, home):
 def uninstall(args):
     if args not in ([], ["--purge-clean-state"]):
         raise ValueError("usage: uninstall.sh [--purge-clean-state]")
-    home, _, dest, physical, targets, manifest = locations()
+    home, prefix, dest, physical, targets, manifest = locations()
     if not regular(manifest):
         raise ValueError("installation manifest is missing or unsafe")
     record = json.loads(manifest.read_text())
+    if not isinstance(record, dict):
+        raise ValueError("unrecognized installation manifest")
+    # Use installed ownership, not the current checkout's possibly newer bundle.
+    # Historical four-file installs remain removable without claiming notices.
+    targets.update(notice_targets(prefix, physical, [key.removeprefix("notice:") for key in record if key.startswith("notice:")]))
     if set(record) != set(targets):
         raise ValueError("unrecognized installation manifest")
     for key, path in targets.items():
