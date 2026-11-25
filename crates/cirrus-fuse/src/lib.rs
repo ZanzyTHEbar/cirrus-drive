@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cirrus_account::{
     AccountError, Accounts, DirectorySnapshot, DirtyMutation, FileVersion, MountBinding,
-    MountStartup,
+    MountMetadataWalk, MountStartup,
 };
 use cirrus_runtime::RuntimeDir;
 use fuser::{
@@ -35,9 +35,11 @@ const READ_AHEAD_MIN_READ: u32 = 16 * 1024;
 const CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 64;
 const MAX_WRITE_FILE: u64 = 1024 * 1024 * 1024 * 1024;
-const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(2);
+const OFFLINE_DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(2);
 const DIRECTORY_CACHE_MAX: usize = 64;
 const DIRECTORY_REFRESH_AGE: Duration = Duration::from_secs(30);
+// Demand can renew credentials if the scheduler has no usable cached session.
+const DIRECTORY_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// A validated durable mount owner record, which may require recovery.
 #[derive(Debug)]
@@ -109,16 +111,49 @@ pub struct NamespaceRefresh {
     drive: Drive,
     alive: Arc<AtomicBool>,
     notifier: fuser::Notifier,
+    walk: Arc<Mutex<MountMetadataWalk>>,
 }
 
 impl NamespaceRefresh {
-    /// Attempts one stale viewed directory. No crawl, token refresh or DAV retry.
+    /// Whether a metadata-only warmup batch is ready for admission.
+    pub fn walk_ready(&self) -> bool {
+        !self.drive.space.is_offline()
+            && self.alive.load(Ordering::Acquire)
+            && self.walk.lock().is_ok_and(|walk| walk.ready())
+    }
+
+    /// Runs one admitted batch using the account's spare metadata read permits.
+    ///
+    /// # Errors
+    /// Reports directory observation or durable publication failures.
+    pub fn walk_batch(&self) -> io::Result<bool> {
+        let mut walk = self
+            .walk
+            .lock()
+            .map_err(|_| io::Error::other("mount walk unavailable"))?;
+        self.drive
+            .accounts
+            .warm_mount_metadata(
+                &self.drive.space,
+                &self.drive.browse_id,
+                &self.alive,
+                &mut walk,
+            )
+            .map_err(io::Error::other)
+    }
+
+    /// Attempts one stale directory which is already in the hot cache.
+    /// No token refresh or DAV retry.
     /// Open readdir handles keep their original immutable snapshots.
     ///
     /// # Errors
-    /// Reports failed observations/publication; previous live state is preserved.
+    /// Reports failed observations/publication without publishing partial views.
+    /// Definitive binding loss disables the prior browse view.
     pub fn refresh_one(&self) -> io::Result<()> {
-        if !self.alive.load(Ordering::Acquire) || self.drive.accounts.background_yield_requested() {
+        if self.drive.space.is_offline()
+            || !self.alive.load(Ordering::Acquire)
+            || self.drive.accounts.background_yield_requested()
+        {
             return Ok(());
         }
         let candidate = {
@@ -127,31 +162,43 @@ impl NamespaceRefresh {
                 .state
                 .lock()
                 .map_err(|_| io::Error::other("mount state unavailable"))?;
-            let candidate = state
+            let index = state
                 .directories
                 .iter()
-                .filter(|d| {
+                .enumerate()
+                .filter(|(_, d)| {
                     d.started.elapsed() >= DIRECTORY_REFRESH_AGE
                         && d.attempted.elapsed() >= DIRECTORY_REFRESH_AGE
+                        && !state.directory_flights.contains(&d.ino)
+                        && state.nodes.contains_key(&d.ino)
                 })
-                .min_by_key(|d| d.attempted)
-                .map(|d| (d.ino, d.children.clone()));
-            if let Some((ino, _)) = &candidate
-                && let Some(d) = state.directories.iter_mut().find(|d| d.ino == *ino)
-            {
+                .min_by_key(|(_, d)| (Some(d.ino) != state.browse_focus, d.attempted))
+                .map(|(index, _)| index);
+            index.map(|index| {
+                let d = &mut state.directories[index];
                 d.attempted = Instant::now();
-            }
-            candidate
+                let (ino, before) = (d.ino, d.children.clone());
+                state.directory_flights.insert(ino);
+                (ino, before)
+            })
         };
         let Some((ino, before)) = candidate else {
             return Ok(());
         };
-        let after = self
+        let flight = DirectoryFlight(&self.drive, ino);
+        let result = self
             .drive
-            .listing_once_mode(INodeNo(ino), true, Some(&self.alive))
-            .map_err(|e| {
-                io::Error::other(format!("background directory observation failed: {e:?}"))
-            })?;
+            .observe_directory(INodeNo(ino), DirectoryObservation::Background(&self.alive));
+        drop(flight);
+        let after = match result {
+            Ok(after) => after,
+            Err(Errno::EAGAIN) => return Ok(()),
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "background directory observation failed: {error:?}"
+                )));
+            }
+        };
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("CIRRUS_TEST_NAMESPACE_POLL").is_some() {
             eprintln!("cirrus lab background directory published: ino={ino}");
@@ -306,11 +353,17 @@ impl Mounted {
         startup: MountStartup,
     ) -> io::Result<Self> {
         recovery::ensure_available(&runtime, path)?;
-        if matches!(startup, MountStartup::Normal) {
-            accounts
+        let seed = if matches!(startup, MountStartup::Normal) {
+            let generation = accounts.metadata_generation();
+            let started = Instant::now();
+            let entries = accounts
                 .mount_directory(&instance, &space, &[], "")
                 .map_err(io::Error::other)?;
-        }
+            Some((entries, generation, started))
+        } else {
+            // Retained startup verified eligibility, not a current DAV view.
+            None
+        };
         let dir = validate_mountpoint(path)?;
         let identity = fs::fstat(&dir).map_err(io::Error::from)?;
         let rechecked = validate_mountpoint(path)?;
@@ -356,9 +409,21 @@ impl Mounted {
         if offline && !space.is_offline_writable() {
             config.mount_options.push(MountOption::RO);
         }
-        let activation_accounts = Arc::clone(&accounts);
-        let activation = space.clone();
-        let filesystem = Drive::new(accounts, instance, space);
+        let filesystem = Drive::new(accounts.clone(), instance, space.clone(), source.clone());
+        let walk_seed = seed.and_then(|(entries, generation, started)| {
+            // Reuse the preflight without making a capacity error fatal to mount startup.
+            filesystem
+                .observe_directory(
+                    INodeNo(1),
+                    DirectoryObservation::Seed {
+                        entries,
+                        generation,
+                        started,
+                    },
+                )
+                .ok()
+                .map(|view| view.0)
+        });
         let refresh_drive = filesystem.clone();
         let session = match fuser::spawn_mount(filesystem, path, &config) {
             Ok(session) => session,
@@ -378,6 +443,7 @@ impl Mounted {
             drive: refresh_drive,
             alive: Arc::new(AtomicBool::new(true)),
             notifier: session.notifier(),
+            walk: Arc::new(Mutex::new(MountMetadataWalk::new(walk_seed))),
         };
         let mut mounted = Self {
             path: path.to_owned(),
@@ -391,7 +457,7 @@ impl Mounted {
             refresh,
         };
         if let Err(error) = if !offline && matches!(startup, MountStartup::Normal) {
-            activation_accounts.activate_sync(&activation)
+            accounts.activate_sync(&space)
         } else {
             Ok(())
         } {
@@ -867,6 +933,8 @@ struct State {
     cache_bytes: usize,
     cache_generation: u64,
     directories: VecDeque<CachedDirectory>,
+    directory_flights: HashSet<u64>,
+    browse_focus: Option<u64>,
     next_scan: u64,
 }
 
@@ -971,11 +1039,35 @@ struct CachedRange {
 #[derive(Clone, PartialEq, Eq)]
 struct CachedDirectory {
     ino: u64,
+    parent_revision: u64,
+    rejected: bool,
     started: Instant,
     attempted: Instant,
     mutation_epoch: u64,
     metadata_generation: u64,
     children: DirectoryView,
+}
+
+enum DirectoryObservation<'a> {
+    Demand,
+    Browse,
+    Background(&'a AtomicBool),
+    Seed {
+        entries: DirectorySnapshot,
+        generation: u64,
+        started: Instant,
+    },
+}
+
+struct DirectoryFlight<'a>(&'a Drive, u64);
+
+impl Drop for DirectoryFlight<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.directory_flights.remove(&self.1);
+            self.0.directory_ready.notify_all();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1030,24 +1122,6 @@ impl DirectoryView {
 
     fn matches(&self, expected: &Self) -> bool {
         self.0.same_observation(&expected.0)
-    }
-
-    fn inode_names(&self) -> Option<Vec<(u64, String)>> {
-        let mut names = Vec::new();
-        let mut after = 0;
-        loop {
-            let page = self.page(after).ok()?;
-            if page.is_empty() {
-                return Some(names);
-            }
-            for (cookie, id, _, name) in page {
-                if names.len() >= MAX_NODES {
-                    return None;
-                }
-                names.push((id, name));
-                after = cookie;
-            }
-        }
     }
 }
 
@@ -1129,6 +1203,12 @@ impl Namespace {
 }
 
 impl State {
+    fn live_node(&self, ino: u64) -> Option<&Node> {
+        self.nodes
+            .get(&ino)
+            .filter(|node| self.paths.get(&node.path) == Some(&ino))
+    }
+
     fn retire_ranges(
         &mut self,
         retired: &mut Vec<Arc<CachedRange>>,
@@ -1215,13 +1295,20 @@ struct Drive {
     accounts: Arc<Accounts>,
     instance: String,
     space: MountBinding,
+    browse_id: String,
     state: Arc<Mutex<State>>,
+    directory_ready: Arc<Condvar>,
     flights: Arc<Mutex<HashMap<RangeKey, Arc<Flight>>>>,
     mutation: Arc<Mutex<()>>,
 }
 
 impl Drive {
-    fn new(accounts: Arc<Accounts>, instance: String, space: MountBinding) -> Self {
+    fn new(
+        accounts: Arc<Accounts>,
+        instance: String,
+        space: MountBinding,
+        browse_id: String,
+    ) -> Self {
         let cache_generation = accounts.clean_cache_generation();
         let root = Node {
             path: Vec::new(),
@@ -1238,6 +1325,7 @@ impl Drive {
             accounts,
             instance,
             space,
+            browse_id,
             state: Arc::new(Mutex::new(State {
                 namespace: Arc::new(Namespace {
                     nodes: HashMap::from([(1, root)]),
@@ -1256,8 +1344,11 @@ impl Drive {
                 cache_bytes: 0,
                 cache_generation,
                 directories: VecDeque::with_capacity(DIRECTORY_CACHE_MAX),
+                directory_flights: HashSet::new(),
+                browse_focus: None,
                 next_scan: 1,
             })),
+            directory_ready: Arc::new(Condvar::new()),
             flights: Arc::new(Mutex::new(HashMap::new())),
             mutation: Arc::new(Mutex::new(())),
         }
@@ -1277,8 +1368,77 @@ impl Drive {
         Ok(node.clone())
     }
 
-    fn listing_for_read(&self, ino: INodeNo, refresh: bool) -> Result<DirectoryView, Errno> {
-        self.listing_inner(ino, refresh)
+    fn browse<T>(
+        &self,
+        ino: INodeNo,
+        read: impl Fn(&State, &Node, &CachedDirectory) -> Option<T>,
+    ) -> Result<T, Errno> {
+        let max_age = if self.space.is_offline() {
+            OFFLINE_DIRECTORY_CACHE_TTL
+        } else {
+            DIRECTORY_MAX_AGE
+        };
+        let mut attempts = 0;
+        loop {
+            let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+            let parent = state.live_node(ino.0).ok_or(Errno::ENOENT)?;
+            if !parent.directory {
+                return Err(Errno::ENOTDIR);
+            }
+            // A successful scan publishes a complete DirectoryView and its
+            // immediate children in the namespace together. A replacement
+            // removes old inode bindings; local edits change the mutation epoch.
+            // No snapshot pages or SQL are needed to validate this cache hit.
+            let generation = self.accounts.metadata_generation();
+            if let Some(cached) = state.directories.iter().find(|d| {
+                d.ino == ino.0
+                    && d.parent_revision == parent.revision
+                    && !d.rejected
+                    && d.mutation_epoch == state.mutation_epoch
+                    && d.metadata_generation == generation
+                    && d.started.elapsed() < max_age
+            }) && let Some(result) = read(&state, parent, cached)
+            {
+                return Ok(result);
+            }
+            if state.directory_flights.contains(&ino.0) {
+                drop(self.directory_ready.wait(state).map_err(|_| Errno::EIO)?);
+                continue;
+            }
+            if attempts == 8 {
+                return Err(Errno::EIO);
+            }
+            attempts += 1;
+            state.directory_flights.insert(ino.0);
+            drop(state);
+            let flight = DirectoryFlight(self, ino.0);
+            let observation = if attempts == 1 {
+                DirectoryObservation::Browse
+            } else {
+                DirectoryObservation::Demand
+            };
+            let result = self.observe_directory(ino, observation);
+            drop(flight);
+            match result {
+                Ok(_) | Err(Errno::EAGAIN) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn browse_entry(&self, parent: INodeNo, name: &str) -> Result<Option<(u64, Node)>, Errno> {
+        self.browse(parent, |state, parent, cached| {
+            let mut path = parent.path.clone();
+            path.push(name.to_owned());
+            if let Some(id) = state.paths.get(&path)
+                && let Some(node) = state.nodes.get(id)
+            {
+                return Some(Some((*id, node.clone())));
+            }
+            // A name missing from a complete, recent view is a cheap negative.
+            // Older negatives demand an observation if background hasn't caught up.
+            (cached.started.elapsed() < DIRECTORY_REFRESH_AGE).then_some(None)
+        })
     }
 
     // The returned guard keeps the validated parent stable through journaling.
@@ -1291,7 +1451,7 @@ impl Drive {
             let epoch = self.state.lock().map_err(|_| Errno::EIO)?.mutation_epoch;
             let generation = self.accounts.metadata_generation();
             let parent_node = self.node(parent)?;
-            let siblings = self.listing_for_read(parent, false)?;
+            let siblings = self.fresh_directory(parent)?;
             if siblings.find(name)?.is_some() {
                 return Err(Errno::EEXIST);
             }
@@ -1334,11 +1494,11 @@ impl Drive {
             let generation = self.accounts.metadata_generation();
             let source_parent = self.node(parent)?;
             let destination_parent = self.node(newparent)?;
-            let source = self.listing_for_read(parent, false)?;
+            let source = self.fresh_directory(parent)?;
             let destination = if parent == newparent {
                 source.clone()
             } else {
-                self.listing_for_read(newparent, false)?
+                self.fresh_directory(newparent)?
             };
             let source_entry = source.find(name)?;
             let target_entry = destination.find(newname)?;
@@ -1447,11 +1607,7 @@ impl Drive {
             let source_children = if inspect_children && target_entry.is_none() {
                 if let Some((id, node)) = &source_directory {
                     if !node.resource_id.starts_with("cirrus-dir:") {
-                        Some((
-                            *id,
-                            node.clone(),
-                            self.listing_for_read(INodeNo(*id), false)?,
-                        ))
+                        Some((*id, node.clone(), self.fresh_directory(INodeNo(*id))?))
                     } else {
                         None
                     }
@@ -1471,7 +1627,7 @@ impl Drive {
                         Some((
                             *id,
                             target_node.clone(),
-                            self.listing_for_read(INodeNo(*id), false)?,
+                            self.fresh_directory(INodeNo(*id))?,
                         ))
                     }
                     _ => None,
@@ -1593,9 +1749,10 @@ impl Drive {
         }
     }
 
-    fn listing_inner(&self, ino: INodeNo, refresh: bool) -> Result<DirectoryView, Errno> {
+    // Namespace mutations must not authorize an operation from the browse cache.
+    fn fresh_directory(&self, ino: INodeNo) -> Result<DirectoryView, Errno> {
         for _ in 0..8 {
-            match self.listing_once(ino, refresh) {
+            match self.observe_directory(ino, DirectoryObservation::Demand) {
                 Err(Errno::EAGAIN) => continue,
                 result => return result,
             }
@@ -1603,76 +1760,68 @@ impl Drive {
         Err(Errno::EIO)
     }
 
-    fn listing_once(&self, ino: INodeNo, refresh: bool) -> Result<DirectoryView, Errno> {
-        self.listing_once_mode(ino, refresh, None)
-    }
-
-    fn listing_once_mode(
+    fn observe_directory(
         &self,
         ino: INodeNo,
-        refresh: bool,
-        background: Option<&AtomicBool>,
+        observation: DirectoryObservation<'_>,
     ) -> Result<DirectoryView, Errno> {
         let parent = self.node(ino)?;
         if !parent.directory {
             return Err(Errno::ENOTDIR);
         }
-        let generation = self.accounts.metadata_generation();
-        let started = Instant::now();
-        let cached = if refresh {
-            None
-        } else {
-            let state = self.state.lock().map_err(|_| Errno::EIO)?;
-            state
-                .directories
-                .iter()
-                .find(|cached| {
-                    cached.ino == ino.0
-                        && cached.started.elapsed() < DIRECTORY_CACHE_TTL
-                        && cached.mutation_epoch == state.mutation_epoch
-                        && cached.metadata_generation == generation
-                })
-                .map(|cached| {
-                    (
-                        cached.clone(),
-                        state.scans.get(&ino.0).copied(),
-                        state.namespace.clone(),
-                    )
-                })
+        let load_durable =
+            matches!(observation, DirectoryObservation::Browse) && !self.space.is_offline();
+        let (seed, generation, mut started, background) = match observation {
+            DirectoryObservation::Seed {
+                entries,
+                generation,
+                started,
+            } => (Some(entries), generation, started, None),
+            DirectoryObservation::Background(alive) => (
+                None,
+                self.accounts.metadata_generation(),
+                Instant::now(),
+                Some(alive),
+            ),
+            DirectoryObservation::Demand | DirectoryObservation::Browse => (
+                None,
+                self.accounts.metadata_generation(),
+                Instant::now(),
+                None,
+            ),
         };
-        // Snapshot pages require SQLite; load only bound identities outside State.
-        if let Some((cached, scan, namespace)) = cached
-            && let Some(names) = cached.children.inode_names()
-            && namespace.paths.get(&parent.path) == Some(&ino.0)
-            && namespace.nodes.get(&ino.0).is_some_and(|current| {
-                current.directory
-                    && current.resource_id == parent.resource_id
-                    && current.revision == parent.revision
-            })
-            && names.iter().all(|(id, name)| {
-                namespace.nodes.get(id).is_some_and(|node| {
-                    node.parent == ino.0
-                        && node.path.last() == Some(name)
-                        && namespace.paths.get(&node.path) == Some(id)
+        let browse_epoch = format!("{}:{generation}", self.browse_id);
+        let durable_epoch = self.namespace()?.mutation_epoch;
+        let _browse_flight = if load_durable {
+            Some(
+                self.accounts
+                    .reserve_mount_browse(&self.browse_id, &parent.path)
+                    .map_err(|_| Errno::EAGAIN)?,
+            )
+        } else {
+            None
+        };
+        let durable = if load_durable {
+            // An unusable retained copy never takes down live browse.
+            self.accounts
+                .load_mount_browse(
+                    &self.space,
+                    &parent.path,
+                    &parent.resource_id,
+                    parent.etag.as_deref(),
+                    &browse_epoch,
+                )
+                .ok()
+                .flatten()
+                .map(|(entries, age)| {
+                    started = started.checked_sub(age).unwrap_or(started);
+                    entries
                 })
-            })
-        {
-            let state = self.state.lock().map_err(|_| Errno::EIO)?;
-            if Arc::ptr_eq(&state.namespace, &namespace)
-                && state.mutation_epoch == cached.mutation_epoch
-                && self.accounts.metadata_generation() == generation
-                && state.scans.get(&ino.0).copied() == scan
-                && state.directories.iter().any(|current| {
-                    current.ino == ino.0
-                        && current.started.elapsed() < DIRECTORY_CACHE_TTL
-                        && current.mutation_epoch == cached.mutation_epoch
-                        && current.metadata_generation == generation
-                        && current.children.matches(&cached.children)
-                })
-            {
-                return Ok(cached.children);
-            }
-        }
+        } else {
+            None
+        };
+        let _foreground = (seed.is_none() && durable.is_none() && background.is_none())
+            .then(|| self.accounts.request_foreground());
         let mut staged_files = Vec::with_capacity(MAX_HANDLES);
         let (ticket, namespace) = {
             let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
@@ -1695,6 +1844,9 @@ impl Drive {
             (ticket, state.namespace.clone())
         };
         let epoch = namespace.mutation_epoch;
+        if durable.is_some() && epoch != durable_epoch {
+            return Err(Errno::EAGAIN);
+        }
         let staged_versions: Vec<_> = staged_files
             .iter()
             .map(|version| (**version).clone())
@@ -1712,36 +1864,60 @@ impl Drive {
             .collect();
         drop(namespace);
         drop(staged_files);
-        let (mut entries, confirmed, confirmed_directories) = if let Some(alive) = background {
-            let refreshed = self
-                .accounts
-                .refresh_mount_directory(
-                    &self.space,
-                    &parent.path,
-                    &parent.resource_id,
-                    alive,
-                    (&staged_versions, &staged_directories),
-                )
-                .map_err(|_| Errno::EIO)?
-                .ok_or(Errno::EAGAIN)?;
+        let (mut entries, confirmed, confirmed_directories) = if let Some(entries) = seed {
+            (entries, Vec::new(), Vec::new())
+        } else if let Some(alive) = background {
+            let refreshed = match self.accounts.refresh_mount_directory(
+                &self.space,
+                &parent.path,
+                &parent.resource_id,
+                alive,
+                &browse_epoch,
+                (&staged_versions, &staged_directories),
+            ) {
+                Ok(Some(refreshed)) => refreshed,
+                Ok(None) => return Err(Errno::EAGAIN),
+                Err(error) => {
+                    if error.is_directory_binding_lost() {
+                        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                        if alive.load(Ordering::Acquire)
+                            && state.mutation_epoch == epoch
+                            && self.accounts.metadata_generation() == generation
+                            && state.live_node(ino.0) == Some(&parent)
+                            && state
+                                .scans
+                                .get(&ino.0)
+                                .is_none_or(|latest| *latest < ticket)
+                            && let Some(cached) =
+                                state.directories.iter_mut().find(|d| d.ino == ino.0)
+                        {
+                            cached.rejected = true;
+                        }
+                    }
+                    return Err(Errno::EIO);
+                }
+            };
             (refreshed.entries, refreshed.files, refreshed.directories)
         } else {
-            let entries = self
-                .accounts
-                .mount_directory(
-                    &self.instance,
-                    &self.space,
-                    &parent.path,
-                    &parent.resource_id,
-                )
-                .map_err(|error| {
-                    eprintln!("directory listing failed: {error}");
-                    if error.is_staging_full() {
-                        Errno::ENOSPC
-                    } else {
-                        Errno::EIO
-                    }
-                })?;
+            let entries = if let Some(entries) = durable {
+                entries
+            } else {
+                self.accounts
+                    .observe_mount_directory(
+                        &self.space,
+                        &parent.path,
+                        &parent.resource_id,
+                        &browse_epoch,
+                    )
+                    .map_err(|error| {
+                        eprintln!("directory listing failed: {error}");
+                        if error.is_staging_full() {
+                            Errno::ENOSPC
+                        } else {
+                            Errno::EIO
+                        }
+                    })?
+            };
             let confirmed = if staged_versions.is_empty() {
                 Vec::new()
             } else {
@@ -2144,6 +2320,8 @@ impl Drive {
             };
             let cached = CachedDirectory {
                 ino: ino.0,
+                parent_revision: parent.revision,
+                rejected: false,
                 started,
                 attempted: started,
                 mutation_epoch: namespace.mutation_epoch,
@@ -2243,8 +2421,13 @@ impl Drive {
                 }
             }
             if live.directories.len() == DIRECTORY_CACHE_MAX {
-                retired_directories
-                    .push(live.directories.pop_front().expect("full directory cache"));
+                // Keep the root view: every pathname walk depends on it.
+                let oldest = usize::from(live.directories[0].ino == 1);
+                retired_directories.push(
+                    live.directories
+                        .remove(oldest)
+                        .expect("full directory cache"),
+                );
             }
             live.directories.push_back(cached);
             live.next_node = next_node;
@@ -2750,7 +2933,7 @@ impl Drive {
         let epoch = self.state.lock().map_err(|_| Errno::EIO)?.mutation_epoch;
         let generation = self.accounts.metadata_generation();
         let name = name.to_str().ok_or(Errno::EINVAL)?;
-        let siblings = self.listing_for_read(parent, false)?;
+        let siblings = self.fresh_directory(parent)?;
         let id = siblings
             .find(name)?
             .map(|entry| entry.0)
@@ -2764,7 +2947,7 @@ impl Drive {
             });
         }
         let children = if directory {
-            let children = self.listing_for_read(INodeNo(id), false)?;
+            let children = self.fresh_directory(INodeNo(id))?;
             if !children.is_empty()? {
                 return Err(Errno::ENOTEMPTY);
             }
@@ -2964,27 +3147,9 @@ impl Filesystem for Drive {
             reply.error(Errno::ENOENT);
             return;
         };
-        let refresh = {
-            let Ok(state) = self.state.lock() else {
-                reply.error(Errno::EIO);
-                return;
-            };
-            state.nodes.get(&parent.0).is_some_and(|node| {
-                let mut path = node.path.clone();
-                path.push(name.to_owned());
-                state
-                    .paths
-                    .get(&path)
-                    .and_then(|id| state.nodes.get(id))
-                    .is_some_and(|child| child.directory)
-            })
-        };
-        match self
-            .listing_inner(parent, refresh)
-            .and_then(|entries| entries.find(name)?.ok_or(Errno::ENOENT))
-            .and_then(|(id, _, _)| self.node(INodeNo(id)).map(|node| (id, node)))
-        {
-            Ok((id, node)) => reply.entry(&Duration::ZERO, &attr(id, &node), Generation(0)),
+        match self.browse_entry(parent, name) {
+            Ok(Some((id, node))) => reply.entry(&Duration::ZERO, &attr(id, &node), Generation(0)),
+            Ok(None) => reply.error(Errno::ENOENT),
             Err(error) => reply.error(error),
         }
     }
@@ -3039,15 +3204,10 @@ impl Filesystem for Drive {
             if u64::from(ino) == 1 {
                 return Ok(node);
             }
-            let id = u64::from(ino);
-            if !self
-                .listing_inner(INodeNo(node.parent), node.directory)?
-                .find(node.path.last().ok_or(Errno::EIO)?)?
-                .is_some_and(|entry| entry.0 == id)
-            {
-                return Err(Errno::ENOENT);
-            }
-            self.node(ino)
+            self.browse_entry(INodeNo(node.parent), node.path.last().ok_or(Errno::EIO)?)?
+                .filter(|(id, _)| *id == ino.0)
+                .map(|(_, node)| node)
+                .ok_or(Errno::ENOENT)
         });
         match result {
             Ok(node) => reply.attr(&Duration::ZERO, &attr(u64::from(ino), &node)),
@@ -3057,7 +3217,7 @@ impl Filesystem for Drive {
 
     fn opendir(&self, _: &Request, ino: INodeNo, _: OpenFlags, reply: ReplyOpen) {
         let result = (|| {
-            let children = self.listing_inner(ino, true)?;
+            let children = self.browse(ino, |_, _, cached| Some(cached.children.clone()))?;
             let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
             // A directory rename can finish after listing but before handle
             // registration. Bind '..' to the current live inode, not a node
@@ -3081,6 +3241,7 @@ impl Filesystem for Drive {
                     children,
                 },
             );
+            state.browse_focus = Some(ino.0);
             Ok(handle)
         })();
         match result {

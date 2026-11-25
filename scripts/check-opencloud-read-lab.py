@@ -236,16 +236,16 @@ def child(root, runtime, container):
 
         status, _, _ = upstream(container, "PUT", f"{folder}/remote-new", b"remote")
         assert status in (201, 204), f"creating remote listing entry: {status}"
-        time.sleep(2.2)
-        assert (local_folder / "remote-new").stat().st_size == 6, "remote change remained stale"
+        fixture.require(cli("--spaces", url), "invalidating mount metadata after remote edit")
+        assert (local_folder / "remote-new").stat().st_size == 6, "fresh lookup missed remote change"
         deny_directory[0] = True
-        time.sleep(2.2)
+        fixture.require(cli("--spaces", url), "invalidating mount metadata before DAV denial")
         try:
             os.listdir(local_folder)
         except OSError as error:
             assert error.errno == errno.EIO, error
         else:
-            raise AssertionError("expired listing concealed permission failure")
+            raise AssertionError("fresh listing concealed permission failure")
         deny_directory[0] = False
         file = mountpoint / "cirrus-read-fixture.bin"
         # The bridge must not inherit an open FUSE fd: spawning docker would

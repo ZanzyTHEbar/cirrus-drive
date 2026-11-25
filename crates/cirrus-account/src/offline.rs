@@ -34,7 +34,7 @@ pub(crate) use upload::{
 };
 
 const APP_ID: i64 = 0x4344_5231;
-pub(crate) const STATE_SCHEMA_VERSION: i64 = 19;
+pub(crate) const STATE_SCHEMA_VERSION: i64 = 20;
 const CHUNK: u64 = 128 * 1024;
 const MAX_PIN_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_STAGING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -129,7 +129,7 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline state"))?;
-    if matches!(version, 17 | 18) {
+    if matches!(version, 17..=19) {
         let reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
             root,
             crate::storage::sql_reservation::Store::State,
@@ -155,7 +155,7 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
                 .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
             conn.execute_batch("PRAGMA user_version=18")
                 .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
-        } else if !matches!(locked_version, 18 | 19) {
+        } else if !matches!(locked_version, 18..=20) {
             return Err(AccountError::new("unsupported offline state version"));
         }
         if matches!(locked_version, 17 | 18) {
@@ -163,6 +163,14 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
                 .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
             conn.execute_batch("PRAGMA user_version=19")
                 .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
+        }
+        if locked_version < 20 {
+            conn.execute_batch(
+                "ALTER TABLE snapshots ADD COLUMN browse_epoch TEXT;
+                ALTER TABLE snapshots ADD COLUMN browse_at INTEGER;
+                PRAGMA user_version=20;",
+            )
+            .map_err(|_| AccountError::new("cannot upgrade directory browse metadata"))?;
         }
         if let Some(reservation) = &reservation {
             reservation.validate(conn)?;
@@ -2447,7 +2455,7 @@ pub(crate) fn queue_tree_move_correlated(
                     if next.len() > 128 {
                         return Err(AccountError::new("invalid Space path"));
                     }
-                    tx.execute("INSERT INTO snapshots SELECT instance,space,?1,entries,updated,self_id,self_etag,local_operation,issuer,subject FROM snapshots WHERE rowid=?2", params![path_key(&next)?,id])
+                    tx.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) SELECT instance,space,?1,entries,updated,self_id,self_etag,local_operation,issuer,subject FROM snapshots WHERE rowid=?2", params![path_key(&next)?,id])
                         .map_err(|error| sqlite_storage_error(error, "cannot relocate directory snapshots"))?;
                 }
             }
@@ -3503,7 +3511,7 @@ fn copy_local_tree_snapshots(
                     if next.len() > 128 {
                         return Err(AccountError::new("invalid Space path"));
                     }
-                    conn.execute("INSERT INTO snapshots SELECT instance,space,?1,entries,updated,self_id,self_etag,local_operation,issuer,subject FROM snapshots WHERE rowid=?2",params![path_key(&next)?,id]).map_err(|error|sqlite_storage_error(error,"cannot copy local tree observation"))?;
+                    conn.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) SELECT instance,space,?1,entries,updated,self_id,self_etag,local_operation,issuer,subject FROM snapshots WHERE rowid=?2",params![path_key(&next)?,id]).map_err(|error|sqlite_storage_error(error,"cannot copy local tree observation"))?;
                 }
             }
         }
@@ -7647,6 +7655,16 @@ pub(crate) fn offline_directory_in(
     path: &[String],
     owner: Option<(&str, &str)>,
 ) -> Result<crate::DirectorySnapshot, AccountError> {
+    check_offline_directory_owner(conn, instance, space, owner)?;
+    resolve_saved_directory_in(storage_root, conn, (instance, space), path, None)
+}
+
+fn check_offline_directory_owner(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    owner: Option<(&str, &str)>,
+) -> Result<(), AccountError> {
     check_retained_identity(conn, instance, space)?;
     if let Some((issuer, subject)) = owner {
         let matches: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM account_identities WHERE instance=?1 AND issuer=?2 AND subject=?3)", params![instance,issuer,subject], |row| row.get(0))
@@ -7667,7 +7685,7 @@ pub(crate) fn offline_directory_in(
             "Space has no verified local activation; local data retained",
         ));
     }
-    resolve_saved_directory_in(storage_root, conn, (instance, space), path, None)
+    Ok(())
 }
 
 fn resolve_saved_directory_in(
@@ -8461,7 +8479,8 @@ pub(crate) fn begin_snapshot_in(root: &StorageRoot) -> Result<SnapshotObservatio
 const UNBOUND_SNAPSHOT_DESCENDANTS: &str = "SELECT child.path FROM snapshots child
     WHERE child.instance=?1 AND child.space=?2
       AND json_array_length(child.path)>?6
-      AND (?3='[]' OR substr(child.path,1,length(?5))=?5)
+      AND child.path>=CASE WHEN ?3='[]' THEN '' ELSE ?5 END
+      AND child.path<CASE WHEN ?3='[]' THEN ']' ELSE substr(?5,1,length(?5)-1)||'-' END
       AND NOT (child.entries='[]' AND json_array_length(child.path)=?6+1
         AND NOT EXISTS (SELECT 1 FROM json_each(?4) fresh
           WHERE json_extract(fresh.value,'$.name')=json_extract(child.path,?7))
@@ -8515,7 +8534,7 @@ fn write_snapshot_json(
     ).map_err(|error| sqlite_storage_error(error,"cannot invalidate unbound descendant snapshots"))?;
     // Even an unchanged observation must advance the durable fence: an older
     // response could otherwise replace it after this observation completes.
-    let count = conn.execute("INSERT INTO snapshots SELECT ?1,?2,?3,?4,strftime('%s','now'),?5,?6,NULL,issuer,subject FROM account_identities WHERE instance=?1 ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries,updated=max(excluded.updated,snapshots.updated+1),self_id=excluded.self_id,self_etag=excluded.self_etag,local_operation=NULL,issuer=excluded.issuer,subject=excluded.subject WHERE snapshots.updated < 9223372036854775807",
+    let count = conn.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) SELECT ?1,?2,?3,?4,strftime('%s','now'),?5,?6,NULL,issuer,subject FROM account_identities WHERE instance=?1 ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries,updated=max(excluded.updated,snapshots.updated+1),self_id=excluded.self_id,self_etag=excluded.self_etag,local_operation=NULL,issuer=excluded.issuer,subject=excluded.subject,browse_epoch=NULL,browse_at=NULL WHERE snapshots.updated < 9223372036854775807",
         params![instance, space, path_key(path)?, json,self_version.0,self_version.1]).map_err(|error| sqlite_storage_error(error, "cannot save offline metadata"))?;
     if count != 1 {
         return Err(AccountError::new("offline metadata generation exhausted"));
@@ -8530,7 +8549,7 @@ fn write_local_snapshot(
     path: &[String],
     operation: i64,
 ) -> Result<(), AccountError> {
-    let count = conn.execute("INSERT INTO snapshots SELECT ?1,?2,?3,'[]',strftime('%s','now'),NULL,NULL,?4,a.issuer,a.subject FROM account_identities a JOIN operation_journal j ON j.instance=a.instance WHERE a.instance=?1 AND j.space=?2 AND j.path=?3 AND j.id=?4 AND j.op_type='mkdir' AND j.state='pending' ON CONFLICT(instance,space,path) DO UPDATE SET entries='[]',updated=max(excluded.updated,snapshots.updated+1),self_id=NULL,self_etag=NULL,local_operation=excluded.local_operation,issuer=excluded.issuer,subject=excluded.subject WHERE snapshots.updated < 9223372036854775807",params![instance,space,path_key(path)?,operation])
+    let count = conn.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) SELECT ?1,?2,?3,'[]',strftime('%s','now'),NULL,NULL,?4,a.issuer,a.subject FROM account_identities a JOIN operation_journal j ON j.instance=a.instance WHERE a.instance=?1 AND j.space=?2 AND j.path=?3 AND j.id=?4 AND j.op_type='mkdir' AND j.state='pending' ON CONFLICT(instance,space,path) DO UPDATE SET entries='[]',updated=max(excluded.updated,snapshots.updated+1),self_id=NULL,self_etag=NULL,local_operation=excluded.local_operation,issuer=excluded.issuer,subject=excluded.subject,browse_epoch=NULL,browse_at=NULL WHERE snapshots.updated < 9223372036854775807",params![instance,space,path_key(path)?,operation])
         .map_err(|error| sqlite_storage_error(error,"cannot save local directory observation"))?;
     if count != 1 {
         return Err(AccountError::new("local directory observation changed"));
@@ -8557,7 +8576,120 @@ pub(crate) fn save_directory_snapshot(
         path,
         &entries.json()?,
         &entries.remote_parent()?,
+        None,
     )
+}
+
+pub(crate) fn save_mount_browse_snapshot(
+    observation: SnapshotObservation,
+    instance: &str,
+    space: &str,
+    path: &[String],
+    entries: &crate::DirectorySnapshot,
+    epoch: &str,
+) -> Result<bool, AccountError> {
+    if observation.root.identity() != entries.storage_root()?.identity() {
+        return Err(AccountError::new(
+            "directory observation storage root changed",
+        ));
+    }
+    save_snapshot_json(
+        observation,
+        instance,
+        space,
+        path,
+        &entries.json()?,
+        &entries.remote_parent()?,
+        Some(epoch),
+    )
+}
+
+pub(crate) fn save_mount_browse_batch(
+    observation: SnapshotObservation,
+    (instance, space): (&str, &str),
+    entries: &[(&[String], &crate::DirectorySnapshot)],
+    rejected: &[&[String]],
+    epoch: &str,
+    still_current: impl Fn() -> bool,
+) -> Result<bool, AccountError> {
+    use crate::storage::sql_reservation::{SqlReservation, Store};
+    if entries.is_empty() && rejected.is_empty() {
+        return Ok(true);
+    }
+    let mut records = Vec::with_capacity(entries.len());
+    let mut bytes = 0u64;
+    let mut metadata = 0u64;
+    for &(path, snapshot) in entries {
+        if observation.root.identity() != snapshot.storage_root()?.identity() {
+            return Err(AccountError::new(
+                "directory observation storage root changed",
+            ));
+        }
+        let json = snapshot.json()?;
+        let version = snapshot.remote_parent()?;
+        bytes = bytes.saturating_add(json.len() as u64);
+        metadata = metadata
+            .saturating_add(snapshot_metadata_bytes(
+                &observation.conn,
+                instance,
+                space,
+                path,
+                &version,
+            )?)
+            .saturating_add(epoch.len() as u64 + 8);
+        records.push((path, json, version));
+    }
+    for path in rejected {
+        metadata = metadata.saturating_add(path_key(path)?.len() as u64 + 128);
+    }
+    let reservation = SqlReservation::begin_in(
+        &observation.root,
+        Store::State,
+        Some(&observation.conn),
+        bytes,
+        metadata,
+        false,
+    )?;
+    if let Some(reservation) = &reservation {
+        reservation.bound_pages(&observation.conn)?;
+    }
+    let mut observation = observation;
+    let tx = observation
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_storage_error(error, "cannot start offline transaction"))?;
+    let current: i64 = tx
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .map_err(|_| AccountError::new("cannot inspect offline metadata"))?;
+    if current != observation.data_version || !still_current() {
+        return Ok(false);
+    }
+    for (path, json, version) in &records {
+        write_snapshot_json(&tx, instance, space, path, json, version)?;
+        stamp_mount_browse(&tx, instance, space, path, epoch)?;
+    }
+    for path in rejected {
+        tx.execute(
+            "UPDATE snapshots SET browse_epoch=NULL,browse_at=NULL
+                    WHERE instance=?1 AND space=?2 AND path=?3 AND browse_epoch=?4",
+            params![instance, space, path_key(path)?, epoch],
+        )
+        .map_err(|error| sqlite_storage_error(error, "cannot revoke durable browse metadata"))?;
+    }
+    if let Some(reservation) = &reservation {
+        reservation.validate(&tx)?;
+    } else if crate::storage::limits::view_in(&observation.root)?
+        .limits
+        .is_some()
+    {
+        return Err(AccountError::new(crate::storage::limits::PRESSURE));
+    }
+    if !still_current() {
+        return Ok(false);
+    }
+    tx.commit()
+        .map_err(|error| sqlite_storage_error(error, "cannot commit offline metadata"))?;
+    Ok(true)
 }
 
 /// A skipped copy is safe only if no unaccounted directory mapping needs revocation.
@@ -8744,23 +8876,7 @@ fn snapshot_reservation_in(
             crate::storage::limits::view_in(root)?.limits.is_some()
         );
     }
-    let owner: (String, String) = conn
-        .query_row(
-            "SELECT issuer,subject FROM account_identities WHERE instance=?1",
-            [instance],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| AccountError::new("snapshot account identity unavailable"))?;
-    let metadata = (instance.len() as u64)
-        .checked_add(space.len() as u64)
-        .and_then(|bytes| bytes.checked_add(path_key(path).ok()?.len() as u64))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                (self_version.0.len() + self_version.1.len() + owner.0.len() + owner.1.len() + 64)
-                    as u64,
-            )
-        })
-        .ok_or_else(|| AccountError::new("snapshot storage estimate overflow"))?;
+    let metadata = snapshot_metadata_bytes(conn, instance, space, path, self_version)?;
     // Complete bounded JSON already exists; no lease spans DAV, and this cap
     // belongs only to the publication connection, never recovery connections.
     let reservation =
@@ -8779,6 +8895,43 @@ fn snapshot_reservation_in(
     Ok(reservation)
 }
 
+fn snapshot_metadata_bytes(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    path: &[String],
+    version: &(String, String),
+) -> Result<u64, AccountError> {
+    let owner: (String, String) = conn
+        .query_row(
+            "SELECT issuer,subject FROM account_identities WHERE instance=?1",
+            [instance],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| AccountError::new("snapshot account identity unavailable"))?;
+    Ok((instance.len()
+        + space.len()
+        + path_key(path)?.len()
+        + version.0.len()
+        + version.1.len()
+        + owner.0.len()
+        + owner.1.len()
+        + 128) as u64)
+}
+
+fn stamp_mount_browse(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    path: &[String],
+    epoch: &str,
+) -> Result<(), AccountError> {
+    conn.execute("UPDATE snapshots SET browse_epoch=?4,browse_at=unixepoch() WHERE instance=?1 AND space=?2 AND path=?3",
+        params![instance, space, path_key(path)?, epoch])
+        .map_err(|error| sqlite_storage_error(error, "cannot stamp durable browse metadata"))?;
+    Ok(())
+}
+
 fn save_snapshot_json(
     observation: SnapshotObservation,
     instance: &str,
@@ -8786,6 +8939,7 @@ fn save_snapshot_json(
     path: &[String],
     json: &str,
     self_version: &(String, String),
+    browse_epoch: Option<&str>,
 ) -> Result<bool, AccountError> {
     let reservation = snapshot_reservation_in(
         &observation.root,
@@ -8810,6 +8964,9 @@ fn save_snapshot_json(
         return Ok(false);
     }
     write_snapshot_json(&tx, instance, space, path, json, self_version)?;
+    if let Some(epoch) = browse_epoch {
+        stamp_mount_browse(&tx, instance, space, path, epoch)?;
+    }
     if let Some(reservation) = &reservation {
         reservation.validate(&tx)?;
     } else if crate::storage::limits::view_in(&observation.root)?
@@ -8837,6 +8994,128 @@ pub(crate) fn directory_snapshot_at(
     tx.commit()
         .map_err(|_| AccountError::new("cannot finish directory snapshot"))?;
     Ok(snapshot)
+}
+
+pub(crate) fn load_mount_browse(
+    binding: &crate::MountBinding,
+    path: &[String],
+    parent_id: &str,
+    parent_etag: Option<&str>,
+    epoch: &str,
+    max_age: Duration,
+) -> Result<Option<(crate::DirectorySnapshot, Duration)>, AccountError> {
+    let mut conn = database_in(&binding.root)?;
+    let tx = conn
+        .transaction()
+        .map_err(|_| AccountError::new("cannot inspect durable browse metadata"))?;
+    let age: Option<u64> = tx
+        .query_row(
+            "SELECT unixepoch()-browse_at FROM snapshots
+         WHERE instance=?1 AND space=?2 AND path=?3 AND browse_epoch=?4
+           AND browse_at BETWEEN unixepoch()-?5 AND unixepoch()
+           AND issuer=?6 AND subject=?7 AND local_operation IS NULL
+           AND (?8='' OR self_id=?8) AND (?9 IS NULL OR self_etag=?9)",
+            params![
+                binding.instance,
+                binding.space,
+                path_key(path)?,
+                epoch,
+                max_age.as_secs(),
+                binding.issuer,
+                binding.subject,
+                parent_id,
+                parent_etag
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AccountError::new("cannot inspect durable browse metadata"))?;
+    let Some(age) = age else {
+        return Ok(None);
+    };
+    let scope = (&binding.instance, &binding.space);
+    check_offline_directory_owner(
+        &tx,
+        scope.0,
+        scope.1,
+        Some((&binding.issuer, &binding.subject)),
+    )?;
+    let has_overlay: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND space=?2
+                       AND (state IN ('pending','conflict','uncertain')
+                         OR (state='synced' AND op_type IN ('rmdir','move-dir-source'))))",
+            params![scope.0, scope.1],
+            |row| row.get(0),
+        )
+        .map_err(|_| AccountError::new("cannot inspect browse overlay"))?;
+    let entries = if has_overlay {
+        resolve_saved_directory_in(&binding.root, &tx, (scope.0, scope.1), path, None)?
+    } else {
+        // Check the unprojected ancestor chain without rebuilding each
+        // ancestor listing. Only the requested directory needs a scratch DB.
+        for (index, name) in path.iter().enumerate() {
+            let linked: bool = tx.query_row("SELECT EXISTS(
+                SELECT 1 FROM snapshots p JOIN snapshots c
+                  ON c.instance=p.instance AND c.space=p.space AND c.issuer=p.issuer
+                   AND c.subject=p.subject,json_each(p.entries) e
+                 WHERE p.instance=?1 AND p.space=?2 AND p.issuer=?3 AND p.subject=?4
+                   AND p.path=?5 AND c.path=?6 AND p.local_operation IS NULL
+                   AND c.local_operation IS NULL AND json_extract(e.value,'$.directory')=1
+                   AND json_extract(e.value,'$.name')=?7 AND json_extract(e.value,'$.id')=c.self_id)",
+                params![scope.0, scope.1, binding.issuer, binding.subject,
+                    path_key(&path[..index])?, path_key(&path[..=index])?, name],
+                |row| row.get(0),
+            ).map_err(|_| AccountError::new("cannot verify durable browse ancestors"))?;
+            if !linked {
+                return Ok(None);
+            }
+        }
+        let Some(mut entries) =
+            directory_snapshot_in_root(&binding.root, &tx, scope.0, scope.1, path)?
+        else {
+            return Ok(None);
+        };
+        apply_staged_entries_in(&tx, scope.0, scope.1, path, &mut entries)?;
+        entries
+    };
+    if !parent_id.is_empty() && !entries.matches_parent(parent_id)? {
+        return Ok(None);
+    }
+    tx.commit()
+        .map_err(|_| AccountError::new("cannot finish durable browse read"))?;
+    Ok(Some((entries, Duration::from_secs(age))))
+}
+
+pub(crate) fn mount_walk_parent_matches(
+    observation: &SnapshotObservation,
+    binding: &crate::MountBinding,
+    path: &[String],
+    id: &str,
+) -> Result<bool, AccountError> {
+    let Some((name, parent)) = path.split_last() else {
+        return Ok(true);
+    };
+    observation
+        .conn
+        .query_row(
+            "SELECT EXISTS(
+        SELECT 1 FROM snapshots s,json_each(s.entries) e
+          WHERE s.instance=?1 AND s.space=?2 AND s.path=?3 AND s.issuer=?4 AND s.subject=?5
+            AND s.local_operation IS NULL AND json_extract(e.value,'$.name')=?6
+            AND json_extract(e.value,'$.id')=?7 AND json_extract(e.value,'$.directory')=1)",
+            params![
+                binding.instance,
+                binding.space,
+                path_key(parent)?,
+                binding.issuer,
+                binding.subject,
+                name,
+                id
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|_| AccountError::new("cannot inspect background directory parent"))
 }
 
 fn directory_snapshot_in_root(
@@ -9428,7 +9707,7 @@ pub(crate) fn cache_eviction_identity_in(
     let schema: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| unavailable())?;
-    if id != APP_ID || !matches!(schema, 17 | 18 | STATE_SCHEMA_VERSION) {
+    if id != APP_ID || !matches!(schema, 17..=STATE_SCHEMA_VERSION) {
         return Err(unavailable());
     }
     opening.check_named()?;

@@ -3888,7 +3888,7 @@ def child(root, runtime, container):
             assert lab.upstream(container,"PUT",base+"/stale-parent/new-child",b"newer parent version")[0]==201
             fixture.require(cli("--ls-space",url,space),"saving newer parent without refreshing its child listing")
             with sqlite3.connect(database) as db:
-                assert db.execute("PRAGMA user_version").fetchone()==(19,)
+                assert db.execute("PRAGMA user_version").fetchone()==(20,)
                 target_row=db.execute("SELECT self_id,self_etag,updated,entries,issuer,subject FROM snapshots WHERE space=? AND path='[\"dir-dest\",\"local-target\"]'",(space,)).fetchone() if replace_remote else None
                 original_rows=db.execute("SELECT path,entries,updated,self_id,self_etag,issuer,subject FROM snapshots WHERE space=? AND path IN ('[\"dir-source\"]','[\"dir-source\",\"nested\"]') ORDER BY path",(space,)).fetchall()
                 assert len(original_rows)==2
@@ -4004,7 +4004,7 @@ def child(root, runtime, container):
                 db.execute("DELETE FROM snapshots WHERE space=? AND path='[\"remote-target-empty\"]'",(space,))
             refuses("dir-source","remote-target-empty",errno.EIO)
             with sqlite3.connect(database) as db:
-                db.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",saved_target)
+                db.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",saved_target)
                 db.execute("UPDATE snapshots SET self_etag='\"different-saved-version\"' WHERE space=? AND path='[\"remote-target-empty\"]'",(space,))
             refuses("dir-source","remote-target-empty",errno.EIO)
             with sqlite3.connect(database) as db:
@@ -5472,7 +5472,7 @@ def child(root, runtime, container):
             fixture.require(cli("--stage-file-space",url,space,"/folder/nested.bin",source),"staging independent dirty root")
             # Save E1 emptiness, change only the server, publish ONLY root E2.
             with sqlite3.connect(database) as db:
-                assert db.execute("PRAGMA user_version").fetchone() == (19,)
+                assert db.execute("PRAGMA user_version").fetchone() == (20,)
                 e1 = db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE instance=? AND space=? AND path='[\"stale-empty\"]'",(url,space)).fetchone()
             assert e1[2] == "[]"
             assert lab.upstream(container,"PUT",base + "/stale-empty/new-child",b"must never be hidden")[0] == 201
@@ -14107,7 +14107,7 @@ def child(root, runtime, container):
             with sqlite3.connect(database) as db:
                 assert db.execute("PRAGMA user_version").fetchone() == (14,)
                 assert db.execute("SELECT state FROM operation_journal WHERE id=?", (row[0],)).fetchone() == ("pending",)
-                db.execute("PRAGMA user_version=19")
+                db.execute("PRAGMA user_version=20")
                 assert db.execute("DELETE FROM operation_parents WHERE operation_id=?", (row[0],)).rowcount == 1
             daemon = start()
             assert cli("--sync", url).returncode != 0, "missing parent evidence was silently skipped"

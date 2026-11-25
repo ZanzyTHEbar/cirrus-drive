@@ -7,6 +7,7 @@ mod callback;
 mod dav;
 mod executor;
 mod http;
+mod mount_metadata;
 mod offline;
 mod operation_result;
 mod ownership;
@@ -19,6 +20,8 @@ mod sqlite_open;
 mod storage;
 mod sync;
 mod upload;
+
+pub use mount_metadata::{MountBrowseFlight, MountMetadataWalk};
 
 #[cfg(target_os = "macos")]
 mod native_bridge;
@@ -294,6 +297,8 @@ pub struct Accounts {
     session_ready: Condvar,
     reads_in_flight: Mutex<usize>,
     read_available: Condvar,
+    mount_browse_flights: Mutex<HashSet<(String, Vec<String>)>>,
+    mount_browse_ready: Condvar,
     metadata_generation: AtomicU64,
     clean_cache_generation: AtomicU64,
     clean_cache_update: Mutex<()>,
@@ -456,7 +461,7 @@ enum DirectorySnapshotPublication {
 
 enum DirectoryAccess<'a> {
     Cli(&'a MountBinding),
-    Mount(&'a MountBinding, &'a str),
+    Mount(&'a MountBinding, &'a str, Option<&'a str>),
 }
 
 fn check_stage_file_path(path: &[String]) -> Result<(), AccountError> {
@@ -1024,6 +1029,8 @@ impl Accounts {
             session_ready: Condvar::new(),
             reads_in_flight: Mutex::new(0),
             read_available: Condvar::new(),
+            mount_browse_flights: Mutex::new(HashSet::new()),
+            mount_browse_ready: Condvar::new(),
             metadata_generation: AtomicU64::new(0),
             clean_cache_generation: AtomicU64::new(0),
             clean_cache_update: Mutex::new(()),
@@ -1644,7 +1651,32 @@ impl Accounts {
                 Some((&space.issuer, &space.subject)),
             );
         }
-        self.directory_inner(instance, DirectoryAccess::Mount(space, parent_id), path)
+        self.directory_inner(
+            instance,
+            DirectoryAccess::Mount(space, parent_id, None),
+            path,
+        )
+    }
+
+    /// Observes a directory for this mount and marks a durable copy for browse reuse.
+    ///
+    /// # Errors
+    /// Refuses unavailable observations or an invalid mount binding.
+    pub fn observe_mount_directory(
+        &self,
+        binding: &MountBinding,
+        path: &[String],
+        parent_id: &str,
+        browse_epoch: &str,
+    ) -> Result<DirectorySnapshot, AccountError> {
+        if binding.offline {
+            return self.mount_directory(binding.instance(), binding, path, parent_id);
+        }
+        self.directory_inner(
+            binding.instance(),
+            DirectoryAccess::Mount(binding, parent_id, Some(browse_epoch)),
+            path,
+        )
     }
 
     /// Observes one mounted directory without keyring access, token refresh or retries.
@@ -1658,6 +1690,7 @@ impl Accounts {
         path: &[String],
         parent_id: &str,
         alive: &AtomicBool,
+        browse_epoch: &str,
         staged: (&[FileVersion], &[(Vec<String>, String)]),
     ) -> Result<Option<MountDirectoryRefresh>, AccountError> {
         if binding.offline {
@@ -1717,10 +1750,6 @@ impl Accounts {
             &session.client,
             Duration::from_secs(2),
         );
-        if observed.as_ref().is_err_and(|error| error.unauthorized) {
-            self.invalidate_read_session(&session)?;
-        }
-        let mut entries = observed?;
         if !available() {
             return Ok(None);
         }
@@ -1735,6 +1764,31 @@ impl Accounts {
         {
             return Ok(None);
         }
+        if observed.as_ref().is_err_and(|error| error.unauthorized) {
+            self.invalidate_read_session(&session)?;
+            self.invalidate_mount_metadata();
+        }
+        let mut entries = match observed {
+            Ok(entries) => entries,
+            Err(error) if error.is_directory_binding_lost() && !error.unauthorized => {
+                if !matches!(
+                    offline::save_mount_browse_batch(
+                        observation,
+                        (session.base.as_str(), space),
+                        &[],
+                        &[path],
+                        browse_epoch,
+                        available,
+                    ),
+                    Ok(true)
+                ) && available()
+                {
+                    self.invalidate_mount_metadata();
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         offline::verify_identity_in(
             &session.root,
             session.base.as_str(),
@@ -1742,14 +1796,29 @@ impl Accounts {
             &session.account.subject,
         )?;
         if !parent_id.is_empty() && !entries.matches_parent(parent_id)? {
+            if !matches!(
+                offline::save_mount_browse_batch(
+                    observation,
+                    (session.base.as_str(), space),
+                    &[],
+                    &[path],
+                    browse_epoch,
+                    available,
+                ),
+                Ok(true)
+            ) && available()
+            {
+                self.invalidate_mount_metadata();
+            }
             return Err(AccountError::new("directory parent identity changed"));
         }
-        if !offline::save_directory_snapshot(
+        if !offline::save_mount_browse_snapshot(
             observation,
             session.base.as_str(),
             space,
             path,
             &entries,
+            browse_epoch,
         )? {
             return Ok(None);
         }
@@ -1925,12 +1994,15 @@ impl Accounts {
         access: DirectoryAccess<'_>,
         path: &[String],
     ) -> Result<DirectorySnapshot, AccountError> {
-        let (binding, parent_id, publication) = match access {
-            DirectoryAccess::Cli(binding) => (binding, None, DirectorySnapshotPublication::Cli),
-            DirectoryAccess::Mount(binding, parent_id) => (
+        let (binding, parent_id, publication, browse_epoch) = match access {
+            DirectoryAccess::Cli(binding) => {
+                (binding, None, DirectorySnapshotPublication::Cli, None)
+            }
+            DirectoryAccess::Mount(binding, parent_id, browse_epoch) => (
                 binding,
                 Some(parent_id),
                 DirectorySnapshotPublication::Mount,
+                browse_epoch,
             ),
         };
         let cli = matches!(publication, DirectorySnapshotPublication::Cli);
@@ -1986,13 +2058,24 @@ impl Accounts {
                     } else {
                         None
                     };
-                    let saved = offline::save_directory_snapshot(
-                        observation,
-                        session.base.as_str(),
-                        space,
-                        path,
-                        &entries,
-                    );
+                    let saved = if let Some(epoch) = browse_epoch {
+                        offline::save_mount_browse_snapshot(
+                            observation,
+                            session.base.as_str(),
+                            space,
+                            path,
+                            &entries,
+                            epoch,
+                        )
+                    } else {
+                        offline::save_directory_snapshot(
+                            observation,
+                            session.base.as_str(),
+                            space,
+                            path,
+                            &entries,
+                        )
+                    };
                     #[cfg(feature = "fault-injection")]
                     if cli
                         && saved.as_ref().is_err_and(|error| error.storage_busy)
@@ -7197,6 +7280,7 @@ pub struct AccountError {
     dav_properties: Option<(u16, Vec<&'static str>)>,
     yielded: bool,
     retryable_read: bool,
+    retry_after: Option<Duration>,
     storage_busy: bool,
 }
 impl AccountError {
@@ -7237,6 +7321,15 @@ impl AccountError {
         self.message == "directory metadata changed concurrently; retry"
     }
 
+    /// Whether a definitive DAV result invalidates a previously bound directory.
+    pub fn is_directory_binding_lost(&self) -> bool {
+        self.unauthorized
+            || matches!(
+                self.message,
+                "directory access denied or resource removed" | "directory parent identity changed"
+            )
+    }
+
     fn new(message: &'static str) -> Self {
         Self {
             message,
@@ -7246,6 +7339,7 @@ impl AccountError {
             dav_properties: None,
             yielded: false,
             retryable_read: false,
+            retry_after: None,
             storage_busy: false,
         }
     }
@@ -7269,6 +7363,7 @@ impl AccountError {
             dav_properties: None,
             yielded: false,
             retryable_read: false,
+            retry_after: None,
             storage_busy: false,
         }
     }
@@ -7298,6 +7393,7 @@ impl AccountError {
             dav_properties: None,
             yielded: false,
             retryable_read: false,
+            retry_after: None,
             storage_busy: false,
         }
     }

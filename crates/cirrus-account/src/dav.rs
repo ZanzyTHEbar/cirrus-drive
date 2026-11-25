@@ -15,6 +15,7 @@ mod listing;
 // consumers. FUSE also has an independent 16,384-live-inode mount limit.
 pub(crate) const MAX_ENTRIES: usize = 16_383;
 pub(crate) const MAX_METADATA: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_PATH_DEPTH: usize = 128;
 const REQUEST: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getetag/><oc:fileid/><oc:checksums/></d:prop></d:propfind>"#;
 
 struct Checksum(String);
@@ -272,7 +273,10 @@ pub(crate) fn directory_snapshot_timed_in(
     client: &Client,
     timeout: std::time::Duration,
 ) -> Result<DirectorySnapshot, AccountError> {
-    if !valid_segment(space) || path.len() > 128 || path.iter().any(|part| !valid_segment(part)) {
+    if !valid_segment(space)
+        || path.len() > MAX_PATH_DEPTH
+        || path.iter().any(|part| !valid_segment(part))
+    {
         return Err(AccountError::new("invalid Space path"));
     }
     let mut url = base
@@ -309,10 +313,20 @@ pub(crate) fn directory_snapshot_timed_in(
         return Err(AccountError::unauthorized());
     }
     if response.status().as_u16() != 207 {
-        if matches!(response.status().as_u16(), 408 | 425 | 429 | 503) {
-            return Err(AccountError::retryable_read(
-                "directory service temporarily unavailable",
+        if matches!(response.status().as_u16(), 403 | 404 | 410) {
+            return Err(AccountError::new(
+                "directory access denied or resource removed",
             ));
+        }
+        if matches!(response.status().as_u16(), 408 | 425 | 429 | 503) {
+            let mut error =
+                AccountError::retryable_read("directory service temporarily unavailable");
+            error.retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(crate::http::retry_after);
+            return Err(error);
         }
         return Err(AccountError::new(
             "directory request did not return a DAV multistatus",

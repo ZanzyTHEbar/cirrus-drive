@@ -548,6 +548,8 @@ mod tests {
         let conn = offline::database_in(&root).unwrap();
         conn.execute_batch(
             "BEGIN IMMEDIATE; DROP TABLE fp_requests; DROP TABLE fp_deletions;
+             ALTER TABLE snapshots DROP COLUMN browse_epoch;
+             ALTER TABLE snapshots DROP COLUMN browse_at;
              PRAGMA user_version=18; COMMIT;",
         )
         .unwrap();

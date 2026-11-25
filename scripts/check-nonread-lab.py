@@ -3,6 +3,8 @@
 
 Requires a built daemon, dbus-run-session, GNOME Keyring, secret-tool, gdbus,
 OpenSSL and FUSE. No real accounts or remote writes.
+
+Use --browse-cache for the mounted metadata prefetch and refresh scenario.
 """
 
 import json
@@ -94,6 +96,7 @@ def child(root):
     session_buses = {}
     mountpoint = Path(os.environ["CIRRUS_LAB_MOUNT"])
     runtime_root = Path(os.environ["CIRRUS_LAB_RUNTIME"])
+    browse_only = os.environ.get("CIRRUS_LAB_BROWSE") == "1"
     state = {"lock_on_refresh": True, "dir_name": "folder", "dir_id": "folder-1",
              "file_present": True, "refreshes": 0, "bulk": None, "dav_error": False,
              "crash_refresh": False, "content": b"abcdefg" * 30000,
@@ -104,7 +107,12 @@ def child(root):
              "access_token": "lab-access-rotated", "reject_old_access": False, "reject_second_access": False,
              "reject_propfind_token": None, "reject_range_token": None, "reject_range_barrier": None,
              "allow_second_refresh": False, "second_space": False, "other_dav_requests": 0,
-             "other_space_name": "Other"}
+             "other_space_name": "Other", "extra_child": False}
+    dav_paths = []
+    wide = [f"extra-{i:02d}" for i in range(70)] if browse_only else []
+    wide_paths = {f"/dav/spaces/space/{name}/": name for name in wide}
+    dav_parallel = [0, 0]
+    dav_gate = threading.Lock()
     refresh_entered = threading.Event()
     refresh_continue = threading.Event()
     range_entered = threading.Event()
@@ -289,6 +297,15 @@ def child(root):
                 self.send_error(401)
                 return
             path = urlsplit(self.path).path
+            if browse_only:
+                dav_paths.append(path)
+            if path in wide_paths:
+                with dav_gate:
+                    dav_parallel[0] += 1
+                    dav_parallel[1] = max(dav_parallel)
+                time.sleep(0.06)
+                with dav_gate:
+                    dav_parallel[0] -= 1
             if path.startswith("/dav/spaces/other-space/"):
                 state["other_dav_requests"] += 1
             base = "/dav/spaces/space/"
@@ -306,8 +323,19 @@ def child(root):
                     rows.append((base + state["dir_name"] + "/", True, state["dir_id"]))
                     if state["file_present"]:
                         rows.append((base + "item.txt", False, "file-1"))
+                    rows.extend((base + name + "/", True, name) for name in wide)
             elif path == base + state["dir_name"] + "/":
                 rows = [(path, True, state["dir_id"]), (path + "child.txt", False, "child-1")]
+                if browse_only:
+                    rows.append((path + "branch/", True, "branch"))
+                if state["extra_child"]:
+                    rows.append((path + "remote-new", False, "extra-1"))
+            elif browse_only and path == base + "folder/branch/":
+                rows = [(path, True, "branch"), (path + "leaf/", True, "leaf")]
+            elif browse_only and path == base + "folder/branch/leaf/":
+                rows = [(path, True, "leaf"), (path + "deep.txt", False, "deep-file")]
+            elif path in wide_paths:
+                rows = [(path, True, wide_paths[path])]
             else:
                 self.send_error(404)
                 return
@@ -315,8 +343,12 @@ def child(root):
             for href, directory, resource_id in rows:
                 kind = "<d:collection/>" if directory else ""
                 size = "" if directory else f"<d:getcontentlength>{len(state['content']) if resource_id == 'file-1' else len(b'other Space content') if resource_id == 'other-file' else 7}</d:getcontentlength>"
-                etag = (f"<d:getetag>{escape(state['etag'])}</d:getetag>"
-                        if not directory and state["etag_present"] else "")
+                if directory:
+                    etag = f'<d:getetag>"{escape(resource_id)}-etag"</d:getetag>'
+                elif state["etag_present"]:
+                    etag = f"<d:getetag>{escape(state['etag'])}</d:getetag>"
+                else:
+                    etag = ""
                 checksum = (state["checksum_override"] or
                             "SHA1:" + hashlib.sha1(state["content"]).hexdigest())
                 checksums = (f"<oc:checksums><oc:checksum>{checksum}</oc:checksum></oc:checksums>"
@@ -362,9 +394,83 @@ def child(root):
         account = dict(instance=url, issuer=url + "issuer", client_id="lab", token_endpoint=url + "token",
                        subject="lab", ca_pem=(root / "ca.pem").read_text(), access_token="lab-access",
                        refresh_token="lab-refresh", expires_at=0, refresh_in_progress=False)
+        if browse_only:
+            account.update(access_token=state["access_token"], expires_at=int(time.time()) + 3600)
         require(run(["secret-tool", "store", "--label=cirrus-lab", "application", "cirrus-drive",
                      "instance", url], input=json.dumps(account)), "saving disposable account")
         start_daemon("one")
+        if browse_only:
+            def wait_for(predicate, message, timeout):
+                deadline = time.monotonic() + timeout
+                while not predicate():
+                    assert time.monotonic() < deadline, (message, dav_paths)
+                    time.sleep(0.05)
+
+            def publications():
+                prefix = "cirrus lab background directory published:"
+                return [line for line in (root / "one-daemon.log").read_text().splitlines()
+                        if line.startswith(prefix)]
+
+            base = "/dav/spaces/space/"
+            folder = mountpoint / "folder"
+            leaf = folder / "branch" / "leaf"
+            database = runtime_root / "home/.local/state/cirrus-drive/state.db"
+            expected_dirs = {(name,) for name in wide} | {("folder",), ("folder", "branch"), ("folder", "branch", "leaf")}
+
+            def durable_paths():
+                with sqlite3.connect(database) as db:
+                    return {tuple(json.loads(path)) for path, in db.execute(
+                        "SELECT path FROM snapshots WHERE space='space' AND browse_epoch IS NOT NULL")}
+
+            started = time.monotonic()
+            require(cli("one", "--mount-space", url, "space", mountpoint), "mounting browse fixture")
+            wait_for(lambda: expected_dirs <= durable_paths(), "unopened tree was not durably warmed", 25)
+            elapsed = time.monotonic() - started
+            assert dav_paths.count(base) == 1, dav_paths
+            assert len(dav_paths) == len(expected_dirs) + 1, dav_paths
+            assert dav_parallel[1] >= 2, "metadata requests did not overlap"
+            print(f"PASS: {len(expected_dirs)} unopened directories persisted in {elapsed:.2f}s, "
+                  f"peak {dav_parallel[1]} concurrent DAV requests; root fetched once", flush=True)
+            baseline = len(dav_paths)
+            assert (leaf / "deep.txt").stat().st_size == 7
+            for name in wide:
+                assert os.listdir(mountpoint / name) == []
+            assert os.listdir(leaf) == ["deep.txt"], "evicted deep view did not reload"
+            with_directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                child_publication = f"cirrus lab background directory published: ino={folder.stat().st_ino}"
+                for _ in range(2):
+                    assert require(run(["ls", "-a", folder]), "listing prefetched folder").stdout.splitlines() == [
+                        ".", "..", "branch", "child.txt"]
+                    assert folder.stat().st_ino == os.fstat(with_directory).st_ino
+                    assert (folder / "child.txt").stat().st_size == 7
+                    paths = require(run(["find", folder, "-type", "f"]), "walking warm namespace").stdout.splitlines()
+                    assert set(paths) == {str(folder / "child.txt"), str(leaf / "deep.txt")}
+                    assert not (folder / "remote-new").exists()
+                    time.sleep(2.2)
+                assert len(dav_paths) == baseline, ("warm browse sent DAV", dav_paths)
+                print("PASS: deep lookup, >64-directory eviction/reload and repeated ls/stat/find used zero DAV", flush=True)
+                assert set(os.listdir(folder)) == {"branch", "child.txt"}
+                state["extra_child"] = True
+                wait_for(lambda: child_publication in publications(),
+                         "remote change was not published without foreground browse", 45)
+                assert dav_paths.count(base + "folder/") == 2, dav_paths
+                baseline = len(dav_paths)
+                assert set(os.listdir(with_directory)) == {"branch", "child.txt"}
+                assert set(os.listdir(folder)) == {"branch", "child.txt", "remote-new"}
+                assert (folder / "remote-new").stat().st_size == 7
+                assert len(dav_paths) == baseline, ("new view sent foreground DAV", dav_paths)
+            finally:
+                os.close(with_directory)
+            (folder / "local-edit").write_bytes(b"local bytes")
+            assert (folder / "local-edit").stat().st_size == 11
+            assert "local-edit" in os.listdir(folder)
+            assert len(dav_paths) > baseline, "namespace mutation did not demand fresh metadata"
+            print("PASS: remote addition published in background, old handle stayed stable, local edit visible", flush=True)
+            require(cli("one", "--unmount-space", url, "space"), "unmounting browse fixture")
+            require(cli("one", "--stop"), "stopping browse fixture daemon")
+            daemons["one"].wait(timeout=5)
+            return
         start_daemon("two")
         marker_dir = runtime_root / "home" / ".local" / "state" / "cirrus-drive"
         for directory in (marker_dir.parent.parent, marker_dir.parent, marker_dir):
@@ -501,15 +607,21 @@ def child(root):
         (unsafe / "keep").write_text("unrelated")
         assert cli("one", "--mount-space", url, "space", unsafe).returncode != 0
         assert (unsafe / "keep").read_text() == "unrelated"
+        propfinds_before = state["propfind_requests"]
         require(cli("one", "--mount-space", url, "space", mountpoint), "mounting disposable metadata fixture")
+        assert state["propfind_requests"] > propfinds_before, "fixture mount did not reach DAV"
         mounted_rows = [json.loads(line) for line in require(cli("one", "--mounts"), "mount status").stdout.splitlines()]
         assert [(row["instance"], row["space_id"], row["path"], row["state"]) for row in mounted_rows] == [
             (url, "space", str(mountpoint), "Mounted")]
-        # The bound mount still reaches DAV when Graph omits its ID, unlike a new explicit request.
+        # The mount can reuse its validated root even when a new Graph listing omits its ID.
         state["space_visible"] = False
         propfinds_before = state["propfind_requests"]
         assert set(os.listdir(mountpoint)) == {"folder", "item.txt"}
-        assert state["propfind_requests"] > propfinds_before, "fixture must still allow DAV"
+        assert state["propfind_requests"] == propfinds_before, "mount did not reuse root preflight"
+        require(cli("one", "--spaces", url), "listing Graph after the mounted Space disappears")
+        propfinds_before = state["propfind_requests"]
+        assert set(os.listdir(mountpoint)) == {"folder", "item.txt"}
+        assert state["propfind_requests"] > propfinds_before, "bound mount could not revalidate directly with DAV"
         state["space_visible"] = True
         # Explicitly browse B in the mounted daemon; A's reads and mutations must stay bound to A.
         state["second_space"] = True
@@ -943,6 +1055,11 @@ def child(root):
         else:
             raise AssertionError("unsupported rename unexpectedly succeeded")
         print("PASS: range reads, overlapping read-ahead, speculative failure retry, seek, EOF, mutation, reopen and invalid responses", flush=True)
+        def invalidate_view():
+            # These cases exercise fresh FUSE publication/error handling rather
+            # than waiting for each external change to reach the browse cache.
+            require(cli("one", "--spaces", url), "invalidating mount metadata for the next scan")
+
         old_fd = os.open(mountpoint / "folder", os.O_RDONLY | os.O_DIRECTORY)
         snapshot_fd = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -950,6 +1067,7 @@ def child(root):
             old_ino = os.stat(mountpoint / "folder").st_ino
             state["dir_name"] = "renamed"
             state["file_present"] = False
+            invalidate_view()
             assert set(os.listdir(mountpoint)) == {"renamed"}
             assert set(os.listdir(snapshot_fd)) == {"folder", "item.txt"}
             assert os.stat(mountpoint / "renamed").st_ino != old_ino
@@ -962,12 +1080,14 @@ def child(root):
             assert os.listdir(mountpoint / "renamed") == ["child.txt"]
             previous = os.stat(mountpoint / "renamed").st_ino
             state["dir_id"] = "folder-2"
+            invalidate_view()
             assert os.stat(mountpoint / "renamed").st_ino != previous
         finally:
             os.close(old_fd)
             os.close(snapshot_fd)
         for reserved in ("cirrus-dir:1", "cirrus-staged:1"):
             state["dir_id"] = reserved
+            invalidate_view()
             try:
                 os.listdir(mountpoint)
             except OSError as error:
@@ -977,6 +1097,7 @@ def child(root):
         state["dir_id"] = "folder-2"
         assert os.listdir(mountpoint) == ["renamed"]
         state["dav_error"] = True
+        invalidate_view()
         try:
             os.listdir(mountpoint)
         except OSError:
@@ -986,8 +1107,10 @@ def child(root):
         state["dav_error"] = False
         for generation in range(18):
             state["bulk"] = generation
+            invalidate_view()
             assert len(os.listdir(mountpoint)) == 1000
         state["bulk"] = None
+        invalidate_view()
         assert os.listdir(mountpoint) == ["renamed"]
         require(cli("one", "--unmount-space", url, "space"), "normal unmount")
         assert not list((runtime_root / "one").glob("cirrus-drive.mount-*"))
@@ -1186,15 +1309,16 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--child":
         child(Path(sys.argv[2]))
         return
-    if not BINARY.is_file() or not service_binary().is_file() or not UI.is_file():
+    browse_only = sys.argv[1:] == ["--browse-cache"]
+    if not BINARY.is_file() or not service_binary().is_file() or (not browse_only and not UI.is_file()):
         raise SystemExit("build first: cargo build --workspace --locked")
     check_lab_binaries(BINARY.parent)
-    if sys.argv[1:] not in ([], ["--fault-injection"]):
-        raise SystemExit("usage: check-nonread-lab.py [--fault-injection]")
+    if sys.argv[1:] not in ([], ["--fault-injection"], ["--browse-cache"]):
+        raise SystemExit("usage: check-nonread-lab.py [--fault-injection | --browse-cache]")
     # The runtime requires O_TMPFILE, which is unavailable on some project filesystems.
     root = Path(tempfile.mkdtemp(prefix="cirrus-read-lab-"))
     os.chmod(root, 0o700)
-    runtime_root = Path(tempfile.mkdtemp(prefix="cdr-fixture-", dir="/dev/shm"))
+    runtime_root = Path(tempfile.mkdtemp(prefix="cdr-", dir=None if browse_only else "/dev/shm"))
     mountpoint = root / "mount"
     for name in ("data", "config", "mount"):
         (root / name).mkdir(mode=0o700)
@@ -1211,12 +1335,16 @@ def main():
     env.pop("DBUS_SESSION_BUS_PID", None)
     env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
+    if browse_only:
+        env.pop("CIRRUS_TEST_AUTO_SYNC", None)
+        env.update(CIRRUS_LAB_BROWSE="1", CIRRUS_TEST_NAMESPACE_POLL="1")
     if sys.argv[1:] == ["--fault-injection"]:
         env["CIRRUS_LAB_FAULT"] = "1"
     try:
         shutil.copy2(BINARY, root / "cirrus-daemon")
         shutil.copy2(service_binary(), root / "cirrus-drive-service")
-        shutil.copy2(UI, root / "cirrus-ui")
+        if not browse_only:
+            shutil.copy2(UI, root / "cirrus-ui")
         check_lab_binaries(root)
         config = root / "user-bus.conf"
         config.write_text('<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN" '

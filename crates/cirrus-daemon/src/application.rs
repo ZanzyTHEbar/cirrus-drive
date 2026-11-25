@@ -826,7 +826,11 @@ impl Application {
                     unreachable!("status is handled before spawning")
                 }
             };
-            accounts.invalidate_mount_metadata();
+            // Successful mounts don't change the journal or principal of a
+            // published binding. Keep the new mount's preflight view usable.
+            if !matches!(&result, Ok(AccountReply::Mounted(_))) {
+                accounts.invalidate_mount_metadata();
+            }
             drop(sign_in_guard);
             // Release account admission before replying as before, but
             // keep the reply counted until its bounded write finishes.

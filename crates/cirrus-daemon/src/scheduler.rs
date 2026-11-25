@@ -23,6 +23,7 @@ struct Control {
 
 pub(crate) struct Scheduler {
     control: Arc<Control>,
+    automatic: bool,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -93,7 +94,7 @@ impl Scheduler {
         accounts: Arc<Accounts>,
         busy: Arc<AtomicBool>,
         mounts: Arc<Mutex<crate::application::MountRegistry>>,
-        enabled: bool,
+        automatic: bool,
     ) -> io::Result<Self> {
         let control = Arc::new(Control {
             accounts,
@@ -105,18 +106,22 @@ impl Scheduler {
             wake: Condvar::new(),
             sleep: Mutex::new(()),
         });
-        if !enabled {
-            return Ok(Self {
-                control,
-                thread: None,
-            });
-        }
-        // Existing fault scenarios deliberately inspect manual-sync boundaries.
-        // This switch is absent from normal binaries and never reads real homes.
+        // Most fault scenarios explicitly control remote observation timing.
         #[cfg(feature = "fault-injection")]
-        if std::env::var("CIRRUS_TEST_AUTO_SYNC").ok().as_deref() != Some("1") {
+        let automatic = automatic && std::env::var("CIRRUS_TEST_AUTO_SYNC").as_deref() == Ok("1");
+        #[cfg(feature = "fault-injection")]
+        let namespace_refresh =
+            automatic || std::env::var_os("CIRRUS_TEST_NAMESPACE_POLL").is_some();
+        #[cfg(not(feature = "fault-injection"))]
+        let namespace_refresh = true;
+        #[cfg(feature = "fault-injection")]
+        let warm_mounts = std::env::var_os("CIRRUS_LAB_BROWSE").is_some();
+        #[cfg(not(feature = "fault-injection"))]
+        let warm_mounts = true;
+        if !namespace_refresh {
             return Ok(Self {
                 control,
+                automatic,
                 thread: None,
             });
         }
@@ -128,6 +133,7 @@ impl Scheduler {
                 let mut leader: Option<cirrus_account::SchedulerGuard> = None;
                 let mut refreshed = Instant::now();
                 let mut mount_after = 0;
+                let mut walk_after = 0;
                 #[cfg(feature = "fault-injection")]
                 let mut diagnostic_events = 0;
                 loop {
@@ -135,7 +141,8 @@ impl Scheduler {
                     if worker.stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    if !worker.paused.load(Ordering::Acquire)
+                    if automatic
+                        && !worker.paused.load(Ordering::Acquire)
                         && worker.pending.load(Ordering::Acquire) == 0
                     {
                         // This preflight only avoids idle elections. Once elected,
@@ -238,7 +245,7 @@ impl Scheduler {
                             progressed = false;
                         }
                     }
-                    // One cached/viewed directory from one mount, outside the
+                    // One refresh or prefetch from one mount, outside the
                     // mount-management lock. Refresh is process-local: the
                     // global transfer leader cannot see another daemon's mounts.
                     // Keep local foreground-first admission, but do not require
@@ -283,10 +290,42 @@ impl Scheduler {
                             }
                         }
                     }
+                    let mut walked = false;
+                    if warm_mounts
+                        && !worker.accounts.background_yield_requested()
+                        && !worker.stopping.load(Ordering::Acquire)
+                    {
+                        let handle = mounts.try_lock().ok().and_then(|mounts| {
+                            let mounts = mounts.ready().ok()?;
+                            (0..mounts.len()).find_map(|offset| {
+                                let index = (walk_after + offset) % mounts.len();
+                                let handle = mounts[index].namespace_refresh();
+                                handle.walk_ready().then(|| {
+                                    walk_after = index + 1;
+                                    handle
+                                })
+                            })
+                        });
+                        if let Some(handle) = handle {
+                            let admitted = {
+                                let _gate = worker.admission.lock().expect("account admission lock poisoned");
+                                worker.pending.load(Ordering::Acquire) == 0
+                                    && !worker.paused.load(Ordering::Acquire)
+                                    && worker.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                            };
+                            if admitted {
+                                let _permit = Background(Arc::clone(&worker));
+                                match handle.walk_batch() {
+                                    Ok(progress) => walked = progress,
+                                    Err(error) => eprintln!("mounted metadata walk deferred: {error}"),
+                                }
+                            }
+                        }
+                    }
                     // A useful bounded turn releases ownership, then immediately
                     // rechecks foreground admission and rotates to the next fair
                     // Space. No-progress, idle and backoff paths still sleep.
-                    if progressed {
+                    if progressed || walked {
                         thread::yield_now();
                         continue;
                     }
@@ -304,6 +343,7 @@ impl Scheduler {
             })?;
         Ok(Self {
             control,
+            automatic,
             thread: Some(thread),
         })
     }
@@ -338,7 +378,8 @@ impl Scheduler {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        !self.control.paused.load(Ordering::Acquire)
+        self.automatic
+            && !self.control.paused.load(Ordering::Acquire)
             && self
                 .thread
                 .as_ref()

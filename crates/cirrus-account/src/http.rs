@@ -145,18 +145,7 @@ pub(crate) fn space_page(
         }
         let delay = match response.headers().get(reqwest::header::RETRY_AFTER) {
             None => Some(Duration::from_millis(100 << attempt)),
-            Some(value) => value.to_str().ok().and_then(|value| {
-                let value = value.trim();
-                value
-                    .parse::<u64>()
-                    .ok()
-                    .map(Duration::from_secs)
-                    .or_else(|| {
-                        httpdate::parse_http_date(value)
-                            .ok()
-                            .map(|time| time.duration_since(SystemTime::now()).unwrap_or_default())
-                    })
-            }),
+            Some(value) => value.to_str().ok().and_then(retry_after),
         };
         let Some(delay) = delay.filter(|delay| *delay <= Duration::from_secs(2)) else {
             return Ok(response);
@@ -176,6 +165,19 @@ pub(crate) fn space_page(
         }
         attempt += 1;
     }
+}
+
+pub(crate) fn retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .map(|time| time.duration_since(SystemTime::now()).unwrap_or_default())
+        })
 }
 
 fn socket_unreachable(error: &reqwest::Error) -> bool {

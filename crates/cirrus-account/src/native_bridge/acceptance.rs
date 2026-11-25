@@ -113,7 +113,7 @@ unsafe extern "C" fn cirrus_retained_fixture(path_text: Text, out: *mut *mut c_v
                 .map_err(|_| UNAVAILABLE)?;
             // Product DDL, only retained identity/activation/observation data.
             conn.execute("INSERT INTO sync_spaces VALUES(?1,'space','issuer','subject','observed-idle',0,0,NULL,1,0,NULL)", [INSTANCE]).map_err(|_| UNAVAILABLE)?;
-            conn.execute("INSERT INTO snapshots VALUES(?1,'space','[]','[]',1,'root-id','\"root-etag\"',NULL,'issuer','subject')", [INSTANCE]).map_err(|_| UNAVAILABLE)?;
+            conn.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) VALUES(?1,'space','[]','[]',1,'root-id','\"root-etag\"',NULL,'issuer','subject')", [INSTANCE]).map_err(|_| UNAVAILABLE)?;
             drop(conn);
             let mut binding = core
                 .accounts
@@ -223,7 +223,7 @@ unsafe extern "C" fn cirrus_catalog_fixture(path_text: Text, out: *mut *mut c_vo
                 })
                 .collect();
             let json = serde_json::to_string(&entries).map_err(|_| INTERNAL)?;
-            tx.execute("INSERT INTO snapshots VALUES(?1,'space','[]',?2,1,'root-id','\"root-etag\"',NULL,'issuer','subject') ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries",params![INSTANCE,json]).map_err(|_|UNAVAILABLE)?;
+            tx.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) VALUES(?1,'space','[]',?2,1,'root-id','\"root-etag\"',NULL,'issuer','subject') ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries",params![INSTANCE,json]).map_err(|_|UNAVAILABLE)?;
             let version = FileVersion {
                 instance: INSTANCE.into(),
                 space: "space".into(),
@@ -310,7 +310,7 @@ unsafe extern "C" fn cirrus_catalog_move_observations(path_text: Text, moved: u8
                 ],
             )
             .map_err(|_| UNAVAILABLE)?;
-            tx.execute("INSERT INTO snapshots VALUES(?1,'space','[\"B\"]',?2,1,'catalog-directory-B',?3,NULL,'issuer','subject') ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries,self_etag=excluded.self_etag",
+            tx.execute("INSERT INTO snapshots(instance,space,path,entries,updated,self_id,self_etag,local_operation,issuer,subject) VALUES(?1,'space','[\"B\"]',?2,1,'catalog-directory-B',?3,NULL,'issuer','subject') ON CONFLICT(instance,space,path) DO UPDATE SET entries=excluded.entries,self_etag=excluded.self_etag",
                 params![INSTANCE,serde_json::to_string(&children).map_err(|_|INTERNAL)?,if moved==0 {"\"b1\""}else{"\"b2\""}]).map_err(|_|UNAVAILABLE)?;
             if moved != 0 {
                 // Real persisted exact-version bytes now live at the observed
