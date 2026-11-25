@@ -618,15 +618,7 @@ pub(crate) fn read_range(
     Ok(body)
 }
 
-pub(crate) fn put_file(
-    base: &Url,
-    space: &str,
-    path: &[String],
-    token: &str,
-    client: &Client,
-    body: reqwest::blocking::Body,
-    etag: Option<&str>,
-) -> Result<reqwest::StatusCode, AccountError> {
+fn mutation_target(base: &Url, space: &str, path: &[String]) -> Result<Url, AccountError> {
     if !valid_segment(space)
         || path.is_empty()
         || path.len() > 128
@@ -646,6 +638,19 @@ pub(crate) fn put_file(
             parts.push(part);
         }
     }
+    Ok(url)
+}
+
+pub(crate) fn put_file(
+    base: &Url,
+    space: &str,
+    path: &[String],
+    token: &str,
+    client: &Client,
+    body: reqwest::blocking::Body,
+    etag: Option<&str>,
+) -> Result<reqwest::StatusCode, AccountError> {
+    let url = mutation_target(base, space, path)?;
     let mut request = client
         .put(url)
         .bearer_auth(token)
@@ -671,25 +676,7 @@ pub(crate) fn namespace_request(
     mkdir: bool,
     etag: Option<&str>,
 ) -> Result<reqwest::StatusCode, AccountError> {
-    if !valid_segment(space)
-        || path.is_empty()
-        || path.len() > 128
-        || path.iter().any(|part| !valid_segment(part))
-    {
-        return Err(AccountError::new("invalid Space path"));
-    }
-    let mut url = base
-        .join("/dav/spaces/")
-        .map_err(|_| AccountError::new("invalid instance URL"))?;
-    {
-        let mut parts = url
-            .path_segments_mut()
-            .map_err(|_| AccountError::new("invalid instance URL"))?;
-        parts.pop_if_empty().push(space);
-        for part in path {
-            parts.push(part);
-        }
-    }
+    let url = mutation_target(base, space, path)?;
     let method = if mkdir {
         reqwest::Method::from_bytes(b"MKCOL")
             .map_err(|_| AccountError::new("cannot prepare DAV request"))?
@@ -720,30 +707,8 @@ pub(crate) fn move_directory(
     etag: &str,
     replace: bool,
 ) -> Result<reqwest::StatusCode, AccountError> {
-    let build = |path: &[String]| -> Result<Url, AccountError> {
-        if !valid_segment(space)
-            || path.is_empty()
-            || path.len() > 128
-            || path.iter().any(|part| !valid_segment(part))
-        {
-            return Err(AccountError::new("invalid Space path"));
-        }
-        let mut url = base
-            .join("/dav/spaces/")
-            .map_err(|_| AccountError::new("invalid instance URL"))?;
-        {
-            let mut parts = url
-                .path_segments_mut()
-                .map_err(|_| AccountError::new("invalid instance URL"))?;
-            parts.pop_if_empty().push(space);
-            for part in path {
-                parts.push(part);
-            }
-        }
-        Ok(url)
-    };
-    let source = build(paths.0)?;
-    let destination = build(paths.1)?;
+    let source = mutation_target(base, space, paths.0)?;
+    let destination = mutation_target(base, space, paths.1)?;
     let method = reqwest::Method::from_bytes(b"MOVE")
         .map_err(|_| AccountError::new("cannot prepare DAV request"))?;
     client
@@ -755,4 +720,30 @@ pub(crate) fn move_directory(
         .send()
         .map(|response| response.status())
         .map_err(|error| AccountError::request("directory move outcome is uncertain", &error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Url, mutation_target};
+
+    #[test]
+    fn mutation_target_encodes_segments_and_rejects_invalid_depth() {
+        let base = Url::parse("https://example.invalid:8443/ignored/base?query#fragment").unwrap();
+        let path = ["deep dir".to_owned(), "雪%2F".to_owned()];
+        assert_eq!(
+            mutation_target(&base, "space id", &path).unwrap().as_str(),
+            "https://example.invalid:8443/dav/spaces/space%20id/deep%20dir/%E9%9B%AA%252F"
+        );
+
+        let too_deep = vec!["dir".to_owned(); 129];
+        for path in [&[][..], too_deep.as_slice()] {
+            let error = mutation_target(&base, "space id", path).unwrap_err();
+            assert_eq!(
+                error.message,
+                "invalid Space path",
+                "path depth: {}",
+                path.len()
+            );
+        }
+    }
 }

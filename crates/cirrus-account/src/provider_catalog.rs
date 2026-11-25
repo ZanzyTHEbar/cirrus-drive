@@ -292,41 +292,6 @@ impl Catalog {
         Ok(catalog)
     }
 
-    pub fn open(binding: &MountBinding, domain: &str) -> Result<Self> {
-        if !safe(domain) || !binding.offline {
-            return Err(Error::Unavailable);
-        }
-        let mut conn = offline::database_in(&binding.root)?;
-        let reservation = Self::reserve(&binding.root, &conn, 16384)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // One configured OS domain per retained principal/Space, even if an
-        // external configuration mistakenly supplies a second domain identifier.
-        let duplicate: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM fp_domains WHERE instance=?1 AND issuer=?2 AND subject=?3 AND space=?4 AND domain<>?5)",
-            params![binding.instance,binding.issuer,binding.subject,binding.space,domain],|r|r.get(0))?;
-        if duplicate {
-            return Err(Error::Unavailable);
-        }
-        offline::offline_directory_in(
-            &binding.root,
-            &tx,
-            &binding.instance,
-            &binding.space,
-            &[],
-            Some((&binding.issuer, &binding.subject)),
-        )?;
-        let epoch = Self::initialize(binding, domain, &tx)?;
-        if let Some(reservation) = &reservation {
-            reservation.validate(&tx)?;
-        }
-        tx.commit()?;
-        Ok(Self {
-            binding: binding.clone(),
-            domain: domain.into(),
-            epoch,
-        })
-    }
-
     fn initialize(binding: &MountBinding, domain: &str, tx: &Connection) -> Result<String> {
         let old: Option<(String, String, String, String, String)> = tx
             .query_row(

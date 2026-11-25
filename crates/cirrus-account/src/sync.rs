@@ -7,7 +7,6 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 
 use crate::account_storage::StorageRoot;
 use crate::{
@@ -127,56 +126,7 @@ impl Drop for ForegroundPriority {
 }
 
 /// Current local scheduling observation, never a global or remote cleanliness claim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncPhase {
-    Queued,
-    Uploading,
-    Verifying,
-    Retry,
-    Attention,
-    ObservedIdle,
-}
-
-/// Bounded local-only status for one persistently activated immutable Space.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SyncStatus {
-    /// Canonical instance URL for this observation.
-    pub instance: String,
-    /// Immutable Space ID, independent of selection.
-    pub space: String,
-    /// Whether a verified mount durably activated this Space.
-    pub activated: bool,
-    /// Whether the responding daemon runs its automatic worker; absent in account-only calls.
-    pub worker_enabled_here: Option<bool>,
-    /// Current local scheduling observation, not remote reconciliation status.
-    pub phase: SyncPhase,
-    /// Pending journal operations, including dependency waiters.
-    pub queued: u64,
-    /// Live PUTs owned by this daemon; other-daemon unconfirmed PUTs stay conservative.
-    pub uploading: u64,
-    /// Successful mutation receipts awaiting read-only verification.
-    pub verifying: u64,
-    /// Unknown mutation outcomes without a successful receipt.
-    pub uncertain: u64,
-    /// Journaled conflicts requiring inspection.
-    pub conflicts: u64,
-    /// Invalid journal entries or missing/mismatched local activation identity.
-    pub damaged: u64,
-    /// Consecutive safe-read/local-capacity retry attempts, capped at 16.
-    pub retry_attempt: u32,
-    /// Earliest admitted retry, in Unix seconds; an expired value is not proof it ran.
-    pub next_attempt: Option<i64>,
-    /// Safe-to-display reason; scheduler policy never parses this string.
-    pub cause: Option<String>,
-    /// Unix seconds of the most recently verified journal operation, historical only.
-    pub last_verified: Option<i64>,
-    /// Highest currently observed journal ID in this Space.
-    pub high_water: i64,
-    /// Journal ID observed through a locally idle pass, not a remote consistency watermark.
-    pub verified_through: i64,
-    /// Local unresolved work or journal growth since that idle observation.
-    pub new_work: bool,
-}
+pub use cirrus_api::{SyncPhase, SyncStatus};
 
 pub(crate) fn now() -> Result<i64, AccountError> {
     SystemTime::now()
@@ -303,7 +253,12 @@ impl Accounts {
     /// or new-row storage pressure. Commit/close failure has unknown outcome;
     /// inspect persisted status rather than assuming activation rolled back.
     pub fn activate_sync(&self, binding: &MountBinding) -> Result<(), AccountError> {
-        let session = self.read_session_in(&binding.root, &binding.instance)?;
+        // Activation is local; each remote turn still checks fresh membership.
+        let session = self.read_session_in(
+            &binding.root,
+            &binding.instance,
+            crate::SessionAccess::BoundSaved(binding),
+        )?;
         if binding.root.identity() != session.root.identity() {
             return Err(AccountError::new("mount storage root changed"));
         }

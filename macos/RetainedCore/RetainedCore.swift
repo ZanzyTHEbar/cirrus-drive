@@ -35,14 +35,6 @@ func withRetainedText<T>(_ string: String, _ body: (CirrusRetainedText) throws -
     }
 }
 
-func encodedPath(_ components: [String]) throws -> String {
-    guard components.count <= 128,
-          components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") }),
-          let text = String(data: try JSONEncoder().encode(components), encoding: .utf8),
-          text.utf8.count <= 16384 else { throw RetainedError.invalidABI }
-    return text
-}
-
 // Deliberately synchronous, non-Sendable, no actor/Dispatch scheduler: a serial
 // queue does not promise OS-thread affinity. Callers dedicate one OS thread.
 class RetainedHandle {
@@ -121,67 +113,6 @@ final class RetainedCore: RetainedHandle {
         }
         guard let raw else { throw RetainedError.internalFailure }
         self.init(taking: raw)
-    }
-    func bind(instance: String, space: String) throws -> RetainedBinding {
-        onOwnerThread()
-        var result: UnsafeMutableRawPointer?
-        try withRetainedText(instance) { instance in
-            try withRetainedText(space) { try checked(cirrus_retained_bind(raw, instance, $0, &result)) }
-        }
-        guard let result else { throw RetainedError.internalFailure }
-        return RetainedBinding(taking: result)
-    }
-}
-
-struct RetainedEntry: Decodable, Sendable {
-    let cookie: UInt64
-    let name: String
-    let id: String
-    let etag: String?
-    let size: UInt64?
-    let directory: Bool
-}
-
-final class RetainedBinding: RetainedHandle {
-    func enumerate(_ path: [String], request: RetainedRequest) throws -> RetainedListing {
-        onOwnerThread()
-        var result: UnsafeMutableRawPointer?
-        try withRetainedText(try encodedPath(path)) {
-            try checked(cirrus_retained_list(raw, $0, request.raw, &result))
-        }
-        guard let result else { throw RetainedError.internalFailure }
-        return RetainedListing(taking: result)
-    }
-    func open(_ path: [String], entry: RetainedEntry, request: RetainedRequest) throws -> RetainedVersion {
-        onOwnerThread()
-        guard !entry.directory, let size = entry.size, let etag = entry.etag else {
-            throw RetainedError.unavailable
-        }
-        var result: UnsafeMutableRawPointer?
-        try withRetainedText(try encodedPath(path)) { path in
-            try withRetainedText(entry.id) { id in
-                try withRetainedText(etag) {
-                    try checked(cirrus_retained_version(raw, path, id, $0, size, request.raw, &result))
-                }
-            }
-        }
-        guard let result else { throw RetainedError.internalFailure }
-        return RetainedVersion(taking: result)
-    }
-}
-
-final class RetainedListing: RetainedHandle {
-    func page(after: UInt64, request: RetainedRequest) throws -> (entries: [RetainedEntry], next: UInt64) {
-        onOwnerThread()
-        var bytes = [UInt8](repeating: 0, count: Int(CIRRUS_RETAINED_PAGE_BYTES))
-        var written = 0
-        var next = after
-        try bytes.withUnsafeMutableBufferPointer {
-            try checked(cirrus_retained_page(raw, after, request.raw, $0.baseAddress, $0.count, &written, &next))
-        }
-        guard written >= 0, written <= bytes.count else { throw RetainedError.internalFailure }
-        // Only bounded metadata is copied into Data, never file content.
-        return (try JSONDecoder().decode([RetainedEntry].self, from: Data(bytes.prefix(written))), next)
     }
 }
 

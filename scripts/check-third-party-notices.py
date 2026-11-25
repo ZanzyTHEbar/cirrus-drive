@@ -27,7 +27,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent
 BUNDLE = ROOT / "LICENSES"
 TARGET = "x86_64-unknown-linux-gnu"
-ROOTS = {"cirrus-daemon", "cirrus-ui"}
+ROOTS = {"cirrus-cli", "cirrus-daemon", "cirrus-ui"}
 COMMAND = ["cargo", "metadata", "--offline", "--locked", "--format-version", "1",
            "--filter-platform", TARGET]
 NOTICE_NAME = re.compile(r"license|licence|copying|notice|copyright|unlicense", re.I)
@@ -183,7 +183,7 @@ def historical_native():
                 key = origin["package"] + "@" + origin["version"]
                 require(key in packages and packages[key]["copyright"] == document["file"], "native origin package reference mismatch")
     binaries = native["binaries"]
-    require(set(binaries) == ROOTS, "native binary identities changed")
+    require(set(binaries) == {"cirrus-daemon", "cirrus-ui"}, "historical native binary identities changed")
     static = {name: set() for name in binaries}
     for row in native["system_static_inputs"]:
         relative(row["file"], basename=True)

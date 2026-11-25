@@ -56,11 +56,64 @@ def upstream(container, method, path, body=b"", headers=()):
     return status, fields, payload
 
 
+def owned_mounts(result, instance, owned):
+    fixture.require(result, "listing owned lab mounts")
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    return [row for row in rows if row["instance"] == instance
+            and (row["space_id"], row["path"]) in owned]
+
+
+def cleanup_mounts(cli, daemon, daemon_dir, instance, owned):
+    try:
+        if owned and daemon and daemon.poll() is None:
+            for row in owned_mounts(cli("--mounts"), instance, owned):
+                if row["state"] == "Mounted":
+                    fixture.require(cli("--unmount-space", instance, row["space_id"]), "unmounting owned lab mount")
+                elif row["state"] == "RecoveryRequired":
+                    fixture.require(cli("--recover-mount", row["path"]), "recovering owned lab mount")
+                else:
+                    raise RuntimeError(f"unknown mount state at {row['path']}")
+    finally:
+        fixture.stop_process(daemon)
+    if not owned:
+        return
+    # The daemon's v3 record has a zero sentinel, not the live kernel mount ID.
+    # Never substitute the path or FUSE source for a missing stored ID.
+    rows = [line.split() for line in Path("/proc/self/mountinfo").read_text().splitlines()]
+
+    def escape(path):
+        return (path.replace("\\", "\\134").replace(" ", "\\040")
+                .replace("\t", "\\011").replace("\n", "\\012"))
+
+    for record_path in daemon_dir.glob("cirrus-drive.mount-*"):
+        record = json.loads(record_path.read_text())
+        if record["instance"] != instance or (record["space_id"], record["path"]) not in owned:
+            continue
+        path = record["path"]
+        at_path = [row for row in rows if row[4] == escape(path)]
+        source = record["source"]
+        at_source = [row for row in rows if row[row.index("-") + 2] == source]
+        if not at_path and not at_source:
+            continue
+        mount_id = record.get("mount_id")
+        if (type(mount_id) is not int or mount_id <= 0 or record.get("version") == 3
+                or len(at_path) != 1 or at_path != at_source or at_path[0][0] != str(mount_id)
+                or at_path[0][at_path[0].index("-") + 1] != "fuse.cirrus-drive"
+                or record["namespace"] != Path("/proc/self/ns/mnt").stat().st_ino
+                or record["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()):
+            raise RuntimeError(f"cannot verify the stored mount identity at {path}; leaving it untouched")
+        raise RuntimeError(f"unsupported owner record version at {path}; leaving it untouched")
+    owned_paths = {escape(path) for _, path in owned}
+    if any(row[4] in owned_paths for row in rows):
+        raise RuntimeError("mount remains at a lab path without a verified owner record; leaving it untouched")
+
+
 def child(root, runtime, container):
     fixture.BINARY = root / "cirrus-daemon"
     keyring = daemon = server = thread = None
     mountpoint = root / "mount"
-    mounted = False
+    url = None
+    owned = set()
     range_requests = [0]
     propfind_requests = [0]
     deny_directory = [False]
@@ -150,11 +203,11 @@ def child(root, runtime, container):
         account = dict(instance=url, issuer=url + "issuer", client_id="lab", token_endpoint=url + "token",
                        subject="disposable-admin", ca_pem=(root / "ca.pem").read_text(),
                        access_token="cirrus-lab-token", refresh_token="unused-lab-token",
-                       expires_at=int(time.time()) + 3600, refresh_in_progress=False, selected_space=space)
+                       expires_at=int(time.time()) + 3600, refresh_in_progress=False)
         fixture.require(fixture.run(["secret-tool", "store", "--label=cirrus-opencloud-lab", "application",
                                     "cirrus-drive", "instance", url], input=json.dumps(account)), "saving lab account")
         with (root / "daemon.log").open("w") as log:
-            daemon = subprocess.Popen([str(fixture.BINARY)], env=os.environ, stdout=subprocess.DEVNULL, stderr=log)
+            daemon = subprocess.Popen([str(fixture.service_binary())], env=os.environ, stdout=subprocess.DEVNULL, stderr=log)
         for _ in range(150):
             if cli("--status").returncode == 0:
                 break
@@ -163,9 +216,8 @@ def child(root, runtime, container):
             time.sleep(0.02)
         else:
             raise RuntimeError("lab daemon did not start")
-        fixture.require(cli("--select-space", url, space), "selecting user-scoped lab Space")
-        fixture.require(cli("--mount", url, mountpoint), "mounting OpenCloud lab")
-        mounted = True
+        owned.add((space, str(mountpoint)))
+        fixture.require(cli("--mount-space", url, space, mountpoint), "mounting OpenCloud lab")
         local_folder = mountpoint / "listing-fixture"
         before = propfind_requests[0]
         started = time.monotonic()
@@ -211,30 +263,21 @@ def child(root, runtime, container):
             assert reader_process.wait(timeout=60) == 0, "OpenCloud FUSE read scenario failed"
         finally:
             fixture.stop_process(reader_process)
-        fixture.require(cli("--unmount"), "unmounting OpenCloud lab")
-        mounted = False
+        fixture.require(cli("--unmount-space", url, space), "unmounting OpenCloud lab")
         fixture.require(cli("--stop"), "stopping OpenCloud lab daemon")
         daemon.wait(timeout=5)
-        print("PASS: OpenCloud 9.0.0 FUSE read, cache, seek, EOF, mutation, EIO and reopen", flush=True)
     finally:
-        if mounted and daemon and daemon.poll() is None:
-            cli("--unmount")
-        fixture.stop_process(daemon)
-        for record_path in (runtime / "daemon").glob("cirrus-drive.mount-*"):
-            record = json.loads(record_path.read_text())
-            for line in Path("/proc/self/mountinfo").read_text().splitlines():
-                parts = line.split()
-                if ("-" in parts and parts[4] == str(mountpoint)
-                        and parts[parts.index("-") + 1:parts.index("-") + 3]
-                        == ["fuse.cirrus-drive", record.get("source")]):
-                    fixture.require(fixture.run(["fusermount3", "-u", "-z", "--", str(mountpoint)]), "cleaning lab mount")
-        if server and thread:
-            server.shutdown()
-        if server:
-            server.server_close()
-        if thread:
-            thread.join(timeout=5)
-        fixture.stop_process(keyring)
+        try:
+            cleanup_mounts(cli, daemon, runtime / "daemon", url, owned)
+        finally:
+            if server and thread:
+                server.shutdown()
+            if server:
+                server.server_close()
+            if thread:
+                thread.join(timeout=5)
+            fixture.stop_process(keyring)
+    print("PASS: OpenCloud 9.0.0 FUSE read, cache, seek, EOF, mutation, EIO and reopen", flush=True)
 
 
 def reader(file):
@@ -272,9 +315,7 @@ def main():
         return
     if sys.argv[1:]:
         raise SystemExit("usage: check-opencloud-read-lab.py")
-    capability = fixture.run([str(fixture.BINARY), "--lab-capabilities"])
-    if capability.returncode or capability.stdout.strip() != "cirrus-drive disposable account and mount lab v1":
-        raise SystemExit("build first: cargo build --locked -p cirrus-daemon --features fault-injection")
+    fixture.check_lab_binaries(fixture.BINARY.parent)
     version = docker("image", "inspect", IMAGE, "--format",
                      '{{index .Config.Labels "org.opencontainers.image.version"}}').decode().strip()
     if version != "9.0.0":
@@ -284,9 +325,8 @@ def main():
     container = None
     try:
         shutil.copy2(fixture.BINARY, root / "cirrus-daemon")
-        copied = fixture.run([str(root / "cirrus-daemon"), "--lab-capabilities"])
-        if copied.returncode or copied.stdout.strip() != "cirrus-drive disposable account and mount lab v1":
-            raise RuntimeError("copied daemon lacks disposable lab isolation")
+        shutil.copy2(fixture.service_binary(), root / "cirrus-drive-service")
+        fixture.check_lab_binaries(root)
         for name in ("data", "config", "mount", "tmp"):
             (root / name).mkdir(mode=0o700)
         for name in ("bus", "control", "home", "daemon"):

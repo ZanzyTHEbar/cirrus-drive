@@ -17,7 +17,7 @@ use core_foundation::{
 };
 use serde::Serialize;
 
-use crate::{Accounts, DirectorySnapshot, FileVersion, MountBinding, account_storage};
+use crate::{Accounts, FileVersion, MountBinding, account_storage};
 
 mod application;
 mod dispatcher;
@@ -130,9 +130,10 @@ struct Bound {
     core: Arc<Core>,
     binding: MountBinding,
 }
+#[cfg(test)]
 struct Listing {
     bound: Arc<Bound>,
-    snapshot: DirectorySnapshot,
+    snapshot: crate::DirectorySnapshot,
 }
 struct Version {
     bound: Arc<Bound>,
@@ -145,6 +146,7 @@ struct NativeRequest {
 enum Value {
     Core(Arc<Core>),
     Bound(Arc<Bound>),
+    #[cfg(test)]
     Listing(Listing),
     Version(Version),
     Catalog {
@@ -196,6 +198,7 @@ unsafe fn text<'a>(value: Text) -> Result<&'a str> {
     Ok(value)
 }
 
+#[cfg(test)]
 unsafe fn path(value: Text) -> Result<Vec<String>> {
     // SAFETY: forwarded unchanged from the ABI caller.
     let path: Vec<String> = serde_json::from_str(unsafe { text(value)? }).map_err(|_| INVALID)?;
@@ -325,40 +328,6 @@ fn resume_catalog(
         }),
         catalog,
     ))
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_catalog_open(
-    pointer: *mut c_void,
-    domain: Text,
-    out: *mut *mut c_void,
-) -> i32 {
-    // SAFETY: caller supplies same-thread live handles and distinct writable out,
-    // with readable text storage, under the shared CirrusRetained.h contract.
-    boundary(|| unsafe {
-        if out.is_null() {
-            return Err(INVALID);
-        }
-        *out = std::ptr::null_mut();
-        let Value::Bound(bound) = &handle(pointer)?.value else {
-            return Err(INVALID);
-        };
-        bound
-            .core
-            .accounts
-            .storage
-            .validate(&bound.binding.root)
-            .map_err(account_error)?;
-        let catalog = crate::provider_catalog::Catalog::open(&bound.binding, text(domain)?)
-            .map_err(catalog_error)?;
-        output(
-            out,
-            Value::Catalog {
-                bound: bound.clone(),
-                catalog,
-            },
-        )
-    })
 }
 
 // One bounded copied JSON result, with explicit operation and typed status.
@@ -570,8 +539,11 @@ unsafe extern "C" fn cirrus_retained_close(pointer: *mut c_void) -> i32 {
     })
 }
 
+// Test-only path adapter for the original native retained-content assertions.
+// Production opens exact versions through the durable catalog.
+#[cfg(test)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_retained_bind(
+unsafe extern "C" fn cirrus_retained_fixture_bind(
     pointer: *mut c_void,
     instance: Text,
     space: Text,
@@ -602,8 +574,9 @@ unsafe extern "C" fn cirrus_retained_bind(
     })
 }
 
+#[cfg(test)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_retained_list(
+unsafe extern "C" fn cirrus_retained_fixture_list(
     pointer: *mut c_void,
     path_json: Text,
     request: *mut c_void,
@@ -642,6 +615,7 @@ unsafe extern "C" fn cirrus_retained_list(
     })
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct Metadata<'a> {
     cookie: u64,
@@ -652,8 +626,9 @@ struct Metadata<'a> {
     directory: bool,
 }
 
+#[cfg(test)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_retained_page(
+unsafe extern "C" fn cirrus_retained_fixture_page(
     pointer: *mut c_void,
     after: u64,
     request: *mut c_void,
@@ -711,8 +686,9 @@ unsafe extern "C" fn cirrus_retained_page(
     })
 }
 
+#[cfg(test)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_retained_version(
+unsafe extern "C" fn cirrus_retained_fixture_version(
     pointer: *mut c_void,
     path_json: Text,
     id: Text,

@@ -19,8 +19,9 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Manual,
-    Write,
     Automatic,
+    #[cfg(feature = "fault-injection")]
+    LabUploadStep,
 }
 
 pub(crate) fn namespace_target_matches(

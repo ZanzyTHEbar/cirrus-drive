@@ -90,13 +90,6 @@ final class RetainedCatalog: RetainedHandle {
         guard let raw else { throw RetainedError.internalFailure }
         self.init(taking: raw)
     }
-    convenience init(binding: RetainedBinding, domain: String) throws {
-        binding.onOwnerThread()
-        var raw: UnsafeMutableRawPointer?
-        try withRetainedText(domain) { try checked(cirrus_catalog_open(binding.raw, $0, &raw)) }
-        guard let raw else { throw RetainedError.internalFailure }
-        self.init(taking: raw)
-    }
     private func read<T: Decodable>(_ operation: UInt32, _ identifier: String, _ argument: String,
                                      request: RetainedRequest) throws -> T {
         onOwnerThread()

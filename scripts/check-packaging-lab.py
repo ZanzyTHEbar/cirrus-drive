@@ -7,22 +7,98 @@ import fcntl
 import hashlib
 import json
 from pathlib import Path
+import runpy
 import shutil
 import signal
-import sqlite3
 import subprocess
 import tarfile
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def check_daemon_shutdown(packaging, root, home, daemon):
+    stop_daemon = runpy.run_path(str(packaging / "manage.py"))["stop_daemon"]
+    runtime = root / "shutdown-runtime"
+    runtime.mkdir(mode=0o700)
+    socket = runtime / "cirrus-drive.sock"
+    mounts_cmd, stop_cmd = [str(daemon), "--mounts"], [str(daemon), "--stop"]
+    active = {"instance": "https://cloud.invalid/", "space_id": "one", "space_name": "One",
+              "path": "/mnt/one", "state": "Mounted", "offline_read_only": False, "offline_writable": False}
+    second = dict(active, space_id="two", space_name="Two", path="/mnt/two")
+
+    def inventory(*rows):
+        return "".join(json.dumps(row) + "\n" for row in rows)
+
+    def refused(message):
+        try:
+            stop_daemon(daemon, None, home)
+        except ValueError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError("unsafe daemon shutdown accepted")
+
+    def stop(command, **kwargs):
+        assert command == stop_cmd
+        socket.unlink()
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with (patch.dict(os.environ, XDG_RUNTIME_DIR=str(runtime)),
+          patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(home))),
+          patch("subprocess.run") as run):
+        for output in ("", inventory(active, second)):
+            socket.touch()
+            run.reset_mock(side_effect=True)
+            run.side_effect = lambda command, **kwargs: (
+                subprocess.CompletedProcess(command, 0, output, "") if command == mounts_cmd
+                else stop(command, **kwargs))
+            stop_daemon(daemon, None, home)
+            assert [call.args[0] for call in run.call_args_list] == [mounts_cmd, stop_cmd]
+            assert not socket.exists()
+
+        socket.touch()
+        recovery = dict(active, state="RecoveryRequired")
+        for code, output, message in (
+            (0, inventory(second, recovery), "mount recovery required"),
+            (0, inventory(active) + "not JSON\n", "cannot verify mount inventory"),
+            (0, inventory(active, dict(second, path=active["path"])), "cannot verify mount inventory"),
+            (1, "", "cannot verify mount inventory"),
+        ):
+            run.reset_mock(side_effect=True)
+            run.return_value = subprocess.CompletedProcess(mounts_cmd, code, output, "")
+            refused(message)
+            assert [call.args[0] for call in run.call_args_list] == [mounts_cmd]
+            assert socket.exists()
+
+        run.reset_mock()
+        run.side_effect = [subprocess.CompletedProcess(mounts_cmd, 0, inventory(active), ""),
+                           subprocess.CompletedProcess(stop_cmd, 0, "", "")]
+        refused("daemon did not stop safely")
+        assert [call.args[0] for call in run.call_args_list] == [mounts_cmd, stop_cmd]
+        socket.unlink()
+
+        run.reset_mock()
+        legacy = runtime / "cirrus-drive.mount"
+        per_mount = runtime / ("cirrus-drive.mount-" + "0" * 32)
+        legacy.write_text("preserve")
+        refused("mount recovery record exists")
+        assert legacy.read_text() == "preserve"
+        legacy.unlink()
+        per_mount.symlink_to(runtime / "missing")
+        refused("mount recovery record exists")
+        assert per_mount.readlink() == runtime / "missing"
+        run.assert_not_called()
+    print("PASS: mocked daemon inventory, managed shutdown, and recovery guard")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--notice-fixtures", action="store_true", help="test packaging only with explicitly disposable shell binaries, not a qualified release pair")
-    parser.add_argument("--bin-dir", type=Path, help="explicit real normal daemon/UI pair, including notice recipe-image staging")
+    parser.add_argument("--bin-dir", type=Path, help="explicit real normal service/CLI/UI builds, including notice recipe-image staging")
     args = parser.parse_args()
     if args.notice_fixtures and args.bin_dir:
         parser.error("select disposable fixtures or an explicit real pair, not both")
@@ -55,7 +131,7 @@ def main():
             packaging = fixture / "packaging"
             binaries = root / "fixture-binaries"
             binaries.mkdir()
-            for name in ("cirrus-daemon", "cirrus-ui"):
+            for name in ("cirrus-daemon", "cirrus-drive-service", "cirrus-ui"):
                 binary = binaries / name
                 binary.write_text('#!/bin/sh\n# Disposable packaging-contract fixture; not Cirrus.\nexit 2\n')
                 binary.chmod(0o700)
@@ -92,7 +168,7 @@ def main():
         def filesystem_state():
             # Fixed, fixture-owned paths only; never inspect a user's live home.
             base = root / "image" / home.lstrip("/")
-            names = (".local/bin/cirrus-daemon", ".local/bin/cirrus-ui",
+            names = (".local/bin/cirrus-daemon", ".local/bin/cirrus-drive-service", ".local/bin/cirrus-ui",
                      ".config/systemd/user/cirrus-drive.service",
                      ".local/share/applications/cirrus-drive.desktop",
                      ".local/share/cirrus-drive/install.json",
@@ -159,7 +235,7 @@ def main():
                 raise RuntimeError(result.stderr)
 
         if args.notice_fixtures:
-            fixture_daemon = binaries / "cirrus-daemon"
+            fixture_daemon = binaries / "cirrus-drive-service"
             normal_fixture = fixture_daemon.read_bytes()
             fixture_daemon.write_text('#!/bin/sh\necho "cirrus-drive disposable account and mount lab v1"\nexit 0\n')
             assert run("install.sh").returncode != 0, "fault-capability fixture accepted"
@@ -178,7 +254,8 @@ def main():
         daemon = base / ".local/bin/cirrus-daemon"
         service = base / ".config/systemd/user/cirrus-drive.service"
         assert daemon.is_file() and os.access(daemon, os.X_OK)
-        assert "ExecStart=/home/cirrus-lab/.local/bin/cirrus-daemon" in service.read_text()
+        assert "ExecStart=/home/cirrus-lab/.local/bin/cirrus-drive-service" in service.read_text().splitlines()
+        assert os.access(base / ".local/bin/cirrus-drive-service", os.X_OK)
         notice_dir = base / ".local/share/licenses/cirrus-drive"
         expected_notices = {name: (ROOT / name).read_bytes() for name in ("LICENSE", "THIRD_PARTY_NOTICES.md")}
         expected_notices.update({"LICENSES/" + p.relative_to(ROOT / "LICENSES").as_posix(): p.read_bytes()
@@ -188,6 +265,7 @@ def main():
         installed = json.loads((base / ".local/share/cirrus-drive/install.json").read_text())
         assert {key.removeprefix("notice:") for key in installed if key.startswith("notice:")} == set(expected_notices)
         if args.notice_fixtures:
+            check_daemon_shutdown(packaging, root, base, daemon)
             installed_notice = notice_dir / "THIRD_PARTY_NOTICES.md"
             original = installed_notice.read_bytes()
             installed_notice.write_text("changed by user")
@@ -219,7 +297,7 @@ def main():
             print(verified.stdout.strip())
             if output:
                 summary = {
-                    "qualification": "disposable shell binaries and actual recipe image; not makepkg or a normal release" if args.notice_fixtures else "explicit normal pair and actual recipe image; not makepkg or broad release qualification",
+                    "qualification": "disposable shell binaries and actual recipe image; not makepkg or a normal release" if args.notice_fixtures else "explicit normal binaries and actual recipe image; not makepkg or broad release qualification",
                     "root": str(root), "user_notices": str(notice_dir), "arch_notices": str(arch_notices),
                     "notice_contents_verified": True, "state_preservation_suite_passed": False,
                     "notice_file_count": len(expected_notices),
@@ -227,7 +305,7 @@ def main():
                     "recipe_image_archive_sha256": hashlib.sha256((root / "arch-recipe-image.tar.gz").read_bytes()).hexdigest(),
                     "fixture_binaries" if args.notice_fixtures else "normal_binaries": {
                         name: hashlib.sha256((Path(env["CIRRUS_BIN_DIR"]) / name).read_bytes()).hexdigest()
-                        for name in ("cirrus-daemon", "cirrus-ui")},
+                        for name in ("cirrus-daemon", "cirrus-drive-service", "cirrus-ui")},
                     "inputs": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in
                                ("packaging/manage.py", "packaging/arch/PKGBUILD", "scripts/check-packaging-lab.py",
                                 "scripts/check-third-party-notices.py", "LICENSES/inventory.json", "LICENSES/SHA256SUMS")},
@@ -237,58 +315,35 @@ def main():
         assert run("install.sh").returncode != 0 and daemon.read_bytes() == before
         keyring = base / ".local/share/keyrings/keep"
         keyring.parent.mkdir(parents=True)
-        keyring.write_text("preserve")
         state = base / ".local/state/cirrus-drive"
         state.mkdir(parents=True, mode=0o700)
-        db = state / "state.db"
-        with sqlite3.connect(db) as conn:
-            conn.executescript("PRAGMA application_id=1128550961; PRAGMA user_version=17;"
-                               "CREATE TABLE account_identities(instance TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL);"
-                               "CREATE TABLE snapshots(instance TEXT NOT NULL, space TEXT NOT NULL, path TEXT NOT NULL, entries TEXT NOT NULL, updated INTEGER NOT NULL, self_id TEXT, self_etag TEXT, local_operation INTEGER, issuer TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(instance,space,path));"
-                               "CREATE TABLE pins(instance TEXT NOT NULL, space TEXT NOT NULL, root TEXT NOT NULL, is_dir INTEGER NOT NULL, directories TEXT NOT NULL, manifest TEXT NOT NULL, PRIMARY KEY(instance,space,root));"
-                               "CREATE TABLE files(instance TEXT NOT NULL, space TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, version TEXT NOT NULL, verified_complete INTEGER NOT NULL CHECK(verified_complete=1), PRIMARY KEY(instance,space,root,path));"
-                               "CREATE TABLE chunks(instance TEXT NOT NULL, space TEXT NOT NULL, root TEXT NOT NULL, path TEXT NOT NULL, offset INTEGER NOT NULL, body BLOB NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(instance,space,root,path,offset));"
-                               "CREATE TABLE pin_copies(id INTEGER PRIMARY KEY AUTOINCREMENT,instance TEXT,space TEXT,root TEXT,is_dir INTEGER,directories TEXT,manifest TEXT,issuer TEXT,subject TEXT,displaced_path TEXT,target_id TEXT,target_etag TEXT);"
-                               "CREATE TABLE pin_copy_files(instance TEXT,space TEXT,root TEXT,path TEXT,version TEXT,verified_complete INTEGER);"
-                               "CREATE TABLE pin_copy_chunks(instance TEXT,space TEXT,root TEXT,path TEXT,offset INTEGER,body BLOB,digest TEXT);"
-                               "CREATE TABLE operation_journal (id INTEGER PRIMARY KEY, instance TEXT NOT NULL, space TEXT NOT NULL, path TEXT NOT NULL, op_type TEXT NOT NULL, base_file_id TEXT, base_etag TEXT, staged_file TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','conflict','synced','uncertain','resolved')), error_msg TEXT, updated_at INTEGER NOT NULL, confirmed_file_id TEXT, confirmed_etag TEXT);"
-                               "CREATE TABLE directory_moves (operation_id INTEGER PRIMARY KEY, destination TEXT NOT NULL, source_entry TEXT NOT NULL, target_id TEXT, target_etag TEXT, offline INTEGER NOT NULL DEFAULT 0 CHECK(offline IN (0,1)));"
-                               "CREATE TABLE tree_proofs(operation_id INTEGER NOT NULL, path TEXT NOT NULL, self_id TEXT NOT NULL, self_etag TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL, entries TEXT NOT NULL, PRIMARY KEY(operation_id,path));"
-                               "CREATE TABLE tree_targets(operation_id INTEGER PRIMARY KEY, self_id TEXT NOT NULL, self_etag TEXT NOT NULL, generation INTEGER NOT NULL, entries TEXT NOT NULL CHECK(entries='[]'), issuer TEXT NOT NULL, subject TEXT NOT NULL);"
-                               "CREATE TABLE write_dependencies (operation_id INTEGER PRIMARY KEY, predecessor_id INTEGER NOT NULL UNIQUE);"
-                               "CREATE TABLE operation_parents (operation_id INTEGER PRIMARY KEY, parents TEXT NOT NULL, destination_parents TEXT);"
-                               "CREATE TABLE removal_versions(operation_id INTEGER NOT NULL, etag TEXT NOT NULL, PRIMARY KEY(operation_id,etag));"
-                               "CREATE TABLE upload_verifications (operation_id INTEGER PRIMARY KEY, operation TEXT NOT NULL, digest TEXT NOT NULL, size INTEGER NOT NULL, version TEXT, verified_offset INTEGER NOT NULL, parent_index INTEGER NOT NULL);"
-                               "CREATE TABLE sync_spaces (instance TEXT NOT NULL, space TEXT NOT NULL, issuer TEXT NOT NULL, subject TEXT NOT NULL, phase TEXT NOT NULL, failures INTEGER NOT NULL, next_at INTEGER NOT NULL, cause TEXT, last_verified INTEGER, verified_through INTEGER NOT NULL, attention_stamp TEXT, PRIMARY KEY(instance,space));"
-                               "CREATE TABLE sync_reads (operation_id INTEGER PRIMARY KEY, snapshot TEXT NOT NULL, phase TEXT NOT NULL, entries TEXT NOT NULL, updated_at INTEGER NOT NULL);"
-                               "CREATE TABLE mutation_receipts (operation_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, snapshot TEXT NOT NULL, extra TEXT NOT NULL);"
-                               "CREATE TABLE verified_uploads (operation_id INTEGER PRIMARY KEY, digest TEXT NOT NULL, version TEXT NOT NULL);"
-                               "CREATE TABLE dirty_roots (root TEXT PRIMARY KEY, digest TEXT NOT NULL, size INTEGER NOT NULL, base TEXT);"
-                               "CREATE TABLE dirty_bases (version TEXT NOT NULL, offset INTEGER NOT NULL, object TEXT NOT NULL, PRIMARY KEY(version,offset));"
-                               "CREATE TABLE dirty_preparations (version TEXT PRIMARY KEY, offset INTEGER NOT NULL);"
-                               "CREATE INDEX space_pending ON operation_journal(instance,space,state,op_type,id);"
-                               "INSERT INTO operation_journal(instance, space, path, op_type, staged_file, state, updated_at) VALUES ('lab', 'space', '[\"file\"]', 'write', 'staged', 'pending', 0);")
-        db.chmod(0o600)
-        with sqlite3.connect(db) as conn:
-            conn.execute("PRAGMA user_version=15")
-        unsupported_bytes = db.read_bytes()
+        sentinels = {state / "state.db": b"preserve state", state / "cache.db": b"preserve cache",
+                     keyring: b"preserve keyring"}
+        for path, data in sentinels.items():
+            path.write_bytes(data)
+
+        installed_state = filesystem_state()
         refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists(), refused.stderr
-        assert db.read_bytes() == unsupported_bytes, "schema-15 database was modified"
-        assert "unsupported offline database version; state preserved" in refused.stderr, refused.stderr
-        with sqlite3.connect(db) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
-            assert conn.execute("SELECT COUNT(*) FROM operation_journal").fetchone()[0] == 1
-            conn.execute("PRAGMA user_version=17")
+        assert refused.returncode != 0 and "usage: uninstall.sh" in refused.stderr, refused.stderr
+        assert filesystem_state() == installed_state, "rejected uninstall changed install/state/keyring files"
+
+        success(run("uninstall.sh"))
+        for path, data in sentinels.items():
+            assert path.read_bytes() == data, f"uninstall changed {path.name}"
+        assert all(row is None for name, row in filesystem_state().items() if base / name not in sentinels), "owned artifacts remain after uninstall"
+        assert all(not (notice_dir / name).exists() for name in expected_notices), "owned notices remain after uninstall"
+        if args.notice_fixtures:
+            assert unknown_notice.read_text() == "preserve", "unrecognized notice file removed"
+
         if os.environ.get("CIRRUS_TEST_PACKAGING_INPUT_LEASE") == "1":
             if output is None:
                 raise RuntimeError("controlled input lease requires private packaging evidence")
-            # Only complete copies of the actual paired binaries, never a fake
+            # Only complete copies of the actual matching binaries, never a fake
             # executable or a lease on the repository/installed target.
             source = Path(env.get("CIRRUS_BIN_DIR", ROOT / "target/debug"))
             bindir = root / "leased-binaries"
             bindir.mkdir(mode=0o700)
-            for name in ("cirrus-daemon", "cirrus-ui"):
+            for name in ("cirrus-daemon", "cirrus-drive-service", "cirrus-ui"):
                 shutil.copy2(source / name, bindir / name)
             previous_bindir = env.get("CIRRUS_BIN_DIR")
             env["CIRRUS_BIN_DIR"] = str(bindir)
@@ -322,88 +377,21 @@ def main():
                     env.pop("CIRRUS_BIN_DIR", None)
                 else:
                     env["CIRRUS_BIN_DIR"] = previous_bindir
-            print("PASS CONTROL: actual owned UI input lease causes the unchanged 30s installer timeout before output creation; pending State/keyring sentinel unchanged; child reaped and lease released (not attribution of historical timeout)", flush=True)
-        success(run("install.sh"))
-        cache = state / "cache.db"
-        with sqlite3.connect(cache) as conn:
-            conn.executescript("PRAGMA application_id=1128547121; PRAGMA user_version=2;"
-                               "CREATE TABLE ranges(issuer TEXT, subject TEXT, version TEXT, offset INTEGER, body BLOB, digest TEXT, accessed INTEGER);"
-                               "CREATE TABLE generation(value INTEGER NOT NULL); INSERT INTO generation VALUES(0);")
-        cache.chmod(0o600)
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and cache.exists() and not daemon.exists(), refused.stderr
-        assert "journal entries exist; state preserved" in refused.stderr, refused.stderr
-        success(run("install.sh"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("DELETE FROM operation_journal")
-            conn.execute("INSERT INTO pins VALUES ('lab', 'space', '[]', 1, '[]', '[]')")
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and not daemon.exists(), refused.stderr
-        assert "pins exist; state preserved" in refused.stderr, refused.stderr
-        success(run("install.sh"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("DELETE FROM pins")
-            conn.execute("INSERT INTO pin_copies(instance,space,root) VALUES ('lab','space','[]')")
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and not daemon.exists(), refused.stderr
-        assert "retained pin copies exist; state preserved" in refused.stderr, refused.stderr
-        success(run("install.sh"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("DELETE FROM pin_copies")
-            conn.execute("INSERT INTO directory_moves(operation_id, destination, source_entry) VALUES (1, '[]', '{}')")
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and not daemon.exists(), refused.stderr
-        assert "directory move records exist; state preserved" in refused.stderr, refused.stderr
-        success(run("install.sh"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("DELETE FROM directory_moves")
-            conn.execute("INSERT INTO operation_parents VALUES (1, '[]', NULL)")
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and not daemon.exists(), refused.stderr
-        assert "operation parent records exist; state preserved" in refused.stderr, refused.stderr
-        success(run("install.sh"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("DELETE FROM operation_parents")
-        for name, content in (("sync.lock", b"cirrus-drive sync lock v1\n"),
-                              ("staging.lock", b"cirrus-drive staging lock v1\n"),
-                              ("scheduler.lock", b"cirrus-drive scheduler lock v1\n")):
-            marker = state / name
-            marker.write_bytes(content)
-            marker.chmod(0o600)
-            with marker.open("rb") as held:
-                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                refused = run("uninstall.sh", "--purge-clean-state")
-                assert refused.returncode != 0 and db.exists() and marker.exists(), refused.stderr
-                assert "account state is in use; state preserved" in refused.stderr, refused.stderr
-            success(run("install.sh"))
-        snapshots = state / "directory-snapshots"
-        snapshots.mkdir(mode=0o700)
-        unknown = snapshots / "preserve-unknown"
-        unknown.write_text("not disposable without inspection")
-        refused = run("uninstall.sh", "--purge-clean-state")
-        assert refused.returncode != 0 and db.exists() and unknown.read_text() == "not disposable without inspection", refused.stderr
-        assert "directory snapshots contain files or are unsafe; state preserved" in refused.stderr, refused.stderr
-        unknown.unlink()
-        success(run("install.sh"))
-        success(run("uninstall.sh", "--purge-clean-state"))
-        assert not state.exists() and keyring.read_text() == "preserve"
-        assert all(not (notice_dir / name).exists() for name in expected_notices), "owned notices remain after uninstall"
-        if args.notice_fixtures:
-            assert unknown_notice.read_text() == "preserve", "unrecognized notice file removed"
+            print("PASS CONTROL: actual owned UI input lease causes the unchanged 30s installer timeout before output creation; state and keyring sentinels unchanged; child reaped and lease released (not attribution of historical timeout)", flush=True)
         if args.notice_fixtures or args.bin_dir:
             if output:
                 summary["state_preservation_suite_passed"] = True
                 (output / "notice-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             print("NOTICE PACKAGING FIXTURES VERIFIED (not normal binaries or makepkg qualification)" if args.notice_fixtures else
                   "NORMAL BINARIES NOTICE PACKAGING VERIFIED (not makepkg or broad release qualification)")
-        print("PASS: isolated install, dirty/pinned refusal, clean purge and keyring preservation")
+        print("PASS: isolated install and uninstall; state and keyring preserved")
 
 
 def check_arch_notice_fixture(root, env):
     """Run the actual package() function, archive/extract its image; no makepkg substitute claim."""
     source = root / "arch-source"
     source.mkdir()
-    for name in ("cirrus-daemon", "cirrus-ui"):
+    for name in ("cirrus-daemon", "cirrus-drive-service", "cirrus-ui"):
         shutil.copy2(Path(env["CIRRUS_BIN_DIR"]) / name, source / name)
     for name in ("cirrus-drive.service", "cirrus-drive.desktop"):
         shutil.copy2(ROOT / "packaging" / name, source / name)
@@ -413,7 +401,7 @@ def check_arch_notice_fixture(root, env):
     with tarfile.open(archive) as tar:
         tar.extractall(source, filter="data")
     recipe_env = dict(env, CIRRUS_GLIBC_MIN=os.environ.get("CIRRUS_GLIBC_MIN", "0"), srcdir=str(source), pkgdir=str(root / "arch-image"))
-    for variable, name in (("DAEMON", "cirrus-daemon"), ("UI", "cirrus-ui"), ("SERVICE", "cirrus-drive.service"),
+    for variable, name in (("DAEMON", "cirrus-daemon"), ("SERVICE_BINARY", "cirrus-drive-service"), ("UI", "cirrus-ui"), ("SERVICE", "cirrus-drive.service"),
                            ("DESKTOP", "cirrus-drive.desktop"), ("NOTICES", "cirrus-notices.tar.gz")):
         recipe_env[f"CIRRUS_{variable}_SHA256"] = hashlib.sha256((source / name).read_bytes()).hexdigest()
     script = '''set -euo pipefail

@@ -1,17 +1,14 @@
-use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-#[cfg(target_os = "linux")]
-use rustix::fs::ResolveFlags;
-use rustix::{
-    fs::{self, AtFlags, FileType, Mode, OFlags},
-    process,
-};
+use rusqlite::{Connection, OptionalExtension, params};
+use rustix::fs;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccountError, CleanCacheStatus, FileVersion, ReadSession, account_storage::StorageRoot,
+    AccountError, CleanCacheStatus, FileVersion, ReadSession,
+    account_storage::StorageRoot,
+    offline,
+    sqlite_open::{Database, OpenMode},
 };
 
 const CACHE_APP_ID: i64 = 0x4344_4331;
@@ -19,100 +16,24 @@ const MAX_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 1024;
 
 fn database(root: &StorageRoot, create: bool) -> Result<Option<Connection>, AccountError> {
-    let database = crate::sqlite_open::Database::Cache;
-    let _guard = database
-        .opening_gate()
-        .map_err(|_| AccountError::new("cache is unavailable"))?;
-    let dir = root.directory();
-    let stat_existing = || fs::statat(&dir, "cache.db", AtFlags::SYMLINK_NOFOLLOW);
-    #[cfg(target_os = "linux")]
-    let (stat, created) = if create {
-        match fs::openat2(
-            &dir,
-            "cache.db",
-            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-        ) {
-            Ok(fd) => (
-                fs::fstat(&fd).map_err(|_| AccountError::new("cannot inspect cache"))?,
-                true,
-            ),
-            Err(rustix::io::Errno::EXIST) => (
-                stat_existing().map_err(|_| AccountError::new("cannot inspect cache"))?,
-                false,
-            ),
-            Err(_) => return Err(AccountError::new("cannot create cache")),
-        }
+    let mode = if create {
+        OpenMode::CreateOrOpen
     } else {
-        match stat_existing() {
-            Ok(stat) => (stat, false),
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(_) => return Err(AccountError::new("cannot inspect cache")),
-        }
+        OpenMode::Existing
     };
-    #[cfg(target_os = "macos")]
-    let (stat, created) = match database
-        .prepare_darwin(root, create)
-        .map_err(|_| AccountError::new("cannot admit cache"))?
-    {
-        Some(value) => value,
-        None => return Ok(None),
+    let Some(opening) = Database::Cache.open(root, mode)? else {
+        return Ok(None);
     };
-    // An extra open/close of an existing file releases process-wide SQLite locks.
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != process::geteuid().as_raw()
-        || stat.st_mode & 0o7777 != 0o600
-        || stat.st_nlink != 1
-    {
-        return Err(AccountError::new(
-            "cache has unsafe ownership or permissions",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    let proc = fs::openat2(
-        fs::CWD,
-        "/proc",
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|_| AccountError::new("trusted procfs is required for cache"))?;
-    #[cfg(target_os = "linux")]
-    if fs::fstatfs(&proc)
-        .map_err(|_| AccountError::new("cannot inspect procfs"))?
-        .f_type
-        != fs::PROC_SUPER_MAGIC
-    {
-        return Err(AccountError::new("trusted procfs is required for cache"));
-    }
-    #[cfg(target_os = "linux")]
-    let path = format!("/proc/self/fd/{}/cache.db", dir.as_raw_fd());
-    #[cfg(target_os = "linux")]
-    database
-        .check_auxiliaries(&dir)
-        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
-    #[cfg(target_os = "linux")]
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|_| AccountError::new("cannot open cache"))?;
-    #[cfg(target_os = "macos")]
-    let conn = {
-        database
-            .check_darwin(root, &stat)
-            .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
-        database
-            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|_| AccountError::new("cannot open cache"))?
-    };
-    crate::sqlite_open::check_unmoved(&conn).map_err(|_| AccountError::new("cache changed"))?;
+    let conn = opening.connection();
     conn.busy_timeout(Duration::from_secs(1))
         .map_err(|_| AccountError::new("cannot configure cache"))?;
-    if created {
+    if opening.created() {
         conn.execute_batch("PRAGMA page_size=4096; PRAGMA auto_vacuum=FULL; BEGIN IMMEDIATE; PRAGMA application_id=1128547121; PRAGMA user_version=2;
             CREATE TABLE ranges (issuer TEXT NOT NULL, subject TEXT NOT NULL, version TEXT NOT NULL, offset INTEGER NOT NULL, body BLOB NOT NULL, digest TEXT NOT NULL, accessed INTEGER NOT NULL, PRIMARY KEY(issuer,subject,version,offset));
             CREATE INDEX range_eviction ON ranges(accessed); CREATE TABLE generation(value INTEGER NOT NULL); INSERT INTO generation VALUES(0); COMMIT;")
             .map_err(|_| AccountError::new("cannot initialize cache"))?;
-        fs::fsync(&dir).map_err(|_| AccountError::new("cannot persist cache directory"))?;
+        fs::fsync(root.directory())
+            .map_err(|_| AccountError::new("cannot persist cache directory"))?;
     }
     let app: i64 = conn
         .pragma_query_value(None, "application_id", |row| row.get(0))
@@ -126,28 +47,12 @@ fn database(root: &StorageRoot, create: bool) -> Result<Option<Connection>, Acco
     if app != CACHE_APP_ID || version != 2 || page_size != 4096 {
         return Err(AccountError::new("unrecognized cache"));
     }
-    let current = stat_existing().map_err(|_| AccountError::new("cache changed"))?;
-    if (stat.st_dev, stat.st_ino) != (current.st_dev, current.st_ino)
-        || current.st_nlink != 1
-        || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
-        || current.st_uid != process::geteuid().as_raw()
-        || current.st_mode & 0o7777 != 0o600
-    {
-        return Err(AccountError::new("cache changed"));
-    }
+    opening.check_named()?;
     // The clean cache is separate from dirty data and pins, with room for SQLite metadata.
     conn.execute_batch("PRAGMA max_page_count=24576")
         .map_err(|_| AccountError::new("cannot bound cache"))?;
-    #[cfg(target_os = "linux")]
-    database
-        .check_auxiliaries(&dir)
-        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
-    #[cfg(target_os = "macos")]
-    database
-        .check_darwin(root, &stat)
-        .map_err(|_| AccountError::new("cache has unsafe ownership or permissions"))?;
-    crate::sqlite_open::check_unmoved(&conn).map_err(|_| AccountError::new("cache changed"))?;
-    Ok(Some(conn))
+    opening.check_sidecars_and_vfs()?;
+    Ok(Some(opening.into_connection()))
 }
 
 fn encoded(version: &FileVersion) -> Result<String, AccountError> {
@@ -242,48 +147,55 @@ pub(crate) fn generation_in(root: &StorageRoot) -> Result<i64, AccountError> {
         .map_err(|_| AccountError::new("cannot inspect cache generation"))
 }
 
-pub(crate) fn evict(
-    session: &ReadSession,
+pub(crate) fn evict_in(
+    root: &StorageRoot,
+    instance: &str,
     space: &str,
     path: &[String],
 ) -> Result<(), AccountError> {
-    let root = &session.root;
+    let (issuer, subject, activated) = offline::cache_eviction_identity_in(root, instance, space)?;
+    let unproven = || AccountError::new("Space has no retained activation or clean ranges");
     let _lease = crate::storage::sql_reservation::cleanup_lease_in(
         root,
         crate::storage::sql_reservation::Store::Cache,
     )?;
     let Some(mut conn) = database(
         root,
-        crate::storage::limits::view_in(root).is_ok_and(|view| view.limits.is_none()),
+        activated && crate::storage::limits::view_in(root).is_ok_and(|view| view.limits.is_none()),
     )?
     else {
-        return Ok(());
+        return if activated { Ok(()) } else { Err(unproven()) };
     };
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| AccountError::new("cannot begin cache eviction"))?;
     let mut remove = Vec::new();
+    let mut known_space = activated;
     {
         let mut statement = tx
             .prepare("SELECT rowid,version FROM ranges WHERE issuer=?1 AND subject=?2")
             .map_err(|_| AccountError::new("cannot inspect cached ranges"))?;
         let rows = statement
-            .query_map(
-                params![session.account.issuer, session.account.subject],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
+            .query_map(params![issuer, subject], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|_| AccountError::new("cannot inspect cached ranges"))?;
         for row in rows {
             let (id, encoded) = row.map_err(|_| AccountError::new("invalid cached range"))?;
             let version: FileVersion = serde_json::from_str(&encoded)
                 .map_err(|_| AccountError::new("invalid cached version"))?;
-            if version.instance == session.base.as_str()
-                && version.space == space
-                && version.path.starts_with(path)
-            {
-                remove.push(id);
+            if version.instance == instance && version.space == space {
+                // An exact principal/instance/Space range proves local cache
+                // scope even when this Space has never enabled sync.
+                known_space = true;
+                if version.path.starts_with(path) {
+                    remove.push(id);
+                }
             }
         }
+    }
+    if !known_space {
+        return Err(unproven());
     }
     for id in remove {
         tx.execute("DELETE FROM ranges WHERE rowid=?1", [id])
@@ -458,4 +370,164 @@ pub(crate) fn store(
     }
     tx.commit()
         .map_err(|_| AccountError::new("cannot commit cached range"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::fs::{self, DirBuilder};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use cirrus_runtime::RuntimeDir;
+
+    use super::*;
+    use crate::Accounts;
+
+    #[test]
+    fn explicit_cache_eviction_is_local_scoped_and_atomic() {
+        const INSTANCE: &str = "https://instance.invalid/";
+        const ISSUER: &str = "https://issuer.invalid/";
+        const SPACE: &str = "requested";
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ev-{}-{}", std::process::id(), nonce.as_nanos()));
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let runtime = fixture.0.join("rt");
+        DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        let root = StorageRoot::open_container(&fixture.0).unwrap();
+        let accounts = Accounts::with_storage(RuntimeDir::open(&runtime).unwrap(), root.clone());
+        let folder = ["folder".to_owned()];
+        let evict = |space| accounts.evict_space("https://INSTANCE.invalid", space, &folder);
+        assert!(evict(SPACE).is_err());
+        assert!(!fixture.0.join("cirrus-drive/state.db").exists());
+        assert!(!fixture.0.join("cirrus-drive/cache.db").exists());
+
+        let cache = database(&root, true).unwrap().unwrap();
+        let insert = |(instance, space, subject): (&str, &str, &str), path: &[&str], body: &str| {
+            let version = FileVersion {
+                instance: instance.to_owned(),
+                space: space.to_owned(),
+                path: path.iter().map(|part| (*part).to_owned()).collect(),
+                id: "version-id".to_owned(),
+                etag: "\"v1\"".to_owned(),
+                size: body.len() as u64,
+                checksums: Vec::new(),
+            };
+            let key = encoded(&version).unwrap();
+            let hash = format!("{:x}", Sha256::digest(body));
+            cache
+                .execute(
+                    "INSERT INTO ranges VALUES (?1,?2,?3,0,?4,?5,0)",
+                    params![ISSUER, subject, key, body.as_bytes(), hash],
+                )
+                .unwrap();
+        };
+        let owner = (INSTANCE, SPACE, "owner");
+        let leaf = &["folder", "leaf"];
+        insert(owner, leaf, "delete");
+        insert(owner, &["folder-ish"], "prefix sibling");
+        insert((INSTANCE, "peer", "owner"), leaf, "peer Space");
+        insert((INSTANCE, SPACE, "peer"), leaf, "peer principal");
+        insert(
+            ("https://peer.invalid/", SPACE, "owner"),
+            leaf,
+            "peer instance",
+        );
+        let cache_payloads = || {
+            cache
+                .prepare("SELECT CAST(body AS TEXT) FROM ranges ORDER BY body")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = cache_payloads();
+        assert!(
+            evict(SPACE).is_err(),
+            "cache rows alone do not establish a principal"
+        );
+        offline::bind_identity_in(&root, INSTANCE, ISSUER, "owner").unwrap();
+        let state = offline::database_in(&root).unwrap();
+        assert!(evict("unknown").is_err());
+        assert!(evict("requested/peer").is_err());
+        assert!(
+            accounts
+                .evict_space("https://user@instance.invalid", SPACE, &folder)
+                .is_err()
+        );
+        assert!(
+            accounts
+                .evict_space(INSTANCE, SPACE, &["..".to_owned()])
+                .is_err()
+        );
+        state.execute(
+            "INSERT INTO sync_spaces(instance,space,issuer,subject,phase,failures,next_at,verified_through)
+             VALUES (?1,?2,?3,'wrong','Attention',0,0,0)",
+            params![INSTANCE, SPACE, ISSUER],
+        ).unwrap();
+        assert!(
+            evict(SPACE).is_err(),
+            "conflicting activation outweighs exact ranges"
+        );
+        state.execute("DELETE FROM sync_spaces", []).unwrap();
+
+        cache
+            .execute_batch(
+                "CREATE TRIGGER abort_eviction BEFORE UPDATE ON generation
+                 BEGIN SELECT RAISE(ABORT, 'generation update refused'); END;",
+            )
+            .unwrap();
+        assert!(evict(SPACE).is_err());
+        assert_eq!(cache_payloads(), before, "range deletion must roll back");
+        assert_eq!(generation_in(&root).unwrap(), 0);
+        assert_eq!(accounts.clean_cache_generation(), 0);
+        cache.execute_batch("DROP TRIGGER abort_eviction").unwrap();
+
+        let state_generation = || {
+            state
+                .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let peers = ["peer Space", "peer instance", "peer principal"];
+        let state_before = state_generation();
+        evict(SPACE).unwrap(); // No activation, credentials or live session.
+        assert_eq!(
+            cache_payloads(),
+            [peers.as_slice(), &["prefix sibling"]].concat()
+        );
+        assert_eq!(generation_in(&root).unwrap(), 1);
+        assert_eq!(accounts.clean_cache_generation(), 1);
+        assert_eq!(state_generation(), state_before);
+
+        let journal_mode: String = state
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        state.execute(
+            "INSERT INTO sync_spaces(instance,space,issuer,subject,phase,failures,next_at,verified_through)
+             VALUES (?1,?2,?3,'owner','Attention',3,0,0)",
+            params![INSTANCE, SPACE, ISSUER],
+        ).unwrap();
+        let state_before = state_generation();
+        accounts.evict_space(INSTANCE, SPACE, &[]).unwrap();
+        accounts.evict_space(INSTANCE, SPACE, &[]).unwrap(); // Activation proves an empty scope.
+        assert_eq!(cache_payloads(), peers);
+        assert_eq!(generation_in(&root).unwrap(), 3);
+        assert_eq!(accounts.clean_cache_generation(), 3);
+        assert_eq!(
+            state_generation(),
+            state_before,
+            "eviction must not change the sync fence"
+        );
+    }
 }

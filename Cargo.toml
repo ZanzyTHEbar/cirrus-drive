@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cirrus-account", "crates/cirrus-daemon", "crates/cirrus-discovery", "crates/cirrus-fuse", "crates/cirrus-runtime", "crates/cirrus-ui"]
+members = ["crates/cirrus-account", "crates/cirrus-api", "crates/cirrus-cli", "crates/cirrus-client", "crates/cirrus-daemon", "crates/cirrus-discovery", "crates/cirrus-fuse", "crates/cirrus-runtime", "crates/cirrus-ui"]
 resolver = "3"
 
 [workspace.package]

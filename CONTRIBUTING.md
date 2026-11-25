@@ -8,9 +8,12 @@ Build and run the workspace checks with the pinned Rust toolchain:
 cargo fmt --all --check
 cargo check --locked --workspace
 cargo test --locked --workspace
+python3 scripts/check-cli-boundary.py
 ```
 
 Daemon runtime tests require `TMPDIR` on a filesystem supporting `O_TMPFILE`, such as `/dev/shm`.
+
+The CLI (`cirrus-daemon`) and service (`cirrus-drive-service`) are separate binaries. Build both for disposable fault-injection labs with `cargo build --locked -p cirrus-cli -p cirrus-daemon --features fault-injection`. Rebuild both without that feature before installing.
 
 For packaging changes, build the normal workspace binaries without fault-injection features and run `python3 scripts/check-packaging-lab.py` in a suitable disposable environment. Set `TMPDIR` to a writable local filesystem with enough space; the packaging lab requires a path without spaces or special characters. Mount labs also need to execute copied binaries and create FUSE mounts there, and use `/dev/shm` for private runtime directories. Other dependencies and isolation requirements are described in the scripts; review them before use.
 

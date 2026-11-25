@@ -31,6 +31,54 @@ sys.dont_write_bytecode = True
 lab = SourceFileLoader("opencloud_lab", str(Path(__file__).with_name("check-opencloud-read-lab.py"))).load_module()
 fixture = lab.fixture
 URL = "https://localhost:9200/"
+ISSUER_REL = "http://openid.net/specs/connect/1.0/issuer"
+DISCOVERY_LIMIT = 65536
+
+
+def discovery_document(context, path):
+    # Direct TLS through the existing tunnel: no proxy or redirect following.
+    connection = http.client.HTTPSConnection(urlsplit(URL).netloc, context=context, timeout=3)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError("discovery endpoint did not return HTTP 200")
+        body = response.read(DISCOVERY_LIMIT + 1)
+        if len(body) > DISCOVERY_LIMIT:
+            raise ValueError("discovery document is too large")
+        document = json.loads(body)
+        if not isinstance(document, dict):
+            raise ValueError("discovery document must be a JSON object")
+        return document
+    finally:
+        connection.close()
+
+
+def check_pinned_discovery(resource, webfinger, metadata):
+    # Check the server's actual desktop response independently of Cirrus's
+    # parser, including the exact no-trailing-slash resource probe.
+    assert webfinger.get("subject") == resource, "unexpected desktop WebFinger subject"
+    issuers = [link.get("href") for link in webfinger.get("links", [])
+               if isinstance(link, dict) and link.get("rel") == ISSUER_REL]
+    assert len(issuers) == 1, "expected one desktop WebFinger issuer link"
+    issuer = issuers[0]
+    assert isinstance(issuer, str), "missing desktop WebFinger issuer URL"
+    issuer_url = urlsplit(issuer)
+    assert issuer_url.scheme == "https" and issuer_url.hostname, "invalid desktop WebFinger issuer URL"
+    props = webfinger.get("properties", {})
+    client_id = props.get("http://opencloud.eu/ns/oidc/client_id")
+    scopes = props.get("http://opencloud.eu/ns/oidc/scopes")
+    assert isinstance(client_id, str) and client_id, "missing desktop client ID"
+    assert isinstance(scopes, list) and "openid" in scopes and all(
+        isinstance(scope, str) and scope for scope in scopes
+    ), "invalid desktop scopes"
+    assert metadata.get("issuer") == issuer, "OpenID metadata issuer does not match WebFinger"
+    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+        value = metadata.get(key)
+        assert isinstance(value, str), f"missing OpenID metadata field {key}"
+        endpoint = urlsplit(value)
+        assert (endpoint.scheme == "https" and endpoint.hostname and endpoint.username is None
+                and endpoint.password is None and not endpoint.fragment), f"invalid OpenID endpoint {key}"
 
 
 class Tunnel(socketserver.ThreadingTCPServer):
@@ -118,9 +166,8 @@ def child(root, runtime, container, password):
 
     fixture.BINARY = root / "cirrus-daemon"
     keyring = daemon = browser = tunnel = thread = loop = None
-    mounted = False
     mountpoint = root / "mount"
-    chosen_mount = None
+    owned = set()
     requests = queue.Queue(maxsize=1)
 
     class Portal(dbus.service.Object):
@@ -131,6 +178,12 @@ def child(root, runtime, container, password):
 
     def cli(*args):
         return fixture.run([str(fixture.BINARY), *map(str, args)], env=os.environ)
+
+    def mount_row(space, path):
+        result = fixture.require(cli("--mounts"), "checking OIDC mount ownership")
+        rows = lab.owned_mounts(result, URL, {(space, str(path))})
+        assert len(rows) == 1 and rows[0]["state"] == "Mounted", result.stdout
+        return rows[0]
 
     def retained_staged_rows():
         rows = []
@@ -144,7 +197,10 @@ def child(root, runtime, container, password):
 
     def start_daemon():
         with (root / "daemon.log").open("a") as log:
-            process = subprocess.Popen([str(fixture.BINARY)], env=os.environ, stdout=subprocess.DEVNULL, stderr=log)
+            # Keep the deliberate offline edits and conflicts pending until
+            # this scenario explicitly syncs them.
+            process = subprocess.Popen([str(fixture.service_binary()), "--no-auto-sync"], env=os.environ,
+                                       stdout=subprocess.DEVNULL, stderr=log)
         for _ in range(150):
             if cli("--status").returncode == 0:
                 return process
@@ -167,18 +223,23 @@ def child(root, runtime, container, password):
         else:
             raise RuntimeError("disposable OpenCloud HTTPS did not become ready")
         (root / "server.pem").write_text(certificate)
-        opener = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context(cafile=str(root / "server.pem"))))
+        context = ssl.create_default_context(cafile=str(root / "server.pem"))
+        opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context))
+        resource = URL.rstrip("/")
+        query = urlencode({"resource": resource, "rel": ISSUER_REL, "platform": "desktop"})
         for _ in range(60):
             try:
-                with opener.open(URL + ".well-known/openid-configuration", timeout=3) as response:
-                    metadata = json.load(response)
-                if metadata.get("issuer", "").rstrip("/") == URL.rstrip("/"):
+                metadata = discovery_document(context, "/.well-known/openid-configuration")
+                if isinstance(metadata.get("issuer"), str) and metadata["issuer"].rstrip("/") == resource:
+                    webfinger = discovery_document(context, "/.well-known/webfinger?" + query)
                     break
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
                 pass
             time.sleep(1)
         else:
-            raise RuntimeError("disposable OpenCloud OIDC metadata did not become ready with TLS verification")
+            raise RuntimeError("disposable OpenCloud WebFinger and OIDC metadata did not become ready with TLS verification")
+        check_pinned_discovery(resource, webfinger, metadata)
+        print("PASS: pinned OpenCloud desktop WebFinger and OpenID issuer metadata", flush=True)
         keyring = fixture.keyring_start()
         DBusGMainLoop(set_as_default=True)
         bus = dbus.SessionBus()
@@ -197,14 +258,14 @@ def child(root, runtime, container, password):
             with net_socket.socket(net_socket.AF_UNIX, net_socket.SOCK_STREAM) as client:
                 client.settimeout(30)
                 client.connect(str(runtime / "daemon" / "cirrus-drive.sock"))
-                client.sendall(b"CIRRUS/2 " + json.dumps(request).encode() + b"\n")
+                client.sendall(b"CIRRUS/3 " + json.dumps(request).encode() + b"\n")
                 response = bytearray()
                 while not response.endswith(b"\n"):
                     chunk = client.recv(65536)
                     if not chunk:
                         raise RuntimeError("daemon closed the sign-in request")
                     response.extend(chunk)
-                return json.loads(response.removeprefix(b"CIRRUS/2 "))
+                return json.loads(response.removeprefix(b"CIRRUS/3 "))
 
         def callback_page(authorization, params, heading):
             redirect = urlsplit(parse_qs(urlsplit(authorization).query)["redirect_uri"][0])
@@ -418,15 +479,14 @@ def child(root, runtime, container, password):
         if len(personal) != 1 or personal[0] not in [line.split("\t", 1)[0] for line in spaces]:
             raise RuntimeError("OIDC account has no unique personal Space")
         space = personal[0]
-        fixture.require(cli("--select-space", URL, space), "selecting OIDC Space")
         ui_env = dict(os.environ, XDG_CONFIG_HOME=str(root / "ui-config"))
-        parent = root / "chosen-parent"
-        parent.mkdir(mode=0o700)
-        chosen_mount = parent
+        chosen_mount = root / "chosen-parent"
+        chosen_mount.mkdir(mode=0o700)
+        owned.add((space, str(chosen_mount)))
         events = [{"t": 1.0, "key": "instance"}, {"t": 1.2, "paste": URL},
                   {"t": 1.5, "key": "load-spaces"}, {"t": 8.0, "key": f"space-{space}"},
                   {"t": 30.0, "key": "choose-mount-folder"},
-                  {"t": 30.5, "type": "file-dialog", "path": str(parent)},
+                  {"t": 30.5, "type": "file-dialog", "path": str(chosen_mount)},
                   {"t": 31.0, "key": "mount"}]
         (root / "ui-mount-events.json").write_text(json.dumps(events))
         fixture.require(fixture.run([str(root / "cirrus-ui"), "--script", str(root / "ui-mount-events.json"),
@@ -435,22 +495,31 @@ def child(root, runtime, container, password):
         assert f"Mounted at {chosen_mount}" in (root / "ui-mount-tree.json").read_text()
         assert "Mounted directory" in (root / "ui-mount-tree.json").read_text()
         assert chosen_mount.is_mount()
-        fixture.require(cli("--unmount"), "unmounting chosen Rune location")
+        mount_row(space, chosen_mount)
+        fixture.require(cli("--unmount-space", URL, space), "unmounting chosen Rune location")
         fixture.require(fixture.run([str(root / "cirrus-ui"), "--tree", str(root / "ui-restart-tree.json"),
                                      "--size", "900x2000", "--at", "2"], env=ui_env), "restarting Rune")
         assert URL in (root / "ui-restart-tree.json").read_text()
-        fixture.require(cli("--mount", URL), "mounting the default location")
-        assert (root / "cirrus").is_mount()
-        fixture.require(cli("--unmount"), "unmounting the default location")
-        existing = root / "cirrus" / "keep"
+        default = fixture.require(cli("--mount-space", URL, space), "mounting the default location").stdout.rstrip("\n")
+        prefix = "Space mounted at "
+        suffix = " experimentally; changes are local until explicit sync"
+        assert default.startswith(prefix) and default.endswith(suffix), default
+        default_mount = Path(default[len(prefix):-len(suffix)])
+        assert default_mount.parent == root.resolve(), default_mount
+        owned.add((space, str(default_mount)))
+        mount_row(space, default_mount)
+        assert default_mount.is_mount()
+        fixture.require(cli("--unmount-space", URL, space), "unmounting the default location")
+        existing = default_mount / "keep"
         existing.write_text("do not cover")
-        assert cli("--mount", URL).returncode != 0
+        rejected = cli("--mount-space", URL, space)
+        assert rejected.returncode != 0 and "default mountpoint already exists and will not be reused" in rejected.stderr
         assert existing.read_text() == "do not cover"
         existing.unlink()
         isolation = SourceFileLoader("opencloud_isolation_lab", str(Path(__file__).with_name("opencloud-isolation-lab.py"))).load_module()
         isolation.run(root, runtime, URL, token, space, opener, requests, ws, fixture)
-        fixture.require(cli("--mount", URL, mountpoint), "mounting OIDC Space")
-        mounted = True
+        owned.add((space, str(mountpoint)))
+        fixture.require(cli("--mount-space", URL, space, mountpoint), "mounting OIDC Space")
         events = [{"t": 1.0, "key": "refresh"}]
         (root / "ui-events.json").write_text(json.dumps(events))
         fixture.require(fixture.run([str(root / "cirrus-ui"), "--script", str(root / "ui-events.json"),
@@ -458,6 +527,7 @@ def child(root, runtime, container, password):
                                     env=os.environ), "Rune OIDC mount status")
         tree = (root / "ui-tree.json").read_text()
         assert "running;" in fixture.require(cli("--status"), "checking OIDC daemon status").stdout
+        mount_row(space, mountpoint)
         assert f"Mounted at {mountpoint}" in tree and "Mounted directory" in tree
         (root / "ui-nav-events.json").write_text(json.dumps([{"t": 1.0, "key": "nav-Recovery"}]))
         fixture.require(fixture.run([str(root / "cirrus-ui"), "--script", str(root / "ui-nav-events.json"),
@@ -474,10 +544,8 @@ def child(root, runtime, container, password):
         if initial_sync.returncode:
             print("\n".join(line for line in (root / "daemon.log").read_text().splitlines() if "cirrus lab DAV propstat:" in line), file=sys.stderr)
         fixture.require(initial_sync, "syncing authenticated mounted edits")
-        fixture.require(cli("--unmount"), "unmounting authenticated Space")
-        mounted = False
-        fixture.require(cli("--mount", URL, mountpoint), "remounting authenticated Space")
-        mounted = True
+        fixture.require(cli("--unmount-space", URL, space), "unmounting authenticated Space")
+        fixture.require(cli("--mount-space", URL, space, mountpoint), "remounting authenticated Space")
         assert (mountpoint / "oidc-dir" / "file").read_bytes() == b"authenticated writable mount\n"
         os.unlink(mountpoint / "oidc-dir" / "file")
         os.rmdir(mountpoint / "oidc-dir")
@@ -496,18 +564,19 @@ def child(root, runtime, container, password):
         with open(mountpoint / "oidc-offline", "wb", buffering=0) as file:
             file.write(b"offline after OIDC login\n")
             os.fsync(file.fileno())
-        fixture.require(cli("--unmount"), "unmounting OIDC Space offline")
-        mounted = False
+        fixture.require(cli("--unmount-space", URL, space), "unmounting OIDC Space offline")
         fixture.require(cli("--stop"), "stopping OIDC daemon offline")
         daemon.wait(timeout=5)
         daemon = start_daemon()
-        fixture.require(cli("--mount", URL, mountpoint), "remounting OIDC Space offline")
-        mounted = True
+        fixture.require(cli("--mount-offline-writable-space", URL, space, mountpoint), "remounting OIDC Space offline")
+        assert mount_row(space, mountpoint)["offline_writable"] is True
         assert (mountpoint / "oidc-offline").read_bytes() == b"offline after OIDC login\n"
         tunnel = Tunnel(container)
         thread = threading.Thread(target=tunnel.serve_forever, daemon=True)
         thread.start()
         fixture.require(cli("--sync", URL), "syncing OIDC offline edit")
+        fixture.require(cli("--unmount-space", URL, space), "unmounting OIDC offline view")
+        fixture.require(cli("--mount-space", URL, space, mountpoint), "restoring online OIDC Space")
         vim = shutil.which("vim")
         if not vim:
             raise RuntimeError("Vim is required for the OIDC editor scenario")
@@ -526,33 +595,34 @@ def child(root, runtime, container, password):
         assert backup and (database.parent / "staging" / backup[0]).read_bytes() == b"before\n", "Vim backup was not retained"
         with opener.open(Request(URL + "dav/spaces/" + quote(space, safe="") + "/oidc-vim", headers={"Authorization": "Bearer " + token}), timeout=15) as response:
             assert response.read() == b"after\n", "synced Vim replacement is missing or changed"
-        fixture.require(cli("--pin", URL, "/oidc-vim"), "pinning OIDC file before rename")
+        fixture.require(cli("--pin-space", URL, space, "/oidc-vim"), "pinning OIDC file before rename")
         os.rename(mountpoint / "oidc-vim", mountpoint / "oidc-vim-renamed")
         assert (mountpoint / "oidc-vim-renamed").read_bytes() == b"after\n"
-        assert "/oidc-vim-renamed" in fixture.require(cli("--pins", URL), "listing relocated file pin").stdout
-        assert cli("--pin", URL, "/oidc-vim-renamed").returncode != 0, "repin ignored the pending file rename"
+        assert "/oidc-vim-renamed" in fixture.require(cli("--pins-space", URL, space), "listing locally relocated file pin").stdout
+        assert cli("--pin-space", URL, space, "/oidc-vim-renamed").returncode != 0, "repin ignored the pending file rename"
         tunnel.set_online(False)
         tunnel.shutdown()
         tunnel.server_close()
         thread.join(timeout=5)
         tunnel = thread = None
-        fixture.require(cli("--unmount"), "unmounting pending pinned file rename")
-        mounted = False
+        fixture.require(cli("--unmount-space", URL, space), "unmounting pending pinned file rename")
         fixture.require(cli("--stop"), "stopping with pending pinned file rename")
         daemon.wait(timeout=5)
         daemon = start_daemon()
-        fixture.require(cli("--mount", URL, mountpoint), "remounting pending pinned file rename offline")
-        mounted = True
+        fixture.require(cli("--mount-offline-writable-space", URL, space, mountpoint), "remounting pending pinned file rename offline")
+        assert mount_row(space, mountpoint)["offline_writable"] is True
         assert (mountpoint / "oidc-vim-renamed").read_bytes() == b"after\n"
-        assert "/oidc-vim-renamed" in fixture.require(cli("--pins", URL), "listing relocated file pin after restart").stdout
+        assert "/oidc-vim-renamed" in fixture.require(cli("--pins-space", URL, space), "listing relocated local file pin after restart").stdout
         tunnel = Tunnel(container)
         thread = threading.Thread(target=tunnel.serve_forever, daemon=True)
         thread.start()
         fixture.require(cli("--sync", URL), "syncing pinned OIDC file rename")
-        pins = fixture.require(cli("--pins", URL), "checking moved historical file pin").stdout
+        fixture.require(cli("--unmount-space", URL, space), "unmounting offline pinned file view")
+        fixture.require(cli("--mount-space", URL, space, mountpoint), "restoring online view after pinned rename")
+        pins = fixture.require(cli("--pins-space", URL, space, "--check-remote"), "checking moved historical file pin").stdout
         assert "stale\t/oidc-vim-renamed" in pins, pins
-        fixture.require(cli("--pin", URL, "/oidc-vim-renamed"), "repinning renamed OIDC file")
-        assert "available offline\t/oidc-vim-renamed" in fixture.require(cli("--pins", URL), "checking repinned file").stdout
+        fixture.require(cli("--pin-space", URL, space, "/oidc-vim-renamed"), "repinning renamed OIDC file")
+        assert "available offline\t/oidc-vim-renamed" in fixture.require(cli("--pins-space", URL, space, "--check-remote"), "checking repinned file").stdout
         with open(mountpoint / "pin-replace-source", "wb", buffering=0) as file:
             file.write(b"keep both versions\n")
         try:
@@ -572,8 +642,8 @@ def child(root, runtime, container, password):
             file.write(b"open remote version\n")
         os.mkdir(mountpoint / "oidc-tree-target")
         fixture.require(cli("--sync", URL), "syncing OIDC tree fixtures")
-        fixture.require(cli("--pin", URL, "/oidc-tree"), "pinning OIDC tree")
-        fixture.require(cli("--pin", URL, "/oidc-tree/nested/unmodified"), "pinning overlapping OIDC file")
+        fixture.require(cli("--pin-space", URL, space, "/oidc-tree"), "pinning OIDC tree")
+        fixture.require(cli("--pin-space", URL, space, "/oidc-tree/nested/unmodified"), "pinning overlapping OIDC file")
         with open(mountpoint / "oidc-tree" / "nested" / "file", "r+b", buffering=0) as writer, \
              open(mountpoint / "oidc-tree" / "nested" / "file", "rb", buffering=0) as reader, \
              open(mountpoint / "oidc-tree" / "nested" / "unmodified", "rb", buffering=0) as remote_reader, \
@@ -596,24 +666,25 @@ def child(root, runtime, container, password):
         tunnel.server_close()
         thread.join(timeout=5)
         tunnel = thread = None
-        fixture.require(cli("--unmount"), "unmounting pending OIDC tree move")
-        mounted = False
+        fixture.require(cli("--unmount-space", URL, space), "unmounting pending OIDC tree move")
         fixture.require(cli("--stop"), "stopping with pending OIDC tree move")
         daemon.wait(timeout=5)
         daemon = start_daemon()
-        fixture.require(cli("--mount", URL, mountpoint), "remounting pending OIDC tree move")
-        mounted = True
+        fixture.require(cli("--mount-offline-writable-space", URL, space, mountpoint), "remounting pending OIDC tree move offline")
+        assert mount_row(space, mountpoint)["offline_writable"] is True
         assert not (mountpoint / "oidc-tree").exists()
         assert (mountpoint / "oidc-tree-target" / "nested" / "file").read_bytes() == b"staged before move\nthrough open handle\n"
         assert (mountpoint / "oidc-tree-target" / "nested" / "new").read_bytes() == b"created after move\n"
         assert (mountpoint / "oidc-tree-target" / "nested" / "unmodified").read_bytes() == b"open remote version\n"
-        pins = fixture.require(cli("--pins", URL), "listing offline relocated pins").stdout
+        pins = fixture.require(cli("--pins-space", URL, space), "listing offline relocated pins").stdout
         assert "/oidc-tree-target" in pins and "/oidc-tree-target/nested/unmodified" in pins, pins
         assert "\t/oidc-tree\n" not in pins, pins
         tunnel = Tunnel(container)
         thread = threading.Thread(target=tunnel.serve_forever, daemon=True)
         thread.start()
         fixture.require(cli("--sync", URL), "syncing OIDC tree move")
+        fixture.require(cli("--unmount-space", URL, space), "unmounting offline tree view")
+        fixture.require(cli("--mount-space", URL, space, mountpoint), "restoring online view after tree move")
         assert (mountpoint / "oidc-tree-target" / "nested" / "file").read_bytes() == b"staged before move\nthrough open handle\n"
         assert not (mountpoint / "oidc-tree").exists()
         edited = subprocess.run([vim, "-Nu", "NONE", "-i", "NONE", "-n", "-es", "-c", "%s/staged/edited/", "-c", "wq", str(mountpoint / "oidc-tree-target" / "nested" / "file")], capture_output=True, timeout=60)
@@ -629,7 +700,7 @@ def child(root, runtime, container, password):
         with open(mountpoint / "oidc-conflict", "wb", buffering=0) as file:
             file.write(b"conflict base\n")
         fixture.require(cli("--sync", URL), "syncing OIDC tree conflict base")
-        fixture.require(cli("--pin", URL, "/oidc-tree-conflict"), "pinning conflict tree")
+        fixture.require(cli("--pin-space", URL, space, "/oidc-tree-conflict"), "pinning conflict tree")
         with open(mountpoint / "oidc-conflict", "wb", buffering=0) as file:
             file.write(b"local conflict edit\n")
         remote = URL + "dav/spaces/" + quote(space, safe="") + "/oidc-conflict"
@@ -648,13 +719,13 @@ def child(root, runtime, container, password):
         with opener.open(Request(conflict_target, method="MKCOL", headers={"Authorization": "Bearer " + token}), timeout=15) as response:
             assert response.status == 201
         assert cli("--sync", URL).returncode != 0, "OIDC tree conflict was not reported"
-        assert cli("--pin", URL, "/oidc-tree-conflict-target").returncode != 0, "repin ignored the conflicted tree move"
+        assert cli("--pin-space", URL, space, "/oidc-tree-conflict-target").returncode != 0, "repin ignored the conflicted tree move"
         conflict_source = URL + "dav/spaces/" + quote(space, safe="") + "/oidc-tree-conflict/file"
         with opener.open(Request(conflict_source, headers={"Authorization": "Bearer " + token}), timeout=15) as response:
             assert response.read() == b"remote tree conflict base\n"
         assert (mountpoint / "oidc-tree-conflict-target" / "file").read_bytes() == b"retained tree edit\n"
         assert (mountpoint / "oidc-tree-conflict-target" / "pinned").read_bytes() == b"pinned conflict base\n"
-        assert "stale\t/oidc-tree-conflict-target" in fixture.require(cli("--pins", URL), "checking conflicted tree pin").stdout
+        assert "stale\t/oidc-tree-conflict-target" in fixture.require(cli("--pins-space", URL, space, "--check-remote"), "checking conflicted tree pin").stdout
         with sqlite3.connect(runtime / "home/.local/state/cirrus-drive/state.db") as db:
             tree_operation = db.execute("SELECT staged_file,state FROM operation_journal WHERE op_type='move-tree' AND state='conflict'").fetchone()
         assert tree_operation is not None and tree_operation[1] == "conflict"
@@ -663,8 +734,7 @@ def child(root, runtime, container, password):
             pinned = db.execute("SELECT count(*) FROM chunks WHERE path=?", ('["oidc-tree-conflict-target","pinned"]',)).fetchone()[0]
         assert pinned > 0, "acknowledging the tree conflict discarded pinned content"
         prior_staged = next(row for row in retained_staged_rows() if row["path"] == ["oidc-conflict"] and row["state"] == "conflict")
-        fixture.require(cli("--unmount"), "unmounting OIDC lab")
-        mounted = False
+        fixture.require(cli("--unmount-space", URL, space), "unmounting OIDC lab")
         fixture.require(cli("--stop"), "stopping OIDC daemon")
         daemon.wait(timeout=5)
         tunnel.shutdown()
@@ -801,40 +871,27 @@ def child(root, runtime, container, password):
         assert (destination / "file-pin").read_bytes() == b"after\n"
         fixture.require(cli("--stop"), "stopping offline recovery daemon")
         daemon.wait(timeout=5)
-        print("PASS: acknowledged conflict pin exported offline without keyring; unsafe destinations, corrupt chunk, checksum and manifest refused", flush=True)
-        print("PASS: OpenCloud OIDC/PKCE, private keyring, daemon IPC, Rune, writable FUSE, offline restart and conflict", flush=True)
         _ = (name, portal)
     finally:
-        if daemon and daemon.poll() is None:
-            status = cli("--mount-status")
-            owned = [p for p in (chosen_mount, root / "cirrus") if p is not None]
-            if status.returncode == 0 and any(status.stdout.startswith(f"mounted: {path};") for path in owned):
-                fixture.require(cli("--unmount"), "unmounting lab location during cleanup")
-        if mounted and daemon and daemon.poll() is None:
-            cli("--unmount")
-        fixture.stop_process(daemon)
-        for record_path in (runtime / "daemon").glob("cirrus-drive.mount-*"):
-            record = json.loads(record_path.read_text())
-            for line in Path("/proc/self/mountinfo").read_text().splitlines():
-                parts = line.split()
-                if ("-" in parts and parts[4] == str(mountpoint)
-                        and parts[parts.index("-") + 1:parts.index("-") + 3]
-                        == ["fuse.cirrus-drive", record.get("source")]):
-                    fixture.require(fixture.run(["fusermount3", "-u", "-z", "--", str(mountpoint)]), "cleaning OIDC lab mount")
-        if browser and browser.poll() is None:
-            try:
-                os.killpg(browser.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        fixture.stop_process(browser)
-        if loop:
-            loop.quit()
-        fixture.stop_process(keyring)
-        if tunnel:
-            tunnel.shutdown()
-            tunnel.server_close()
-        if thread:
-            thread.join(timeout=5)
+        try:
+            lab.cleanup_mounts(cli, daemon, runtime / "daemon", URL, owned)
+        finally:
+            if browser and browser.poll() is None:
+                try:
+                    os.killpg(browser.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            fixture.stop_process(browser)
+            if loop:
+                loop.quit()
+            fixture.stop_process(keyring)
+            if tunnel:
+                tunnel.shutdown()
+                tunnel.server_close()
+            if thread:
+                thread.join(timeout=5)
+    print("PASS: acknowledged conflict pin exported offline without keyring; unsafe destinations, corrupt chunk, checksum and manifest refused", flush=True)
+    print("PASS: OpenCloud OIDC/PKCE, private keyring, daemon IPC, Rune, writable FUSE, offline restart and conflict", flush=True)
 
 
 def main():
@@ -844,9 +901,7 @@ def main():
         return
     if sys.argv[1:]:
         raise SystemExit("usage: check-opencloud-oidc-e2e.py")
-    capability = fixture.run([str(fixture.BINARY), "--lab-capabilities"])
-    if capability.returncode or capability.stdout.strip() != "cirrus-drive disposable account and mount lab v1":
-        raise SystemExit("build the disposable fault-injection daemon first")
+    fixture.check_lab_binaries(fixture.BINARY.parent)
     version = lab.docker("image", "inspect", lab.IMAGE, "--format", '{{index .Config.Labels "org.opencontainers.image.version"}}').decode().strip()
     if version != "9.0.0":
         raise SystemExit("pinned lab image does not identify as OpenCloud 9.0.0")
@@ -857,6 +912,8 @@ def main():
     password = secrets.token_urlsafe(24)
     try:
         shutil.copy2(fixture.BINARY, root / "cirrus-daemon")
+        shutil.copy2(fixture.service_binary(), root / "cirrus-drive-service")
+        fixture.check_lab_binaries(root)
         if not fixture.UI.is_file():
             raise RuntimeError("build the Rune UI before running the OIDC lab")
         shutil.copy2(fixture.UI, root / "cirrus-ui")

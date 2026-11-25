@@ -1,4 +1,4 @@
-//! Exact retained operation observations; never infer completion from scheduler status.
+//! Native provider mutation boundary. Durable operation results, not scheduler status, determine completion.
 
 use super::*;
 
@@ -88,14 +88,16 @@ unsafe extern "C" fn cirrus_catalog_mutate(
     })
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct Observation {
     operation: crate::OperationHandle,
     result: crate::OperationResult,
 }
 
+#[cfg(test)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn cirrus_retained_operation(
+unsafe extern "C" fn cirrus_retained_fixture_operation(
     pointer: *mut c_void,
     request: *mut c_void,
     buffer: *mut u8,

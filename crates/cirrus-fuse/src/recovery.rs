@@ -159,10 +159,6 @@ pub(crate) fn ensure_available(runtime: &RuntimeDir, path: &Path) -> io::Result<
     Ok(())
 }
 
-pub(crate) fn pending(runtime: &RuntimeDir) -> io::Result<bool> {
-    Ok(!records(runtime)?.is_empty())
-}
-
 pub(crate) fn owners(runtime: &RuntimeDir) -> io::Result<Vec<RecoveryOwner>> {
     Ok(records(runtime)?
         .into_iter()

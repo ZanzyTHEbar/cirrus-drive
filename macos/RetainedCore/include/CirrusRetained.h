@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 /* Private in-process ABI v1; not an IPC/auth boundary or FileProvider API.
+ * The native Swift targets use this header with the matching Rust archive.
  * All handles are Rust-owned. Close exactly once on the creating OS thread.
  * Every account operation is synchronous and must stay on that OS thread.
  * Child handles retain their parents/root/binding, so parents may close first.
@@ -14,8 +15,8 @@
  * all operations/cancel calls have joined. It is one-shot; never reset.
  * No other concurrent use or close. On INTERNAL, discard the entire session
  * (close only); no panic unwinds across C. Allocation abort is process-fatal.
- * Strings are UTF-8 (no NUL/control bytes), <=16384 bytes; paths JSON string
- * arrays, <=128 safe components. Retained read APIs never authenticate or network.
+ * Strings are UTF-8 (no NUL/control bytes), <=16384 bytes.
+ * Retained read APIs never authenticate or network.
  * Application/dispatcher/mutation APIs explicitly authenticate or execute work.
  */
 typedef void *CirrusRetainedHandle;
@@ -41,25 +42,6 @@ int32_t cirrus_retained_open(CirrusRetainedText app_group,
 int32_t cirrus_retained_request(CirrusRetainedHandle *out);
 int32_t cirrus_retained_cancel(CirrusRetainedHandle request);
 int32_t cirrus_retained_close(CirrusRetainedHandle handle);
-int32_t cirrus_retained_bind(CirrusRetainedHandle core, CirrusRetainedText instance,
-    CirrusRetainedText space, CirrusRetainedHandle *out);
-int32_t cirrus_retained_list(CirrusRetainedHandle binding, CirrusRetainedText path_json,
-    CirrusRetainedHandle request, CirrusRetainedHandle *out);
-/* Copies <=32 metadata entries as JSON into the caller's EXACT 262144-byte
- * buffer, no borrowed engine memory. Empty JSON array means end. next is the
- * last cookie (unchanged at end); written=0 on failure. Release buffers in Swift.
- */
-int32_t cirrus_retained_page(CirrusRetainedHandle listing, uint64_t after,
-    CirrusRetainedHandle request, uint8_t *buffer, size_t capacity,
-    size_t *written, uint64_t *next);
-/* Opens the exact listed id/etag/size, not whichever version now occupies a path.
- * STALE only for a concrete version mismatch; ambiguous engine errors are
- * UNAVAILABLE, never guessed noSuchItem. Existing engine capacity predicates
- * and actual output errno may yield CAPACITY; other engine errors stay opaque.
- */
-int32_t cirrus_retained_version(CirrusRetainedHandle binding,
-    CirrusRetainedText path_json, CirrusRetainedText id, CirrusRetainedText etag,
-    uint64_t size, CirrusRetainedHandle request, CirrusRetainedHandle *out);
 /* fd is caller-owned EXCL-created empty 0600 regular file, nlink1, current UID.
  * The existing strict DENY-only Darwin ACL policy also applies before bytes.
  * Caller exclusively owns it through return, and owns all failure cleanup.
@@ -71,29 +53,18 @@ int32_t cirrus_retained_version(CirrusRetainedHandle binding,
 int32_t cirrus_retained_materialize(CirrusRetainedHandle version, int32_t fd,
     CirrusRetainedHandle request);
 int32_t cirrus_retained_verify(CirrusRetainedHandle version, CirrusRetainedHandle request);
-/* Exact staged Version observation, no network/credentials. Copied JSON
- * {operation,result}, PAGE_BYTES. Pending/conflict/uncertain/resolved are not
- * remote success. Confirmed writes require matching verified_uploads evidence.
- * Unknown/changed identities return UNAVAILABLE, never guessed missing data.
- */
-int32_t cirrus_retained_operation(CirrusRetainedHandle staged_version,
-    CirrusRetainedHandle request, uint8_t *buffer, size_t capacity, size_t *written);
-/* Durable catalog, same handle/thread/pointer contracts as above. Domain is
- * explicit configuration bound immutably to the retained principal and Space.
- * read operations: 0 capture(container, "name"|"date") -> JSON token string;
- * 1 page(container, token) -> JSON page; 2 lookup(FPID, "") -> JSON item;
- * 3 changes("", anchor or "") -> JSON changes. All are retained observations,
- * NEVER authoritative remote freshness, absence, deletion or sync completion.
- * Exactly PAGE_BYTES output; written=0 on error. Tokens are <500 UTF-8 bytes.
- */
-int32_t cirrus_catalog_open(CirrusRetainedHandle binding, CirrusRetainedText domain,
-    CirrusRetainedHandle *out);
 /* Noncreating resume by actual OS domain ID. Saved identity and epoch must still
  * match the retained account/activation/root. Unknown/foreign IDs UNAVAILABLE.
  * No credentials, configuration tuple, display-name inference or ID allocation.
  */
 int32_t cirrus_catalog_resume(CirrusRetainedHandle core, CirrusRetainedText domain,
     CirrusRetainedHandle *out);
+/* 0 capture(container, "name"|"date") -> JSON token string;
+ * 1 page(container, token) -> JSON page; 2 lookup(FPID, "") -> JSON item;
+ * 3 changes("", anchor or "") -> JSON changes. All are retained observations,
+ * NEVER authoritative remote freshness, absence, deletion or sync completion.
+ * Exactly PAGE_BYTES output; written=0 on error. Tokens are <500 UTF-8 bytes.
+ */
 int32_t cirrus_catalog_read(CirrusRetainedHandle catalog, uint32_t operation,
     CirrusRetainedText identifier, CirrusRetainedText argument,
     CirrusRetainedHandle request, uint8_t *buffer, size_t capacity, size_t *written);
@@ -115,7 +86,7 @@ typedef void (*CirrusMutationProgress)(void *context, uint64_t completed, uint64
 int32_t cirrus_catalog_mutate(CirrusRetainedHandle catalog, CirrusRetainedText descriptor,
     CirrusRetainedText source, CirrusRetainedHandle request, CirrusMutationProgress progress, void *context, uint8_t *buffer,
     size_t capacity, size_t *written);
-/* Application-only authenticated demand reads. The same strict Core admission
+/* Application-only authenticated account and mount operations. The same strict Core admission
  * applies. One engine owner per root/principal; no scheduler or selected-Space
  * mutation. Bind uses fresh authenticated membership and retains the exact Core.
  * SignIn is request-local and distinct from retained cancellation. Only cancel
@@ -141,12 +112,6 @@ int32_t cirrus_application_space_page(CirrusRetainedHandle spaces, size_t offset
     uint8_t *buffer, size_t capacity, size_t *written, size_t *next);
 int32_t cirrus_application_bind(CirrusRetainedHandle core, CirrusRetainedText instance,
     CirrusRetainedText space, CirrusRetainedHandle *out);
-/* Current binding identity, NOT a fresh authentication check. Metadata JSON
- * {instance,space,issuer,subject}, no tokens. Exact PAGE_BYTES, written=0 on
- * failure. Treat principal metadata as private; do not log/persist it.
- */
-int32_t cirrus_application_binding(CirrusRetainedHandle binding, uint8_t *buffer,
-    size_t capacity, size_t *written);
 /* Mount intent (automatically enables sync/Finder), ONLINE Bound only. Uses
  * normal guarded activation and authenticated root observation for fresh Spaces,
  * then atomically reuses/allocates the durable domain
@@ -168,8 +133,6 @@ int32_t cirrus_application_domain_prepare(CirrusRetainedHandle authenticated_bou
  */
 int32_t cirrus_application_domains_restore(CirrusRetainedHandle core,
     uint8_t *buffer, size_t capacity, size_t *written);
-int32_t cirrus_application_list(CirrusRetainedHandle binding, CirrusRetainedText path_json,
-    CirrusRetainedText parent_id, CirrusRetainedHandle *out);
 /* Automatic execution, NOT a UI action. Open accepts Core or Catalog and elects
  * one cooperating dispatcher under that admitted root. Another process's election
  * returns UNAVAILABLE; retry at a bounded lifecycle/poll interval. The handle

@@ -545,6 +545,7 @@ dependencies = [
 name = "cirrus-account"
 version = "0.1.0"
 dependencies = [
+ "cirrus-api",
  "cirrus-discovery",
  "cirrus-runtime",
  "core-foundation",
@@ -574,16 +575,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "cirrus-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cirrus-cli"
+version = "0.1.0"
+dependencies = [
+ "cirrus-client",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cirrus-client"
+version = "0.1.0"
+dependencies = [
+ "cirrus-api",
+ "cirrus-discovery",
+ "cirrus-runtime",
+ "libc",
+ "rustix 1.1.5",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "cirrus-daemon"
 version = "0.1.0"
 dependencies = [
  "cirrus-account",
- "cirrus-discovery",
+ "cirrus-api",
+ "cirrus-client",
  "cirrus-fuse",
  "cirrus-runtime",
- "libc",
  "rustix 1.1.5",
- "serde",
  "serde_json",
 ]
 

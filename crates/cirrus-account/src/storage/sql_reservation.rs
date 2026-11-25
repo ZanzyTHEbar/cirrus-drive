@@ -51,16 +51,7 @@ struct Record {
     scratch: Option<String>,
 }
 
-/// Shared pending disk allowance, not additional physical allocation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SqlStorageReservation {
-    pub store: String,
-    pub token: String,
-    pub ceiling_bytes: u64,
-    pub store_allocated_bytes: u64,
-    pub outstanding_bytes: u64,
-    pub pin_scratch_name: Option<String>,
-}
+pub use cirrus_api::SqlStorageReservation;
 
 fn invalid() -> AccountError {
     AccountError::new("invalid or abandoned SQL storage reservation; inspect storage status")

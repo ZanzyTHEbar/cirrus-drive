@@ -264,28 +264,13 @@ impl Overlay {
         })
     }
 
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn import_in(
         storage: &StorageRoot,
         input: &mut impl Read,
         size: u64,
     ) -> Result<Self, AccountError> {
-        if size > MAX_FILE {
-            return Err(AccountError::new("file exceeds 1 TiB"));
-        }
-        let mut root = Self::empty_in(storage);
-        let mut bytes = vec![0; OBJECT];
-        while root.size < size {
-            let length = (size - root.size).min(OBJECT as u64) as usize;
-            input
-                .read_exact(&mut bytes[..length])
-                .map_err(|_| AccountError::new("cannot read staging source"))?;
-            if bytes[..length].iter().all(|byte| *byte == 0) {
-                root.resize(root.size + length as u64)?;
-            } else {
-                root.write(root.size, &bytes[..length])?;
-            }
-        }
-        Ok(root)
+        Self::import_candidate_in(storage, input, size, &|| false)
     }
 
     /// An unpublished request import owns every object it creates. Cancellation

@@ -1,135 +1,24 @@
 //! Foreground user daemon and private local client.
 
+mod application;
 mod local;
 mod scheduler;
 
-use std::io::{self, Read};
+use std::io;
+
+use cirrus_client::{AccountReply, AccountRequest, account as account_request};
 
 pub use cirrus_account::{
     CleanCacheStatus, JournalEntry, JournalPage, JournalState, JournalSummary,
     NamespaceStorageReservation, SqlStorageReservation, StorageLimits, StorageLimitsView,
-    StorageStatus, StorageUsage, SyncPhase, SyncStatus, WriteTurnOutcome,
+    StorageStatus, StorageUsage, SyncPhase, SyncStatus,
 };
 use cirrus_runtime::RuntimeDir;
-use serde::{Deserialize, Serialize};
 
-/// A validated immediate child of a selected Space directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectoryEntry {
-    /// Original UTF-8 child name.
-    pub name: String,
-    /// Whether the child is a directory.
-    pub directory: bool,
-    /// File size, absent for directories.
-    pub size: Option<u64>,
-}
-
-/// State of a mount owned by the daemon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MountState {
-    /// The daemon owns an active FUSE mount.
-    Mounted,
-    /// A stale mount needs explicit recovery.
-    RecoveryRequired,
-}
-
-/// Identifies one mount and its Space.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MountInfo {
-    /// Canonical account URL.
-    pub instance: String,
-    /// Stable Space ID.
-    pub space_id: String,
-    /// Space display label, currently the ID if a name is unavailable.
-    pub space_name: String,
-    /// Absolute mount path.
-    pub path: String,
-    /// Current lifecycle state.
-    pub state: MountState,
-    /// Local-only read-only mode for a live mount; unknown after a crash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offline_read_only: Option<bool>,
-    /// Explicit local-only file editing mode; unknown on stale crash records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offline_writable: Option<bool>,
-}
-
-/// A journal-referenced immutable dirty snapshot, not a remote-content assertion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetainedStaged {
-    /// Journal row ID.
-    pub id: i64,
-    /// Space containing the operation.
-    pub space: String,
-    /// Original Space path.
-    pub path: Vec<String>,
-    /// Journal state, not a claim about remote content.
-    pub state: String,
-    /// Private staging filename.
-    pub staged_file: String,
-    /// Current file size, absent if the file cannot be inspected safely.
-    pub size: Option<u64>,
-    /// Current content digest, absent if unavailable.
-    pub sha256: Option<String>,
-    /// Selector binding the journal entry and immutable byte-interpretation root.
-    pub selector: Option<String>,
-    /// Explanation of the digest's limitations.
-    pub integrity: String,
-    /// The copy is local and may be stale.
-    pub status: String,
-}
-
-/// A pin root in an explicitly named Space.
-#[derive(Debug, Clone)]
-pub struct RetainedPin {
-    /// Space ID.
-    pub space: String,
-    /// Pin root components.
-    pub root: Vec<String>,
-}
-
-/// A retained file from an explicitly named pin, not necessarily current remotely.
-#[derive(Debug, Clone)]
-pub struct RetainedPinFile {
-    /// Space path components.
-    pub path: Vec<String>,
-    /// Opaque version selector.
-    pub selector: String,
-    /// Stored length when valid metadata is available.
-    pub size: Option<u64>,
-}
-
-/// An immutable displaced pin capture, independent of namespace paths.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RetainedPinCopy {
-    /// Stable local capture ID, independent of any active path.
-    pub id: i64,
-    /// Original immutable Space ID.
-    pub space: String,
-    /// Original captured logical root, not a live namespace binding.
-    pub root: Vec<String>,
-    /// Replacement target path at capture admission.
-    pub displaced_path: Vec<String>,
-    /// Resource ID from the separate replacement-admission proof.
-    pub target_id: String,
-    /// Strong ETag from the separate replacement-admission proof.
-    pub target_etag: String,
-}
-
-/// A directory identity or exportable file version in a retained pin capture.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RetainedPinCopyEntry {
-    /// Captured entry kind: directory metadata or file version.
-    pub kind: String,
-    /// Original path within the capture.
-    pub path: Vec<String>,
-    /// Captured directory ID, absent for the explicit Space-root sentinel.
-    pub id: Option<String>,
-    /// Exact file version/chunk selector, absent for directories.
-    pub selector: Option<String>,
-    /// File length, absent for directory metadata.
-    pub size: Option<u64>,
-}
+pub use cirrus_api::{
+    DirectoryEntry, MountInfo, MountState, RetainedPage, RetainedPin, RetainedPinCopy,
+    RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
+};
 
 /// The user-scoped daemon's application boundary.
 #[derive(Debug, Default)]
@@ -147,11 +36,6 @@ impl Daemon {
     /// Returns an error if the URL is unsafe or invalid.
     pub fn canonical_instance(instance: &str) -> io::Result<String> {
         cirrus_account::Accounts::canonical_instance(instance).map_err(io::Error::other)
-    }
-
-    /// Describes this build's capabilities, not the status of a running process.
-    pub fn scaffold_status(&self) -> &'static str {
-        "daemon account, Space and experimental staged-write file mounts available"
     }
 
     /// Runs the foreground status service until a local client requests shutdown.
@@ -182,7 +66,9 @@ impl Daemon {
     ///
     /// Returns an error if the endpoint, peer or response cannot be verified.
     pub fn status(&self, runtime: &RuntimeDir) -> io::Result<&'static str> {
-        local::request(runtime, local::Request::Status)
+        cirrus_client::status(runtime)
+            .map(|status| status.description())
+            .map_err(Into::into)
     }
 
     /// Requests a running daemon to stop and clean up its socket.
@@ -191,7 +77,7 @@ impl Daemon {
     ///
     /// Returns an error if the endpoint, peer or response cannot be verified.
     pub fn stop(&self, runtime: &RuntimeDir) -> io::Result<()> {
-        local::request(runtime, local::Request::Stop).map(|_| ())
+        cirrus_client::stop(runtime).map_err(Into::into)
     }
 
     /// Reports shared local clean-cache payload usage without accessing the server or keyring.
@@ -199,12 +85,9 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the daemon or cache cannot be inspected.
     pub fn clean_cache_status(&self, runtime: &RuntimeDir) -> io::Result<CleanCacheStatus> {
-        let rows = local::account_request(runtime, local::AccountRequest::CleanCacheStatus)?;
-        match rows.as_slice() {
-            [(kind, value)] if kind == "clean-cache" => {
-                serde_json::from_str(value).map_err(io::Error::other)
-            }
-            _ => Err(io::Error::other("invalid clean cache status response")),
+        match account_request(runtime, AccountRequest::CleanCacheStatus)? {
+            AccountReply::CleanCacheStatus(value) => Ok(value),
+            _ => Err(unexpected_reply()),
         }
     }
 
@@ -213,12 +96,9 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the daemon, paths or local storage cannot be inspected.
     pub fn storage_status(&self, runtime: &RuntimeDir) -> io::Result<StorageStatus> {
-        let rows = local::account_request(runtime, local::AccountRequest::StorageStatus)?;
-        match rows.as_slice() {
-            [(kind, value)] if kind == "storage" => {
-                serde_json::from_str(value).map_err(io::Error::other)
-            }
-            _ => Err(io::Error::other("invalid storage status response")),
+        match account_request(runtime, AccountRequest::StorageStatus)? {
+            AccountReply::StorageStatus(value) => Ok(value),
+            _ => Err(unexpected_reply()),
         }
     }
 
@@ -227,7 +107,7 @@ impl Daemon {
     /// # Errors
     /// Returns an error for unavailable daemon or invalid/unsafe configuration.
     pub fn storage_limits(&self, runtime: &RuntimeDir) -> io::Result<StorageLimitsView> {
-        self.storage_limits_request(runtime, local::AccountRequest::StorageLimits)
+        self.storage_limits_request(runtime, AccountRequest::StorageLimits)
     }
 
     /// Sets user-chosen shared limits, or disables them without deleting data.
@@ -239,7 +119,7 @@ impl Daemon {
         runtime: &RuntimeDir,
         limits: Option<StorageLimits>,
     ) -> io::Result<StorageLimitsView> {
-        self.storage_limits_request(runtime, local::AccountRequest::SetStorageLimits { limits })
+        self.storage_limits_request(runtime, AccountRequest::SetStorageLimits { limits })
     }
 
     /// Releases a token-matched inactive store or namespace allowance, never data.
@@ -252,29 +132,25 @@ impl Daemon {
         store: String,
         token: String,
     ) -> io::Result<()> {
-        let rows = local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::ReleaseStorageReservation { store, token },
-        )?;
-        match rows.as_slice() {
-            [(kind, value)] if kind == "storage-reservation-released" && value == "{}" => Ok(()),
-            _ => Err(io::Error::other(
-                "invalid storage reservation release response",
-            )),
-        }
+            AccountRequest::ReleaseStorageReservation {
+                store: store.parse().map_err(io::Error::other)?,
+                token,
+            },
+        )
+        .map(|_| ())
+        .map_err(Into::into)
     }
 
     fn storage_limits_request(
         &self,
         runtime: &RuntimeDir,
-        request: local::AccountRequest,
+        request: AccountRequest,
     ) -> io::Result<StorageLimitsView> {
-        let rows = local::account_request(runtime, request)?;
-        match rows.as_slice() {
-            [(kind, value)] if kind == "storage-limits" => {
-                serde_json::from_str(value).map_err(io::Error::other)
-            }
-            _ => Err(io::Error::other("invalid storage limits response")),
+        match account_request(runtime, request)? {
+            AccountReply::StorageLimits(value) => Ok(value),
+            _ => Err(unexpected_reply()),
         }
     }
 
@@ -296,9 +172,7 @@ impl Daemon {
     /// # Errors
     /// Returns an error if system randomness is unavailable.
     pub fn sign_in_attempt() -> io::Result<String> {
-        let mut bytes = [0u8; 16];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        cirrus_client::sign_in_attempt()
     }
 
     /// Connects an account with a cancelable attempt identifier.
@@ -312,15 +186,16 @@ impl Daemon {
         ca_pem: Option<String>,
         attempt: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::Connect {
+            AccountRequest::Connect {
                 instance: instance.to_owned(),
                 ca_pem,
                 attempt: attempt.to_owned(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Requests cancellation before the attempt starts exchanging its authorization code.
@@ -328,7 +203,14 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the attempt is no longer active or is finishing.
     pub fn cancel_connect(&self, runtime: &RuntimeDir, attempt: &str) -> io::Result<()> {
-        local::cancel_connect(runtime, attempt)
+        account_request(
+            runtime,
+            AccountRequest::CancelConnect {
+                attempt: attempt.to_owned(),
+            },
+        )
+        .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Lists authenticated Spaces through the daemon.
@@ -340,40 +222,42 @@ impl Daemon {
         runtime: &RuntimeDir,
         instance: &str,
     ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::Spaces {
+            AccountRequest::Spaces {
                 instance: instance.to_owned(),
             },
-        )
+        )? {
+            AccountReply::Spaces(value) => Ok(value
+                .into_iter()
+                .map(|space| (space.id, space.name))
+                .collect()),
+            _ => Err(unexpected_reply()),
+        }
     }
 
-    /// Selects a freshly verified Space through the daemon.
+    /// Lists a directory in the requested, freshly verified Space via the daemon.
     ///
     /// # Errors
-    /// Returns an error if the daemon or account operation fails.
-    pub fn select_space(&self, runtime: &RuntimeDir, instance: &str, id: &str) -> io::Result<()> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::SelectSpace {
-                instance: instance.to_owned(),
-                id: id.to_owned(),
-            },
-        )
-        .map(|_| ())
-    }
-
-    /// Lists a directory in the selected Space via the daemon.
-    ///
-    /// # Errors
-    /// Returns an error for invalid paths, incomplete listings or daemon failures.
-    pub fn directory(
+    /// Returns an error for unverified access, incomplete listings or daemon failures.
+    pub fn directory_space(
         &self,
         runtime: &RuntimeDir,
         instance: &str,
+        space: &str,
         path: Vec<String>,
     ) -> io::Result<Vec<DirectoryEntry>> {
-        local::directory_request(runtime, instance, path)
+        match account_request(
+            runtime,
+            AccountRequest::DirectorySpace {
+                instance: instance.to_owned(),
+                space: space.to_owned(),
+                path: path.into(),
+            },
+        )? {
+            AccountReply::Entries(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Inspects one previously mounted Space's saved namespace without credentials.
@@ -388,29 +272,17 @@ impl Daemon {
         space: &str,
         path: Vec<String>,
     ) -> io::Result<Vec<DirectoryEntry>> {
-        local::offline_directory_request(runtime, instance, space, path)
-    }
-
-    /// Stages a local file without modifying the remote Space.
-    ///
-    /// # Errors
-    /// Returns an error if the source or durable state cannot be verified.
-    pub fn stage_file(
-        &self,
-        runtime: &RuntimeDir,
-        instance: &str,
-        path: Vec<String>,
-        source: &str,
-    ) -> io::Result<()> {
-        local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::StageFile {
+            AccountRequest::OfflineDirectory {
                 instance: instance.to_owned(),
-                path,
-                source: source.to_owned(),
+                space: space.to_owned(),
+                path: path.into(),
             },
-        )
-        .map(|_| ())
+        )? {
+            AccountReply::Entries(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Stages a local file in an explicitly verified Space.
@@ -425,16 +297,42 @@ impl Daemon {
         path: Vec<String>,
         source: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::StageFileSpace {
+            AccountRequest::StageFileSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path,
-                source: source.to_owned(),
+                path: path.into(),
+                source: source.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
+    }
+
+    /// Imports a local file using saved Space and parent metadata, without authenticating.
+    ///
+    /// # Errors
+    /// Returns an error for missing retained evidence, unsafe imports or daemon failures.
+    pub fn stage_file_offline_space(
+        &self,
+        runtime: &RuntimeDir,
+        instance: &str,
+        space: &str,
+        path: Vec<String>,
+        source: &str,
+    ) -> io::Result<()> {
+        account_request(
+            runtime,
+            AccountRequest::StageFileOfflineSpace {
+                instance: instance.to_owned(),
+                space: space.to_owned(),
+                path: path.into(),
+                source: source.into(),
+            },
+        )
+        .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Evicts clean cached ranges for a Space path without removing pins or edits.
@@ -448,15 +346,16 @@ impl Daemon {
         space: &str,
         path: Vec<String>,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::EvictSpace {
+            AccountRequest::EvictSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path,
+                path: path.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Lists a bounded account or Space journal page, newest first.
@@ -470,7 +369,17 @@ impl Daemon {
         space: Option<&str>,
         before: Option<i64>,
     ) -> io::Result<JournalPage> {
-        local::journal_request(runtime, instance, space, before)
+        match account_request(
+            runtime,
+            AccountRequest::Journal {
+                instance: instance.to_owned(),
+                space: space.map(str::to_owned),
+                before,
+            },
+        )? {
+            AccountReply::Journal(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Requests best-effort synchronization of staged files.
@@ -478,13 +387,14 @@ impl Daemon {
     /// # Errors
     /// Returns an error when operations remain pending, conflicted or uncertain.
     pub fn sync_pending(&self, runtime: &RuntimeDir, instance: &str) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::Sync {
+            AccountRequest::Sync {
                 instance: instance.to_owned(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Requests best-effort synchronization of one listed Space.
@@ -492,27 +402,15 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the Space is unlisted or has unresolved operations.
     pub fn sync_space(&self, runtime: &RuntimeDir, instance: &str, space: &str) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::SyncSpace {
+            AccountRequest::SyncSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
             },
         )
         .map(|_| ())
-    }
-
-    /// Runs one explicit Space write-transfer turn, releasing ownership on return.
-    ///
-    /// # Errors
-    /// Returns an error for account, storage or IPC failure.
-    pub fn write_turn(
-        &self,
-        runtime: &RuntimeDir,
-        instance: &str,
-        space: &str,
-    ) -> io::Result<WriteTurnOutcome> {
-        local::write_turn_request(runtime, instance, space)
+        .map_err(Into::into)
     }
 
     /// Requests bounded-output, local-only status for one immutable Space ID.
@@ -525,7 +423,16 @@ impl Daemon {
         instance: &str,
         space: &str,
     ) -> io::Result<SyncStatus> {
-        local::sync_status_request(runtime, instance, space)
+        match account_request(
+            runtime,
+            AccountRequest::SyncStatus {
+                instance: instance.to_owned(),
+                space: space.to_owned(),
+            },
+        )? {
+            AccountReply::SyncStatus(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Acknowledges an inspected conflict or uncertain entry, retaining its local copy.
@@ -538,57 +445,15 @@ impl Daemon {
         instance: &str,
         staged: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::Acknowledge {
+            AccountRequest::Acknowledge {
                 instance: instance.to_owned(),
                 staged: staged.to_owned(),
             },
         )
         .map(|_| ())
-    }
-
-    /// Pins a file or directory tree for experimental offline use.
-    ///
-    /// # Errors
-    /// Returns an error if the pin cannot be verified and stored.
-    pub fn pin(&self, runtime: &RuntimeDir, instance: &str, path: Vec<String>) -> io::Result<()> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::Pin {
-                instance: instance.to_owned(),
-                path,
-            },
-        )
-        .map(|_| ())
-    }
-
-    /// Removes a previously requested pin.
-    ///
-    /// # Errors
-    /// Returns an error if the account or offline state is unavailable.
-    pub fn unpin(&self, runtime: &RuntimeDir, instance: &str, path: Vec<String>) -> io::Result<()> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::Unpin {
-                instance: instance.to_owned(),
-                path,
-            },
-        )
-        .map(|_| ())
-    }
-
-    /// Lists pin paths and their observed availability status.
-    ///
-    /// # Errors
-    /// Returns an error if the account or offline state is unavailable.
-    pub fn pins(&self, runtime: &RuntimeDir, instance: &str) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::Pins {
-                instance: instance.to_owned(),
-            },
-        )
+        .map_err(Into::into)
     }
 
     /// Pins a path in an explicitly verified Space.
@@ -602,15 +467,16 @@ impl Daemon {
         space: &str,
         path: Vec<String>,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::PinSpace {
+            AccountRequest::PinSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path,
+                path: path.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Removes a pin in an explicitly verified Space.
@@ -624,53 +490,66 @@ impl Daemon {
         space: &str,
         path: Vec<String>,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::UnpinSpace {
+            AccountRequest::UnpinSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path,
+                path: path.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
-    /// Lists pins in an explicitly verified Space.
+    /// Lists locally retained pins in the named Space without checking the server.
     ///
     /// # Errors
-    /// Returns an error if Space verification or pin listing fails.
+    /// Returns an error if local identity or pin listing is unavailable.
     pub fn pins_space(
         &self,
         runtime: &RuntimeDir,
         instance: &str,
         space: &str,
     ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::PinsSpace {
+            AccountRequest::PinsSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
             },
-        )
+        )? {
+            AccountReply::Pins(value) => Ok(value
+                .into_iter()
+                .map(|pin| (pin.path.clone(), pin.status(false).to_owned()))
+                .collect()),
+            _ => Err(unexpected_reply()),
+        }
     }
 
-    /// Lists a page of retained pin roots, without connecting to the server.
+    /// Compares pins with the server in a freshly verified Space.
     ///
     /// # Errors
-    /// Returns an error if the daemon or local state is unavailable.
-    pub fn retained_pins(
+    /// Returns an error if Space verification or pin listing fails.
+    pub fn pins_space_check_remote(
         &self,
         runtime: &RuntimeDir,
         instance: &str,
-        offset: u32,
+        space: &str,
     ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::RetainedPins {
+            AccountRequest::PinsSpaceCheckRemote {
                 instance: instance.to_owned(),
-                offset,
+                space: space.to_owned(),
             },
-        )
+        )? {
+            AccountReply::Pins(value) => Ok(value
+                .into_iter()
+                .map(|pin| (pin.path.clone(), pin.status(true).to_owned()))
+                .collect()),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Lists journal-referenced retained staged copies without account credentials.
@@ -682,17 +561,17 @@ impl Daemon {
         runtime: &RuntimeDir,
         instance: &str,
         offset: u32,
-    ) -> io::Result<Vec<RetainedStaged>> {
-        local::account_request(
+    ) -> io::Result<RetainedPage<RetainedStaged>> {
+        match account_request(
             runtime,
-            local::AccountRequest::RetainedStaged {
+            AccountRequest::RetainedStaged {
                 instance: instance.to_owned(),
                 offset,
             },
-        )?
-        .into_iter()
-        .map(|(_, value)| serde_json::from_str(&value).map_err(io::Error::other))
-        .collect()
+        )? {
+            AccountReply::RetainedStaged(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Exports one journal-referenced staged copy to a new local path.
@@ -707,16 +586,17 @@ impl Daemon {
         selector: &str,
         destination: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::ExportStaged {
+            AccountRequest::ExportStaged {
                 instance: instance.to_owned(),
                 id,
                 selector: selector.to_owned(),
-                destination: destination.to_owned(),
+                destination: destination.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Parses one page of pin roots for interactive clients.
@@ -728,16 +608,17 @@ impl Daemon {
         runtime: &RuntimeDir,
         instance: &str,
         offset: u32,
-    ) -> io::Result<Vec<RetainedPin>> {
-        self.retained_pins(runtime, instance, offset)?
-            .into_iter()
-            .map(|(space, root)| {
-                Ok(RetainedPin {
-                    space,
-                    root: serde_json::from_str(&root).map_err(io::Error::other)?,
-                })
-            })
-            .collect()
+    ) -> io::Result<RetainedPage<RetainedPin>> {
+        match account_request(
+            runtime,
+            AccountRequest::RetainedPins {
+                instance: instance.to_owned(),
+                offset,
+            },
+        )? {
+            AccountReply::RetainedPins(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Parses one page of pinned files for interactive clients.
@@ -751,88 +632,19 @@ impl Daemon {
         space: &str,
         root: Vec<String>,
         offset: u32,
-    ) -> io::Result<Vec<RetainedPinFile>> {
-        self.retained_files(runtime, instance, space, root, offset)?
-            .into_iter()
-            .map(|(path, value)| {
-                let (selector, metadata) = value
-                    .split_once('\n')
-                    .ok_or_else(|| io::Error::other("invalid retained version"))?;
-                let version: serde_json::Value =
-                    serde_json::from_str(metadata).map_err(io::Error::other)?;
-                Ok(RetainedPinFile {
-                    path: serde_json::from_str(&path).map_err(io::Error::other)?,
-                    selector: selector.to_owned(),
-                    size: version.get("size").and_then(serde_json::Value::as_u64),
-                })
-            })
-            .collect()
-    }
-
-    /// Lists retained file metadata; each value is a selector, newline, and
-    /// stored version JSON. The selector does not assert integrity.
-    ///
-    /// # Errors
-    /// Returns an error if the daemon or local state is unavailable.
-    pub fn retained_files(
-        &self,
-        runtime: &RuntimeDir,
-        instance: &str,
-        space: &str,
-        root: Vec<String>,
-        offset: u32,
-    ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
+    ) -> io::Result<RetainedPage<RetainedPinFile>> {
+        match account_request(
             runtime,
-            local::AccountRequest::RetainedFiles {
+            AccountRequest::RetainedFiles {
                 instance: instance.to_owned(),
+                offset,
                 space: space.to_owned(),
-                root,
-                offset,
+                root: root.into(),
             },
-        )
-    }
-
-    /// Lists independent immutable displaced-pin copy IDs and capture metadata.
-    ///
-    /// # Errors
-    /// Returns an error if local retained state or the service is unavailable.
-    pub fn pin_copies(
-        &self,
-        runtime: &RuntimeDir,
-        instance: &str,
-        offset: u32,
-    ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::PinCopies {
-                instance: instance.to_owned(),
-                offset,
-            },
-        )
-    }
-
-    /// Lists directories and selected file versions in one retained pin copy.
-    ///
-    /// # Errors
-    /// Returns an error for invalid selection or unavailable retained metadata.
-    pub fn pin_copy_entries(
-        &self,
-        runtime: &RuntimeDir,
-        instance: &str,
-        space: &str,
-        id: i64,
-        offset: u32,
-    ) -> io::Result<Vec<(String, String)>> {
-        local::account_request(
-            runtime,
-            local::AccountRequest::PinCopyEntries {
-                instance: instance.to_owned(),
-                space: space.to_owned(),
-                id,
-                offset,
-            },
-        )
+        )? {
+            AccountReply::RetainedFiles(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Lists typed retained pin captures for the recovery controls.
@@ -844,11 +656,17 @@ impl Daemon {
         runtime: &RuntimeDir,
         instance: &str,
         offset: u32,
-    ) -> io::Result<Vec<RetainedPinCopy>> {
-        self.pin_copies(runtime, instance, offset)?
-            .into_iter()
-            .map(|(_, value)| serde_json::from_str(&value).map_err(io::Error::other))
-            .collect()
+    ) -> io::Result<RetainedPage<RetainedPinCopy>> {
+        match account_request(
+            runtime,
+            AccountRequest::PinCopies {
+                instance: instance.to_owned(),
+                offset,
+            },
+        )? {
+            AccountReply::PinCopies(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Lists captured directory identities and selectable files for recovery.
@@ -862,11 +680,19 @@ impl Daemon {
         space: &str,
         id: i64,
         offset: u32,
-    ) -> io::Result<Vec<RetainedPinCopyEntry>> {
-        self.pin_copy_entries(runtime, instance, space, id, offset)?
-            .into_iter()
-            .map(|(_, value)| serde_json::from_str(&value).map_err(io::Error::other))
-            .collect()
+    ) -> io::Result<RetainedPage<RetainedPinCopyEntry>> {
+        match account_request(
+            runtime,
+            AccountRequest::PinCopyEntries {
+                instance: instance.to_owned(),
+                offset,
+                space: space.to_owned(),
+                id,
+            },
+        )? {
+            AccountReply::PinCopyEntries(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Exports one selected file from an immutable pin copy.
@@ -882,18 +708,19 @@ impl Daemon {
         selector: &str,
         destination: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::ExportPinCopy {
+            AccountRequest::ExportPinCopy {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
                 id: source.0,
-                path: source.1,
+                path: source.1.into(),
                 selector: selector.to_owned(),
-                destination: destination.to_owned(),
+                destination: destination.into(),
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Removes only an explicitly identified retained pin copy, never active pins.
@@ -907,15 +734,16 @@ impl Daemon {
         space: &str,
         id: i64,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::RemovePinCopy {
+            AccountRequest::RemovePinCopy {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
                 id,
             },
         )
         .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Exports one retained, possibly stale file version to a new local path.
@@ -931,33 +759,19 @@ impl Daemon {
         selector: &str,
         destination: &str,
     ) -> io::Result<()> {
-        local::account_request(
+        account_request(
             runtime,
-            local::AccountRequest::ExportRetained {
+            AccountRequest::ExportRetained {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                root: source.0,
-                path: source.1,
+                root: source.0.into(),
+                path: source.1.into(),
                 selector: selector.to_owned(),
-                destination: destination.to_owned(),
+                destination: destination.into(),
             },
         )
         .map(|_| ())
-    }
-
-    /// Mounts the selected Space at an existing empty private directory.
-    ///
-    /// # Errors
-    /// Returns an error if the mount, account or daemon is unavailable.
-    pub fn mount(&self, runtime: &RuntimeDir, instance: &str, path: &str) -> io::Result<()> {
-        local::mount_request(
-            runtime,
-            local::AccountRequest::Mount {
-                instance: instance.to_owned(),
-                path: path.to_owned(),
-            },
-        )
-        .map(|_| ())
+        .map_err(Into::into)
     }
 
     /// Mounts an explicitly verified Space at an existing private directory.
@@ -986,17 +800,16 @@ impl Daemon {
         space: &str,
         path: Option<&str>,
     ) -> io::Result<String> {
-        let rows = local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::MountSpace {
+            AccountRequest::MountSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path: path.map(str::to_owned),
+                path: path.map(Into::into),
             },
-        )?;
-        match rows.as_slice() {
-            [(id, path)] if id == space => Ok(path.clone()),
-            _ => Err(io::Error::other("invalid mount response")),
+        )? {
+            AccountReply::Mounted(value) => Ok(value.path),
+            _ => Err(unexpected_reply()),
         }
     }
 
@@ -1011,24 +824,23 @@ impl Daemon {
         space: &str,
         path: &str,
     ) -> io::Result<String> {
-        let rows = local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::OfflineMountSpace {
+            AccountRequest::OfflineMountSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path: path.to_owned(),
+                path: path.into(),
             },
-        )?;
-        match rows.as_slice() {
-            [(id, path)] if id == space => Ok(path.clone()),
-            _ => Err(io::Error::other("invalid offline mount response")),
+        )? {
+            AccountReply::Mounted(value) => Ok(value.path),
+            _ => Err(unexpected_reply()),
         }
     }
 
     /// Mounts retained files for explicit local editing without credentials.
     ///
     /// # Errors
-    /// Requires automatic work disabled, retained bindings and safe mount ownership.
+    /// Requires retained bindings and safe mount ownership.
     pub fn mount_writable_offline_space(
         &self,
         runtime: &RuntimeDir,
@@ -1036,26 +848,17 @@ impl Daemon {
         space: &str,
         path: &str,
     ) -> io::Result<String> {
-        let rows = local::account_request(
+        match account_request(
             runtime,
-            local::AccountRequest::WritableOfflineMountSpace {
+            AccountRequest::WritableOfflineMountSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
-                path: path.to_owned(),
+                path: path.into(),
             },
-        )?;
-        match rows.as_slice() {
-            [(id, path)] if id == space => Ok(path.clone()),
-            _ => Err(io::Error::other("invalid offline mount response")),
+        )? {
+            AccountReply::Mounted(value) => Ok(value.path),
+            _ => Err(unexpected_reply()),
         }
-    }
-
-    /// Unmounts the Space owned by the daemon.
-    ///
-    /// # Errors
-    /// Returns an error if no mount is owned or unmounting fails.
-    pub fn unmount(&self, runtime: &RuntimeDir) -> io::Result<()> {
-        local::mount_request(runtime, local::AccountRequest::Unmount).map(|_| ())
     }
 
     /// Unmounts one Space owned by the daemon without affecting other mounts.
@@ -1068,22 +871,15 @@ impl Daemon {
         instance: &str,
         space: &str,
     ) -> io::Result<()> {
-        local::mount_request(
+        account_request(
             runtime,
-            local::AccountRequest::UnmountSpace {
+            AccountRequest::UnmountSpace {
                 instance: instance.to_owned(),
                 space: space.to_owned(),
             },
         )
         .map(|_| ())
-    }
-
-    /// Returns the daemon's current mountpoint, if any.
-    ///
-    /// # Errors
-    /// Returns an error if the daemon or mount state is unavailable.
-    pub fn mount_status(&self, runtime: &RuntimeDir) -> io::Result<Option<String>> {
-        local::mount_request(runtime, local::AccountRequest::MountStatus)
+        .map_err(Into::into)
     }
 
     /// Lists live mounts and verified owner records requiring recovery.
@@ -1091,10 +887,10 @@ impl Daemon {
     /// # Errors
     /// Returns an error when owner records are unsafe or ambiguous.
     pub fn mounts(&self, runtime: &RuntimeDir) -> io::Result<Vec<MountInfo>> {
-        local::account_request(runtime, local::AccountRequest::Mounts)?
-            .into_iter()
-            .map(|(_, value)| serde_json::from_str(&value).map_err(io::Error::other))
-            .collect()
+        match account_request(runtime, AccountRequest::Mounts)? {
+            AccountReply::Mounts(value) => Ok(value),
+            _ => Err(unexpected_reply()),
+        }
     }
 
     /// Recovers a stale recorded mount at the explicitly supplied path.
@@ -1102,12 +898,12 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the mount record, identity or unmount cannot be verified.
     pub fn recover_mount(&self, runtime: &RuntimeDir, path: &str) -> io::Result<()> {
-        local::mount_request(
-            runtime,
-            local::AccountRequest::RecoverMount {
-                path: path.to_owned(),
-            },
-        )
-        .map(|_| ())
+        account_request(runtime, AccountRequest::RecoverMount { path: path.into() })
+            .map(|_| ())
+            .map_err(Into::into)
     }
+}
+
+fn unexpected_reply() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "unexpected typed daemon reply")
 }

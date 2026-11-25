@@ -36,20 +36,7 @@ fn directory(
     Ok(entries)
 }
 
-/// Outcome of one explicitly requested write transfer turn, not whole-Space sync status.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum WriteTurnOutcome {
-    /// No unresolved work remains in the requested Space.
-    Idle,
-    /// Progress was made or a transfer budget expired; call again to continue.
-    Yielded,
-    /// Namespace or conflict-copy work needs the ordinary explicit sync executor.
-    Dependencies,
-    /// A conflict, rejected upload or ambiguous outcome needs user attention.
-    Attention,
-    /// A read-only request or local continuation checkpoint failed; retry is safe.
-    Retry,
-}
+pub use cirrus_api::WriteTurnOutcome;
 
 struct Budget {
     started: Instant,

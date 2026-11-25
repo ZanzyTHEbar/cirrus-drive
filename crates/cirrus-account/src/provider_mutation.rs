@@ -438,7 +438,7 @@ impl Source {
 }
 
 impl Accounts {
-    #[cfg(feature = "fault-injection")]
+    #[cfg(all(test, target_os = "linux", feature = "fault-injection"))]
     pub fn provider_fixture_observe(&self, domain: &str, container: &str) -> Result<Vec<Item>> {
         let _automatic = crate::executor::automatic_guard(self);
         let root = self.storage_root()?;
@@ -592,8 +592,12 @@ impl Accounts {
         {
             return Err(Error::Unavailable);
         }
-        let session = self.read_session_in(&binding.root, &binding.instance)?;
-        crate::bound_space(&session, Some(&binding))?;
+        let session = self.read_session_in(
+            &binding.root,
+            &binding.instance,
+            crate::SessionAccess::BoundOnline(&binding),
+        )?;
+        crate::bound_space(&session, &binding)?;
         let observed = Observation {
             session: &session,
             space: &binding.space,
@@ -997,8 +1001,12 @@ impl Accounts {
             waiting: None,
             postcondition: None,
         };
-        let session = self.read_session_in(&binding.root, &binding.instance)?;
-        crate::bound_space(&session, Some(&binding))?;
+        let session = self.read_session_in(
+            &binding.root,
+            &binding.instance,
+            crate::SessionAccess::BoundOnline(&binding),
+        )?;
+        crate::bound_space(&session, &binding)?;
         let priority = self.request_foreground();
         let owner = self.wait_for_automatic_turn_in(&binding.root)?;
         if let Some((prior, result)) = load(catalog, &record.key, &record.descriptor)? {
@@ -1417,8 +1425,12 @@ impl Accounts {
         {
             return Err(Error::Unavailable);
         }
-        let session = self.read_session_in(&binding.root, &binding.instance)?;
-        crate::bound_space(&session, Some(&binding))?;
+        let session = self.read_session_in(
+            &binding.root,
+            &binding.instance,
+            crate::SessionAccess::BoundOnline(&binding),
+        )?;
+        crate::bound_space(&session, &binding)?;
         let priority = self.request_foreground();
         let owner = self.wait_for_automatic_turn_in(&binding.root)?;
         if let Some((completed, Some(reply))) = load(catalog, &record.key, &record.descriptor)? {
@@ -1689,8 +1701,12 @@ impl Accounts {
         {
             return Err(Error::Unavailable);
         }
-        let session = self.read_session_in(&binding.root, &binding.instance)?;
-        crate::bound_space(&session, Some(&binding))?;
+        let session = self.read_session_in(
+            &binding.root,
+            &binding.instance,
+            crate::SessionAccess::BoundOnline(&binding),
+        )?;
+        crate::bound_space(&session, &binding)?;
         let _priority = self.request_foreground();
         let _owner = self.wait_for_automatic_turn_in(&binding.root)?;
         let observed = Observation {

@@ -92,7 +92,7 @@ impl Scheduler {
     pub(crate) fn start(
         accounts: Arc<Accounts>,
         busy: Arc<AtomicBool>,
-        mounts: Arc<Mutex<crate::local::MountRegistry>>,
+        mounts: Arc<Mutex<crate::application::MountRegistry>>,
         enabled: bool,
     ) -> io::Result<Self> {
         let control = Arc::new(Control {
@@ -338,9 +338,11 @@ impl Scheduler {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
+        !self.control.paused.load(Ordering::Acquire)
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
     }
 
     pub(crate) fn pause(&self) {

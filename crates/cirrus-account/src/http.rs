@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -8,7 +9,7 @@ use reqwest::redirect::Policy;
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use crate::AccountError;
+use crate::{AccountError, GraphListingError};
 
 const LIMIT: u64 = 65_536;
 
@@ -116,24 +117,27 @@ pub(crate) fn space_page(
     access_token: &str,
     page: usize,
     cancelled: &AtomicBool,
-) -> Result<Response, AccountError> {
+) -> Result<Response, GraphListingError> {
     let mut attempt = 0;
     loop {
         crate::executor::preflight_checkpoint()?;
         if cancelled.load(Ordering::Acquire) {
-            return Err(AccountError::new(
-                "account operation cancelled by daemon shutdown",
-            ));
+            return Err(AccountError::new("account operation cancelled by daemon shutdown").into());
         }
         let response = client
             .get(url.clone())
             .bearer_auth(access_token)
             .send()
             .map_err(|error| {
-                if page == 0 {
+                let failure = if page == 0 {
                     AccountError::request("Space request failed", &error)
                 } else {
                     AccountError::new("Space listing was interrupted before completion")
+                };
+                if page == 0 && attempt == 0 && socket_unreachable(&error) {
+                    GraphListingError::InitialTransport(failure)
+                } else {
+                    failure.into()
                 }
             })?;
         if !matches!(response.status().as_u16(), 429 | 503) || attempt >= 2 {
@@ -160,9 +164,9 @@ pub(crate) fn space_page(
         let until = Instant::now() + delay;
         while Instant::now() < until {
             if cancelled.load(Ordering::Acquire) {
-                return Err(AccountError::new(
-                    "account operation cancelled by daemon shutdown",
-                ));
+                return Err(
+                    AccountError::new("account operation cancelled by daemon shutdown").into(),
+                );
             }
             std::thread::sleep(
                 until
@@ -172,6 +176,30 @@ pub(crate) fn space_page(
         }
         attempt += 1;
     }
+}
+
+fn socket_unreachable(error: &reqwest::Error) -> bool {
+    // A reqwest timeout or reset can occur during TLS or HTTP. Require a
+    // definite socket-level refusal/unreachability, not an ambiguous outage.
+    if !error.is_connect() {
+        return false;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<io::Error>()
+            && io.raw_os_error().is_some()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+            )
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 pub(crate) fn json<T: DeserializeOwned>(mut response: Response) -> Result<T, AccountError> {

@@ -27,17 +27,7 @@ struct Record {
     ceiling_bytes: u64,
 }
 
-/// Conservative per-owner disk allowance, not an exact global physical total.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NamespaceStorageReservation {
-    pub token: String,
-    pub device: u64,
-    pub inode: u64,
-    pub ceiling_bytes: u64,
-    /// None means other-process or inactive materialization is unknown.
-    pub known_local_allocated_bytes: Option<u64>,
-    pub outstanding_reserved_bytes: u64,
-}
+pub use cirrus_api::NamespaceStorageReservation;
 
 fn invalid() -> AccountError {
     AccountError::new("invalid namespace scratch reservation; inspect storage status")

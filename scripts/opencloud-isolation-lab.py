@@ -97,6 +97,7 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
     for path in (bus_dir, home, daemon_dir, control, mount, desktop_home, data, config):
         path.mkdir(mode=0o700)
     bus = keyring = daemon = client = None
+    owned_space = None
     env = dict(os.environ, HOME=str(desktop_home), XDG_DATA_HOME=str(data), XDG_CONFIG_HOME=str(config),
                XDG_RUNTIME_DIR=str(daemon_dir), CIRRUS_TEST_ACCOUNT_HOME=str(home),
                CIRRUS_TEST_USER_BUS_DIR=str(bus_dir))
@@ -135,7 +136,9 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
         else:
             raise RuntimeError("second disposable keyring did not acquire its bus name")
 
-        daemon = subprocess.Popen([str(fixture.BINARY)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The shared edit must remain pending until access has been revoked.
+        daemon = subprocess.Popen([str(fixture.service_binary()), "--no-auto-sync"], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(150):
             if cli("--status").returncode == 0:
                 break
@@ -166,8 +169,11 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
         ids = {line.split("\t", 1)[0] for line in spaces}
         if not ids or admin_space in ids:
             raise RuntimeError("second user's listing exposed the other user's private Space")
-        if cli("--select-space", url, admin_space).returncode == 0:
-            raise RuntimeError("second user could select the other user's private Space")
+        owned_space = admin_space
+        rejected = cli("--mount-space", url, admin_space, mount)
+        if rejected.returncode == 0 or "requested Space is not in the authenticated listing" not in rejected.stderr:
+            raise RuntimeError("mount did not reject the other user's private Space")
+        owned_space = None
         dav = url + "dav/spaces/" + quote(admin_space, safe="") + "/"
         for method in ("PROPFIND", "PUT"):
             request = Request(dav if method == "PROPFIND" else dav + "cirrus-isolation-probe",
@@ -183,11 +189,13 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
             own = [drive["id"] for drive in json.load(response)["value"] if drive.get("driveType") == "personal"]
         if len(own) != 1 or own[0] not in ids:
             raise RuntimeError("second user has no unique accessible personal Space")
-        fixture.require(cli("--select-space", url, own[0]), "selecting second user's Space")
-        fixture.require(cli("--mount", url, mount), "mounting second user's Space")
+        personal_space = own[0]
+        owned_space = personal_space
+        fixture.require(cli("--mount-space", url, personal_space, mount), "mounting second user's Space")
         (mount / "isolation.txt").write_bytes(b"second user only\n")
         fixture.require(cli("--sync", url), "syncing second user's file")
-        fixture.require(cli("--unmount"), "unmounting second user's Space")
+        fixture.require(cli("--unmount-space", url, personal_space), "unmounting second user's Space")
+        owned_space = None
         ocs = url + "ocs/v2.php/apps/files_sharing/api/v1/shares"
         share = urlencode({"space_ref": shared_space, "shareType": 7, "shareWith": "cirrus-isolation", "role": "editor"}).encode()
         headers = {"Authorization": "Bearer " + admin_token, "OCS-APIRequest": "true", "Content-Type": "application/x-www-form-urlencoded"}
@@ -201,8 +209,8 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
             time.sleep(0.2)
         else:
             raise RuntimeError("shared Space did not appear for the second user")
-        fixture.require(cli("--select-space", url, shared_space), "selecting shared Space")
-        fixture.require(cli("--mount", url, mount), "mounting shared Space")
+        owned_space = shared_space
+        fixture.require(cli("--mount-space", url, shared_space, mount), "mounting shared Space")
         staged = mount / "retained-after-revocation.txt"
         staged.write_bytes(b"retain this local edit after access is revoked\n")
         revoke = ocs + "/" + quote(shared_space, safe="") + "?" + urlencode({"shareWith": "cirrus-isolation"})
@@ -227,23 +235,30 @@ def run(root, runtime, url, admin_token, admin_space, opener, requests, ws, fixt
         fixture.require(cli("--export-staged", url, retained["id"], retained["selector"], destination), "recovering the revoked edit")
         if destination.read_bytes() != b"retain this local edit after access is revoked\n":
             raise RuntimeError("the recovered revoked edit did not match")
-        fixture.require(cli("--unmount"), "unmounting the revoked Space")
-        rejected = cli("--mount", url, mount)
-        if rejected.returncode == 0 or "no longer in the signed-in user's listing" not in rejected.stderr:
-            raise RuntimeError("mount did not reject the revoked selection")
+        fixture.require(cli("--unmount-space", url, shared_space), "unmounting the revoked Space")
+        rejected = cli("--mount-space", url, shared_space, mount)
+        if rejected.returncode == 0 or "requested Space is not in the authenticated listing" not in rejected.stderr:
+            raise RuntimeError("mount did not reject the revoked Space")
+        owned_space = None
         fixture.require(cli("--stop"), "stopping second disposable daemon")
         daemon.wait(timeout=5)
-        print("PASS: two OIDC identities, private isolation, shared access and revoked pending-edit recovery", flush=True)
     finally:
         fixture.stop_process(client)
         try:
-            if daemon and daemon.poll() is None:
-                status = cli("--mount-status")
-                if status.returncode == 0 and status.stdout.startswith(f"mounted: {mount};"):
-                    result = cli("--unmount")
-                    if result.returncode:
-                        print("second disposable mount could not be unmounted; lab data will be preserved", flush=True)
+            if owned_space is not None and daemon and daemon.poll() is None:
+                status = fixture.require(cli("--mounts"), "listing second disposable mounts")
+                for line in status.stdout.splitlines():
+                    row = json.loads(line)
+                    if (row["instance"], row["space_id"], row["path"]) != (url, owned_space, str(mount)):
+                        continue
+                    if row["state"] == "Mounted":
+                        fixture.require(cli("--unmount-space", url, owned_space), "unmounting second disposable mount")
+                    elif row["state"] == "RecoveryRequired":
+                        fixture.require(cli("--recover-mount", mount), "recovering second disposable mount")
+                    else:
+                        raise RuntimeError(f"unknown second disposable mount state at {mount}")
         finally:
             fixture.stop_process(daemon)
             fixture.stop_process(keyring)
             fixture.stop_process(bus)
+    print("PASS: two OIDC identities, private isolation, shared access and revoked pending-edit recovery", flush=True)

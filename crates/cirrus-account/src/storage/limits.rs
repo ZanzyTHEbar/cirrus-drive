@@ -14,28 +14,13 @@ use crate::{AccountError, account_storage::StorageRoot, offline, ownership};
 const FILE: &str = "storage-limits.json";
 pub(crate) const PRESSURE: &str = "configured storage pressure limit reached";
 
-/// User-chosen bytes, shared by cooperating daemons for this account owner.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StorageLimits {
-    pub budget_bytes: u64,
-    pub free_space_reserve_bytes: u64,
-}
+pub use cirrus_api::{StorageLimits, StorageLimitsView};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(deserialize_with = "Option::deserialize")]
     limits: Option<StorageLimits>,
-}
-
-/// Explicit enforcement coverage; a configured policy is not a hard global cap.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StorageLimitsView {
-    pub limits: Option<StorageLimits>,
-    pub enforcement: String,
-    pub hard_global_limit: bool,
-    pub automatic_reclamation: String,
 }
 
 fn invalid() -> AccountError {

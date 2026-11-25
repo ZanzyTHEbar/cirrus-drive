@@ -1,0 +1,17 @@
+[package]
+name = "cirrus-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cirrus-daemon"
+path = "src/main.rs"
+
+[dependencies]
+cirrus-client = { path = "../cirrus-client" }
+serde = "1"
+serde_json = "1"
+
+[features]
+fault-injection = []

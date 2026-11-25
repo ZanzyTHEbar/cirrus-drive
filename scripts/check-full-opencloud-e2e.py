@@ -16,6 +16,7 @@ import socket
 import ssl
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -90,6 +91,7 @@ def child(root, runtime, container):
     owner_cleanup_mounts = []
     lost_response = [False]
     uncertain_puts = [0]
+    import_puts = {}
     fail_verification = [False]
     fail_upload_status = [False]
     lost_conflict_copy = [False]
@@ -177,7 +179,6 @@ def child(root, runtime, container):
     local_directory_requests = {method: 0 for method in ("MKCOL", "PUT", "DELETE", "MOVE")}
     remove_staged_requests = {method: 0 for method in ("MKCOL", "PUT", "DELETE", "MOVE")}
     root_publication_puts = [0]
-    import_publication_puts = [0]
     capture_requests = {method: 0 for method in ("GET", "PUT", "DELETE", "MOVE")}
     capture_put_active = threading.Event()
     capture_gets_inside_put = [0]
@@ -459,8 +460,6 @@ def child(root, runtime, container):
                     capture_gets_inside_put[0] += 1
             if self.path.endswith("/root-publication") and self.command == "PUT":
                 root_publication_puts[0] += 1
-            if self.path.endswith("/cli-import-publication") and self.command == "PUT":
-                import_publication_puts[0] += 1
             if "/folder/empty-" in self.path and self.command in empty_move_requests:
                 empty_move_requests[self.command] += 1
             if self.path.endswith(("/folder/file-source", "/folder/file-pressure", "/folder/file-chain-original", "/folder/file-chain-source", "/folder/file-chain-target")) and self.command in file_move_requests:
@@ -602,8 +601,15 @@ def child(root, runtime, container):
                     return
             try:
                 diagnostic_event("upstream-start",method=self.command,path=self.path)
-                status, fields, body = lab.upstream(container, self.command, self.path,
-                                                     self.rfile.read(length), headers)
+                request_body = self.rfile.read(length)
+                if self.command == "PUT" and import_puts:
+                    put_path = unquote(urlsplit(self.path).path)
+                    for name, attempts in import_puts.items():
+                        target = unquote(base) + "/" + name
+                        if put_path == target or put_path.startswith(target + " (conflict "):
+                            attempts.append((put_path, self.headers.get("If-Match"),
+                                             self.headers.get("If-None-Match"), request_body))
+                status, fields, body = lab.upstream(container, self.command, self.path, request_body, headers)
                 diagnostic_event("upstream-end",method=self.command,path=self.path,status=status,bytes=len(body))
                 if replacement_late_child[0] and self.command=="PROPFIND" and self.path.rstrip("/").endswith("/dest-conflict-moved"):
                     replacement_late_child[0]=False
@@ -808,12 +814,85 @@ def child(root, runtime, container):
             # MKCOLs through the Docker DAV proxy, not one small lab operation.
             return subprocess.run([str(fixture.BINARY), *map(str, args)], env=os.environ,
                                   capture_output=True, text=True, timeout=180)
-        if (os.environ.get("CIRRUS_TEST_MANUAL_PIN") or os.environ.get("CIRRUS_TEST_SNAPSHOT_ATOMICITY")) and args[0] in ("--pin", "--sync"):
+        if (os.environ.get("CIRRUS_TEST_MANUAL_PIN") or os.environ.get("CIRRUS_TEST_SNAPSHOT_ATOMICITY")) and args[0] in ("--pin-space", "--sync"):
             # Several complete 2599-entry observations exceed the small lab's
             # 30s command wrapper; keep a fixed budget, not a product override.
             return subprocess.run([str(fixture.BINARY), *map(str, args)], env=os.environ,
                                   capture_output=True, text=True, timeout=180)
         return fixture.run([str(fixture.BINARY), *map(str, args)], env=os.environ)
+
+    def resume_mount(space_id, path, description):
+        # These are ordinary mounts with an already verified, retained root,
+        # not the credential-free retained-only mount modes.
+        assert server is None, "fixture proxy was not shut down"
+        with socket.socket() as probe:
+            probe.settimeout(2)
+            assert probe.connect_ex(("127.0.0.1", port)) == errno.ECONNREFUSED, "fixture socket did not refuse connection"
+        database = runtime / "home/.local/state/cirrus-drive/state.db"
+        with sqlite3.connect(database) as db:
+            proof = db.execute(
+                """SELECT 1 FROM sync_spaces AS a
+                   JOIN account_identities AS i USING(instance, issuer, subject)
+                   JOIN snapshots AS s USING(instance, space, issuer, subject)
+                   WHERE a.instance=? AND a.space=? AND s.path='[]'""",
+                (url, space_id),
+            ).fetchone()
+        assert proof, f"no matching activation and retained root for {space_id}"
+        fixture.require(cli("--mount-space", url, space_id, path), description)
+
+    def lab_account_request(request, environment=os.environ, *, process=None):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(30)
+            client.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
+            if process is not None:
+                peer = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"))
+                pid, uid, _ = struct.unpack("iII", peer)
+                if pid != process.pid or uid != os.geteuid() or process.poll() is not None:
+                    raise RuntimeError("runtime socket does not belong to the live fixture daemon")
+            client.sendall(b"CIRRUS/3 " + json.dumps(request).encode() + b"\n")
+            with client.makefile("rb") as response:
+                line = response.readline(262145)
+        assert line.startswith(b"CIRRUS/3 {") and line.endswith(b"\n") and len(line) <= 262144, line[:256]
+        return json.loads(line.removeprefix(b"CIRRUS/3 "))
+
+    def fallback_cleanup_mounts(process):
+        # second_cli can close over a rebound runtime, and either daemon can
+        # own either fixture path. Resolve the endpoint from the exact child.
+        prefix = b"XDG_RUNTIME_DIR="
+        entries = Path(f"/proc/{process.pid}/environ").read_bytes().split(b"\0")
+        (runtime_dir,) = (Path(os.fsdecode(entry[len(prefix):])) for entry in entries
+                         if entry.startswith(prefix))
+        if runtime_dir.parent != runtime or runtime_dir.name == ".." or runtime_dir.is_symlink():
+            raise RuntimeError("daemon runtime is not a fixture runtime directory")
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime_dir))
+
+        def cleanup_cli(*args):
+            return fixture.run([str(fixture.BINARY), *map(str, args)], env=env)
+
+        # Mounted rows are checked against both the daemon's live registry
+        # and the exact FUSE owner/source. Never adopt RecoveryRequired rows.
+        reply = lab_account_request({"operation": "Mounts"}, env, process=process)
+        if reply["error"] is not None:
+            raise RuntimeError(reply["error"])
+        fixture_paths = {str(path): path for path in (mountpoint, reservation_mount)}
+        result = []
+        for row in reply["reply"]["value"]:
+            path = fixture_paths.get(row["path"])
+            if path is not None and row["state"] == "Mounted" and row["instance"] == url:
+                result.append((process, cleanup_cli, ("--unmount-space", row["instance"], row["space_id"]), path))
+        return result
+
+    def upload_step(instance, space, environment=os.environ):
+        # Only the fault-enabled daemon accepts this request. Manual sync can
+        # drain the entire receipt and successor, hiding the crash boundary.
+        log_mount_owners()
+        return lab_account_request(
+            {"operation": "LabUploadStep", "instance": instance, "space": space}, environment
+        )
+
+    def upload_outcome(reply):
+        assert reply["error"] is None, reply
+        return reply["reply"]["value"]
 
     publication_automatic = [False]
     activation_automatic = [False]
@@ -825,7 +904,7 @@ def child(root, runtime, container):
     offline_reconnect = [False]
     offline_automatic = [False]
 
-    def start():
+    def start(*, no_auto_sync=False):
         with (root / "daemon.log").open("a") as log:
             daemon_env = dict(os.environ)
             if os.environ.get("CIRRUS_TEST_OFFLINE_AUTOMATIC") or os.environ.get("CIRRUS_TEST_AUTO_BUS"):
@@ -850,17 +929,25 @@ def child(root, runtime, container):
                 daemon_env["CIRRUS_TEST_AUTO_SYNC"] = "0"
             if os.environ.get("CIRRUS_TEST_STORAGE_STATUS") or os.environ.get("CIRRUS_TEST_STORAGE_LIMITS") or os.environ.get("CIRRUS_TEST_ROOT_PUBLICATION_LIMITS") or os.environ.get("CIRRUS_TEST_IMPORT_PUBLICATION_LIMITS") or os.environ.get("CIRRUS_TEST_ROOT_REGISTRATION_LIMITS") or os.environ.get("CIRRUS_TEST_BASE_CAPTURE_LIMITS") or os.environ.get("CIRRUS_TEST_PREPARATION_LIMITS") or os.environ.get("CIRRUS_TEST_VERIFICATION_LIMITS"):
                 daemon_env["CIRRUS_TEST_AUTO_SYNC"] = "0"
+            if os.environ.get("CIRRUS_TEST_RESUMABLE_UPLOAD"):
+                daemon_env["CIRRUS_TEST_AUTO_SYNC"] = "0"
             if os.environ.get("CIRRUS_TEST_DIRTY_COMMITTED_ERROR"):
                 daemon_env["CIRRUS_TEST_AUTO_SYNC"] = "1" if publication_automatic[0] else "0"
-            arguments = [str(fixture.BINARY)]
-            if (os.environ.get("CIRRUS_TEST_OFFLINE_MOUNT") and not offline_reconnect[0] and not offline_automatic[0]) or os.environ.get("CIRRUS_TEST_PIN_READ_RACE"):
+            if os.environ.get("CIRRUS_TEST_IMPORT_PUBLICATION_LIMITS"):
+                for suffix in ("ADMISSION", "RESERVED", "COMMIT"):
+                    daemon_env["CIRRUS_TEST_ROOT_PUBLICATION_" + suffix + "_WINDOW"] = str(root / ("import-publication-" + suffix.lower()))
+                daemon_env["CIRRUS_TEST_DIRTY_COMMITTED_ERROR"] = str(root / "import-committed-error")
+            arguments = [str(fixture.service_binary())]
+            # Retained read-only mounts require the service flag, not just a
+            # paused fault-injection scheduler.
+            if (no_auto_sync or manual_status_restart[0]
+                    or (os.environ.get("CIRRUS_TEST_OFFLINE_MOUNT") and not offline_reconnect[0] and not offline_automatic[0])
+                    or os.environ.get("CIRRUS_TEST_PIN_READ_RACE")):
                 arguments.append("--no-auto-sync")
             if os.environ.get("CIRRUS_TEST_PIN_READ_RACE"):
                 daemon_env["CIRRUS_TEST_PIN_READ_SELECTED_WINDOW"] = str(root / "pin-read-selected")
                 if pin_read_local[0]:
                     daemon_env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + str(runtime / "no-keyring-bus")
-            if manual_status_restart[0]:
-                arguments.append("--no-auto-sync")
             process = subprocess.Popen(arguments, env=daemon_env,
                                        stdout=subprocess.DEVNULL, stderr=log)
         for _ in range(150):
@@ -980,7 +1067,7 @@ def child(root, runtime, container):
         account = dict(instance=url, issuer=url + "issuer", client_id="lab", token_endpoint=url + "token",
                        subject="disposable-admin", ca_pem=(root / "ca.pem").read_text(),
                        access_token="cirrus-lab-token", refresh_token="unused-lab-token",
-                       expires_at=int(time.time()) + 3600, refresh_in_progress=False, selected_space=space)
+                       expires_at=int(time.time()) + 3600, refresh_in_progress=False)
         fixture.require(fixture.run(["secret-tool", "store", "--label=cirrus-opencloud-lab", "application",
                                     "cirrus-drive", "instance", url], input=json.dumps(account)), "saving lab account")
         if os.environ.get("CIRRUS_TEST_PIN_RACE") or os.environ.get("CIRRUS_TEST_PIN_RETRY"):
@@ -1121,10 +1208,6 @@ def child(root, runtime, container):
             for suffix in ("ADMISSION", "RESERVED", "COMMIT"):
                 os.environ["CIRRUS_TEST_ROOT_REGISTRATION_" + suffix + "_WINDOW"] = str(root / ("root-registration-" + suffix.lower()))
             os.environ["CIRRUS_TEST_ROOT_REGISTRATION_COMMITTED_ERROR"] = str(root / "registration-committed-error")
-        if os.environ.get("CIRRUS_TEST_IMPORT_PUBLICATION_LIMITS"):
-            for suffix in ("ADMISSION", "RESERVED", "COMMIT"):
-                os.environ["CIRRUS_TEST_IMPORT_PUBLICATION_" + suffix + "_WINDOW"] = str(root / ("import-publication-" + suffix.lower()))
-            os.environ["CIRRUS_TEST_IMPORT_COMMITTED_ERROR"] = str(root / "import-committed-error")
         if os.environ.get("CIRRUS_TEST_BASE_CAPTURE_LIMITS") or os.environ.get("CIRRUS_TEST_PREPARATION_LIMITS"):
             for suffix in ("ADMISSION", "RESERVED", "COMMIT"):
                 os.environ["CIRRUS_TEST_BASE_CAPTURE_" + suffix + "_WINDOW"] = str(root / ("base-capture-" + suffix.lower()))
@@ -1212,7 +1295,7 @@ def child(root, runtime, container):
                 daemon.wait(timeout=5)
                 daemon = start()
                 owner(label,daemon)
-                fixture.require(cli("--mount",url,reservation_mount),"offline selected-Space first-parent remount")
+                resume_mount(project, reservation_mount, "offline first-parent remount")
                 project_mounted = True
 
             owner("initial",daemon)
@@ -1224,10 +1307,9 @@ def child(root, runtime, container):
             assert lab.upstream(container,"MKCOL",project_base + "/d/nested")[0] == 201
             assert lab.upstream(container,"PUT",project_base + "/d/old-A",b"A child")[0] == 201
             assert lab.upstream(container,"PUT",project_base + "/d/nested/old-deep",b"A nested child")[0] == 201
-            fixture.require(cli("--select-space",url,project),"selecting unmounted first-parent Space")
             # The real CLI Directory request does not first observe its parent.
-            fixture.require(cli("--ls",url,"/d"),"observing A directly before any root snapshot")
-            fixture.require(cli("--ls",url,"/d/nested"),"observing A descendant directly")
+            fixture.require(cli("--ls-space",url,project,"/d"),"observing A directly before any root snapshot")
+            fixture.require(cli("--ls-space",url,project,"/d/nested"),"observing A descendant directly")
             before = copies()
             assert {row[0] for row in before} == {'["d"]','["d","nested"]'},before
             second_runtime = runtime / "first-parent-peer"
@@ -1235,21 +1317,21 @@ def child(root, runtime, container):
             peer_window = root / "first-parent-peer-state"
             second_env = dict(os.environ,XDG_RUNTIME_DIR=str(second_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "first-parent-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
             deadline = time.monotonic() + 10
             while second_cli("--status").returncode != 0:
                 assert second_daemon.poll() is None and time.monotonic() < deadline
                 time.sleep(0.02)
             owner("peer",second_daemon)
-            fixture.require(second_cli("--ls",url,"/d"),"warming direct-observation peer")
+            fixture.require(second_cli("--ls-space",url,project,"/d"),"warming direct-observation peer")
             before = copies()
             reservation_mount.mkdir(mode=0o700)
             peer_worker = None
             try:
                 peer_window.touch(mode=0o600)
                 result = []
-                peer_worker = threading.Thread(target=lambda:result.append(second_cli("--ls",url,"/d")))
+                peer_worker = threading.Thread(target=lambda:result.append(second_cli("--ls-space",url,project,"/d")))
                 peer_worker.start()
                 deadline = time.monotonic() + 10
                 while not peer_window.with_suffix(".waiting").exists() and peer_worker.is_alive() and time.monotonic() < deadline: time.sleep(0.02)
@@ -1268,7 +1350,7 @@ def child(root, runtime, container):
                 assert not peer_worker.is_alive()
                 fixture.require(result[0],"finishing older direct A observation")
                 assert not any(row[0] == '[]' for row in copies())
-                fixture.require(cli("--ls",url,"/"),"publishing the first full parent containing B")
+                fixture.require(cli("--ls-space",url,project,"/"),"publishing the first full parent containing B")
                 first = copies()
                 assert {row[0] for row in first} == {'[]'},first
                 fixture.require(cli("--mount-space",url,project,reservation_mount),"mounting B without observing its children")
@@ -1282,12 +1364,12 @@ def child(root, runtime, container):
                 assert {row[0] for row in copies()} == {'[]'}
                 recovery("offline-orphan-revoked")
                 online()
-                fixture.require(cli("--ls",url,"/d"),"observing actual B children")
-                fixture.require(cli("--ls",url,"/d/nested"),"observing actual B nested children")
+                fixture.require(cli("--ls-space",url,project,"/d"),"observing actual B children")
+                fixture.require(cli("--ls-space",url,project,"/d/nested"),"observing actual B nested children")
                 assert set(os.listdir(reservation_mount / "d")) == {"new-B","nested"}
                 assert os.listdir(reservation_mount / "d/nested") == ["new-deep"]
                 known = [row for row in copies() if row[0] != '[]']
-                fixture.require(cli("--ls",url,"/"),"refreshing unchanged known B parent")
+                fixture.require(cli("--ls-space",url,project,"/"),"refreshing unchanged known B parent")
                 assert [row for row in copies() if row[0] != '[]'] == known
                 offline()
                 restart("offline-known-preserved")
@@ -1338,7 +1420,7 @@ def child(root, runtime, container):
 
             def remount():
                 nonlocal mounted
-                fixture.require(cli("--mount",url,mountpoint),"remounting review Space")
+                resume_mount(space, mountpoint, "remounting review Space offline")
                 mounted = True
 
             def offline():
@@ -1374,7 +1456,7 @@ def child(root, runtime, container):
             if os.environ.get("CIRRUS_TEST_PEER_WARM_BARRIER"):
                 second_env.update(CIRRUS_TEST_BLOCKER_TRACE="1",CIRRUS_TEST_CLI_SNAPSHOT_BLOCKED_MARKER=str(root / "review-warm-contention"))
             with (root / "review-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
             deadline = time.monotonic() + 10
             while second_cli("--status").returncode != 0:
@@ -1402,7 +1484,9 @@ def child(root, runtime, container):
                 warm_reader = None
                 try:
                     wait(peer_window,root_reader)
-                    warm_reader = threading.Thread(target=lambda:warm_result.append(second_cli("--ls",url,"/folder")))
+                    # The peer mount already warmed credentials. This explicit
+                    # listing must finish Graph and DAV before queuing for State.
+                    warm_reader = threading.Thread(target=lambda:warm_result.append(second_cli("--ls-space",url,space,"/folder")))
                     warm_reader.start()
                     contention = root / "review-warm-contention"
                     deadline = time.monotonic() + 10
@@ -1424,7 +1508,7 @@ def child(root, runtime, container):
                 assert "nested.bin" in warm_result[0].stdout,warm_result
                 peer_window.with_suffix(".waiting").unlink(missing_ok=True)
             else:
-                fixture.require(second_cli("--ls",url,"/folder"),"warming review peer session")
+                fixture.require(second_cli("--ls-space",url,space,"/folder"),"warming review peer session")
             worker = peer_worker = None
             try:
                 # 1: A->B cannot be exposed without durable descendant revocation.
@@ -1437,7 +1521,7 @@ def child(root, runtime, container):
                     saved = db.execute("SELECT path,entries FROM snapshots WHERE instance=? AND space=? AND path IN ('[]','[\"review-dir\"]') ORDER BY path",(url,space)).fetchall()
                 peer_window.touch(mode=0o600)
                 peer_result = []
-                peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls",url,"/folder")))
+                peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls-space",url,space,"/folder")))
                 peer_worker.start()
                 wait(peer_window,peer_worker)
                 assert lab.upstream(container,"MOVE",base + "/review-dir",headers=[("Destination","https://localhost:9200" + base + "/review-dir-A"),("Overwrite","F")])[0] == 201
@@ -1491,7 +1575,7 @@ def child(root, runtime, container):
                         worker = threading.Thread(target=lambda:result.append(cli("--sync",url)))
                         worker.start()
                     else:
-                        fixture.require(cli("--unmount"),"unmounting before automatic rebase")
+                        fixture.require(cli("--unmount-space",url,space),"unmounting before automatic rebase")
                         mounted = False
                         daemon.kill()
                         daemon.wait(timeout=5)
@@ -1525,7 +1609,8 @@ def child(root, runtime, container):
                         version = db.execute("SELECT base_etag FROM operation_journal WHERE id=?",(row[0],)).fetchone()[0]
                         assert version != row[1]
                         assert {entry[0] for entry in db.execute("SELECT etag FROM removal_versions WHERE operation_id=?",(row[0],))} == {row[1],version},"receipt did not atomically retain exact old/new parent versions"
-                    remount()
+                    fixture.require(cli("--mount-space",url,space,mountpoint),"remounting review Space after receipt confirmation")
+                    mounted = True
                 # 3: a manual successful MOVE must have the same durable receipt
                 # as an automatic MOVE before dependent dirty writes can drain.
                 assert lab.upstream(container,"MKCOL",base + "/review-tree")[0] == 201
@@ -1596,9 +1681,9 @@ def child(root, runtime, container):
                 with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
                     client.settimeout(30)
                     client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                    client.sendall(b"CIRRUS/2 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
+                    client.sendall(b"CIRRUS/3 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
                     with client.makefile("rb") as response:
-                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
                     assert reply["error"] is None,reply
 
             def evidence_export(label):
@@ -1627,7 +1712,7 @@ def child(root, runtime, container):
             second_env = {key:value for key,value in os.environ.items() if not key.startswith("CIRRUS_TEST_READ_EVIDENCE_")}
             second_env.update(XDG_RUNTIME_DIR=str(second_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "read-evidence-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
             deadline = time.monotonic() + 10
@@ -1638,8 +1723,8 @@ def child(root, runtime, container):
             reservation_mount.mkdir(mode=0o700)
             fixture.require(second_cli("--mount-space",url,project,reservation_mount),"mounting independent evidence Space")
             second_mounted = True
-            fixture.require(second_cli("--ls",url,"/folder"),"warming evidence peer session")
-            fixture.require(cli("--unmount"),"unmounting before automatic evidence start")
+            fixture.require(second_cli("--ls-space",url,space,"/folder"),"warming evidence peer session")
+            fixture.require(cli("--unmount-space",url,space),"unmounting before automatic evidence start")
             mounted = False
             daemon.kill()
             daemon.wait(timeout=5)
@@ -1663,7 +1748,7 @@ def child(root, runtime, container):
                         if boundary == "peer":
                             peer_result = []
                             peer_window.touch(mode=0o600)
-                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls",url,"/folder")))
+                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space",url,space,"/folder")))
                             peer_worker.start()
                             evidence_wait(lambda: peer_window.with_suffix(".waiting").exists(),"waiting peer State")
                             assert [row["store"] for row in evidence_storage()["sql_reservations"]] == ["state"]
@@ -1746,9 +1831,9 @@ def child(root, runtime, container):
                 with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
                     client.settimeout(30)
                     client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                    client.sendall(b"CIRRUS/2 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
+                    client.sendall(b"CIRRUS/3 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
                     with client.makefile("rb") as response:
-                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
                     assert reply["error"] is None,reply
 
             def activation_rows():
@@ -1785,7 +1870,7 @@ def child(root, runtime, container):
             second_env = {key:value for key,value in os.environ.items() if not key.startswith("CIRRUS_TEST_ACTIVATION_")}
             second_env.update(XDG_RUNTIME_DIR=str(second_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "activation-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
             deadline = time.monotonic() + 10
@@ -1793,7 +1878,7 @@ def child(root, runtime, container):
                 assert second_daemon.poll() is None and time.monotonic() < deadline
                 time.sleep(0.02)
             activation_owner("peer",second_daemon)
-            fixture.require(second_cli("--ls",url,"/folder"),"warming activation peer read session")
+            fixture.require(second_cli("--ls-space",url,space,"/folder"),"warming activation peer read session")
             worker = peer_worker = None
             new_mounted = False
             try:
@@ -1812,7 +1897,7 @@ def child(root, runtime, container):
                         assert [lease["store"] for lease in activation_status()["sql_reservations"]] == (["state"] if boundary == "commit" else [])
                         if boundary == "peer":
                             peer_window.touch(mode=0o600)
-                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls",url,"/folder")))
+                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space",url,space,"/folder")))
                             peer_worker.start()
                             activation_wait(peer_window,peer_worker,peer_result)
                             assert [lease["store"] for lease in activation_status()["sql_reservations"]] == ["state"]
@@ -1842,12 +1927,12 @@ def child(root, runtime, container):
                     activation_budget(high)
                 # Directory preparation has completed before the existing-row
                 # hook. Reactivation itself and unmount cleanup remain uncapped.
-                fixture.require(cli("--unmount"),"unmounting before pressure reactivation")
+                fixture.require(cli("--unmount-space",url,space),"unmounting before pressure reactivation")
                 mounted = False
                 window = root / "activation-existing"
                 window.touch(mode=0o600)
                 result = []
-                worker = threading.Thread(target=lambda: result.append(cli("--mount",url,mountpoint)))
+                worker = threading.Thread(target=lambda: result.append(cli("--mount-space",url,space,mountpoint)))
                 worker.start()
                 try:
                     activation_wait(window,worker,result)
@@ -1861,7 +1946,7 @@ def child(root, runtime, container):
                 mounted = True
                 assert activation_rows() == prior
                 activation_export("existing-pressure")
-                fixture.require(cli("--unmount"),"unmounting existing activation under pressure")
+                fixture.require(cli("--unmount-space",url,space),"unmounting existing activation under pressure")
                 mounted = False
                 activation_budget(high)
                 # Restore the real scheduler across process restart. Existing
@@ -1872,7 +1957,7 @@ def child(root, runtime, container):
                 daemon = start()
                 activation_owner("restart",daemon)
                 activation_export("restart")
-                fixture.require(cli("--mount",url,mountpoint),"reactivating existing Space")
+                fixture.require(cli("--mount-space",url,space,mountpoint),"reactivating existing Space")
                 mounted = True
                 fixture.require(cli("--mount-space",url,project,reservation_mount),"retrying new activation")
                 new_mounted = True
@@ -1935,9 +2020,9 @@ def child(root, runtime, container):
                     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
                         client.settimeout(30)
                         client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                        client.sendall(b"CIRRUS/2 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
+                        client.sendall(b"CIRRUS/3 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
                         with client.makefile("rb") as response:
-                            reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                            reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
                         assert reply["error"] is None,reply
 
                 def detached_export(label,expected_bytes):
@@ -1963,7 +2048,7 @@ def child(root, runtime, container):
                 second_env = {key:value for key,value in os.environ.items() if not key.startswith("CIRRUS_TEST_DETACHED_")}
                 second_env.update(XDG_RUNTIME_DIR=str(second_runtime),CIRRUS_TEST_AUTO_SYNC="0")
                 with (root / "detached-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
                 def second_cli(*args):
                     return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
                 deadline = time.monotonic() + 10
@@ -2034,7 +2119,7 @@ def child(root, runtime, container):
                 os.close(peer_writer)
                 peer_writer = None
                 fixture.require(second_cli("--sync-space",url,project),"syncing independent detached Space")
-                fixture.require(cli("--unmount"),"unmounting detached before restart")
+                fixture.require(cli("--unmount-space",url,space),"unmounting detached before restart")
                 mounted = False
                 daemon.kill()
                 daemon.wait(timeout=5)
@@ -2043,7 +2128,7 @@ def child(root, runtime, container):
                 detached_export("restart",expected)
                 assert staged_bytes(database,acknowledged_root) == old
                 assert {name:hashlib.sha256((staging / name).read_bytes()).digest() for name in protected} == protected
-                fixture.require(cli("--mount",url,mountpoint),"remounting current pathname")
+                fixture.require(cli("--mount-space",url,space,mountpoint),"remounting current pathname")
                 mounted = True
                 assert read_file(target) == replacement + b" current edit"
                 fixture.require(cli("--sync-space",url,space),"syncing current path not detached head")
@@ -2067,10 +2152,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_PENDING_REPLACE_LIMITS") or os.environ.get("CIRRUS_TEST_LOCAL_DIRECTORY_LIMITS") or os.environ.get("CIRRUS_TEST_REMOVE_STAGED_LIMITS"):
             ticks = Path(f"/proc/{daemon.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
             print(f"OWNED storage fixture: root={root} runtime={runtime} container={container} primary_pid={daemon.pid} start_ticks={ticks}", flush=True)
-        fixture.require(cli("--select-space", url, space), "selecting user-scoped lab Space")
-        # Later credential rewrites must preserve the selection just verified by the daemon.
-        account["selected_space_verified"] = space
-        fixture.require(cli("--mount", url, mountpoint), "mounting lab")
+        fixture.require(cli("--mount-space", url, space, mountpoint), "mounting lab")
         mounted = True
         if os.environ.get("CIRRUS_TEST_STORAGE_SAFEGUARDS"):
             # BEGIN OPTIONAL G8 STORAGE SAFEGUARDS
@@ -2210,8 +2292,8 @@ def child(root, runtime, container):
             # auth-interference, peer and RO qualification rounds.
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             fixture.require(cli("--pin-space", url, space, "/file.bin"), "pinning lifecycle original")
-            fixture.require(cli("--ls", url), "saving lifecycle root evidence")
-            fixture.require(cli("--ls", url, "/folder"), "saving lifecycle complete parent")
+            fixture.require(cli("--ls-space", url, space), "saving lifecycle root evidence")
+            fixture.require(cli("--ls-space", url, space, "/folder"), "saving lifecycle complete parent")
             assert read_file(mountpoint / "file.bin") == contents["file.bin"]
             # A naturally unpinned, unread original, not deleted test data.
             with open(mountpoint / "overwrite.bin", "r+b", buffering=0) as partial:
@@ -2934,7 +3016,7 @@ def child(root, runtime, container):
             conflict_runtime=runtime/'repin-conflict-peer';conflict_runtime.mkdir(mode=0o700)
             conflict_env=dict(os.environ,XDG_RUNTIME_DIR=str(conflict_runtime),CIRRUS_TEST_AUTO_SYNC='1')
             with (root/'repin-conflict-peer.log').open('w') as log:
-                second_daemon=subprocess.Popen([str(fixture.BINARY)],env=conflict_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon=subprocess.Popen([str(fixture.service_binary())],env=conflict_env,stdout=subprocess.DEVNULL,stderr=log)
             ticks=Path(f'/proc/{second_daemon.pid}/stat').read_text().rsplit(')',1)[1].split()[19]
             print(f'OWNED repin conflict peer: root={root} runtime={conflict_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}',flush=True)
             deadline=time.monotonic()+100
@@ -2966,8 +3048,8 @@ def child(root, runtime, container):
                 # A's partial root remains resolved and unmaterialized.
                 close_resolved();repin_stop();daemon=start()
                 assert lab.upstream(container,'DELETE',base+'/repin-guard/item')[0]==204
-                fixture.require(cli('--ls',url),'saving current replacement parent')
-                fixture.require(cli('--ls',url,'/repin-guard'),'saving actual empty target')
+                fixture.require(cli('--ls-space',url,space),'saving current replacement parent')
+                fixture.require(cli('--ls-space',url,space,'/repin-guard'),'saving actual empty target')
                 fixture.require(cli('--evict-space',url,space,'/'),'evicting transformation cache')
                 fixture.require(cli('--stop'),'stopping transformation observations');daemon.wait(timeout=10)
                 server.shutdown();server.server_close();thread.join(timeout=5);server=thread=None
@@ -3100,7 +3182,7 @@ def child(root, runtime, container):
             peer_runtime=runtime/'repin-peer';peer_runtime.mkdir(mode=0o700)
             peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime))
             with (root/'repin-peer.log').open('w') as log:
-                second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon=subprocess.Popen([str(fixture.service_binary()),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
             def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
             deadline=time.monotonic()+10
             while peer_cli('--status').returncode!=0:
@@ -3135,7 +3217,7 @@ def child(root, runtime, container):
             protected=repin_state()
             for table in ('dirty_roots','operation_journal','operation_parents','pin_copies','pin_copy_files','pin_copy_chunks'):assert all(row in protected[table] for row in saved[table]),table
             assert protected['dirty_bases'],'resolved A original gaps were not independently captured'
-            fixture.require(cli('--pin',url,'/repin-guard'),'implicit retry preserves independently protected A')
+            fixture.require(cli('--pin-space',url,space,'/repin-guard'),'repin retry preserves independently protected A')
             assert repin_state()['dirty_bases']==protected['dirty_bases'],'protected retry allocated duplicate originals'
             assert not (database.parent/'state-storage.reservation').exists()
             assert not list(database.parent.glob('.pin-download-*')),'download scratch was not retired'
@@ -3155,7 +3237,7 @@ def child(root, runtime, container):
             assert read_file(mountpoint/'repin-race')==b'RACE'+original[4:]
             assert offline_mount_mutations==before
             repin_stop()
-            print('PASS: resolved A partial recovery automatically protected locally before explicit/implicit directory repin B; pressure fail-closed, charged named download releases State for capture; peer download/staging fence no deadlock or lost acknowledgement; cold A recovery export exact SHA/B pin/independent Space, no capture duplication or mutation replay',flush=True)
+            print('PASS: resolved A partial recovery automatically protected locally before directory repin B in the named Space; pressure fail-closed, charged named download releases State for capture; peer download/staging fence no deadlock or lost acknowledgement; cold A recovery export exact SHA/B pin/independent Space, no capture duplication or mutation replay',flush=True)
             return
         if os.environ.get('CIRRUS_TEST_UNPIN_DIRTY_GUARD'):
             database=runtime/'home/.local/state/cirrus-drive/state.db'
@@ -3279,7 +3361,7 @@ def child(root, runtime, container):
             peer_runtime=runtime/'guard-peer';peer_runtime.mkdir(mode=0o700)
             peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime))
             with (root/'guard-peer.log').open('w') as log:
-                second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon=subprocess.Popen([str(fixture.service_binary()),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
             def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
             deadline=time.monotonic()+10
             while peer_cli('--status').returncode!=0:
@@ -3367,7 +3449,7 @@ def child(root, runtime, container):
             assert offline_mount_mutations.count(('MOVE',unquote(base)+'/guard-origin'))==1
             assert offline_mount_mutations.count(('DELETE',unquote(base)+'/guard-detached'))==1
             assert offline_mount_mutations.count(('PUT',unquote(base)+'/guard-live'))==1
-            fixture.require(cli('--unpin',url,'/guard-unrelated'),'checking selected-Space unpin shares the guarded path without self-deadlock')
+            fixture.require(cli('--unpin-space',url,space,'/guard-unrelated'),'retrying guarded unpin in the named Space without self-deadlock')
             stable=list(offline_mount_mutations);fixture.require(cli('--sync-space',url,space),'confirming guarded unpin non-replay');assert offline_mount_mutations==stable
             fixture.require(cli('--unmount-space',url,space),'unmounting guarded edit');mounted=False
             fixture.require(cli('--unmount-space',url,project),'unmounting guarded peer');second_mounted=False
@@ -3382,13 +3464,13 @@ def child(root, runtime, container):
                 assert lab.upstream(container,"MKCOL",base+path)[0]==201
             assert lab.upstream(container,"PUT",base+"/reuse-nonempty/remote",b"remote child must survive")[0]==201
             assert lab.upstream(container,"PUT",base+"/reuse-file",b"not a directory")[0]==201
-            fixture.require(cli("--ls",url),"saving local replacement root")
+            fixture.require(cli("--ls-space",url,space),"saving local replacement root")
             for path in ("/reuse-parent","/reuse-parent/empty","/reuse-parent/empty-bind","/reuse-nonempty","/reuse-missing","/reuse-stale","/reuse-pending","/reuse-changed"):
-                fixture.require(cli("--ls",url,path),"saving exact empty target "+path)
+                fixture.require(cli("--ls-space",url,space,path),"saving exact empty target "+path)
             fixture.require(cli("--pin-space",url,space,"/reuse-pinned"),"retaining independent target pin")
             assert lab.upstream(container,"PUT",base+"/reuse-stale/transient",b"advance empty version")[0]==201
             assert lab.upstream(container,"DELETE",base+"/reuse-stale/transient")[0]==204
-            fixture.require(cli("--ls",url),"saving newer target parent without its stale child listing")
+            fixture.require(cli("--ls-space",url,space),"saving newer target parent without its stale child listing")
             with sqlite3.connect(database) as db:
                 target_proof=db.execute("SELECT self_id,self_etag,updated,entries,issuer,subject FROM snapshots WHERE space=? AND path='[\"reuse-parent\",\"empty\"]'",(space,)).fetchone()
                 pin_rows=db.execute("SELECT * FROM pins ORDER BY rowid").fetchall()
@@ -3397,10 +3479,8 @@ def child(root, runtime, container):
             for path in ("/loss-target","/child-target","/automatic-target"):assert lab.upstream(container,"MKCOL",project_base+path)[0]==201
             reservation_mount.mkdir(mode=0o700)
             fixture.require(cli("--mount-space",url,project,reservation_mount),"mounting local replacement peer Space");second_mounted=True
-            fixture.require(cli("--select-space",url,project),"selecting peer target observations")
-            fixture.require(cli("--ls",url),"saving peer root")
-            for path in ("/loss-target","/child-target","/automatic-target"):fixture.require(cli("--ls",url,path),"saving peer target "+path)
-            fixture.require(cli("--select-space",url,space),"restoring original selection")
+            fixture.require(cli("--ls-space",url,project),"saving peer root")
+            for path in ("/loss-target","/child-target","/automatic-target"):fixture.require(cli("--ls-space",url,project,path),"saving peer target "+path)
             account_copy=json.loads(fixture.require(fixture.run(["secret-tool","lookup","application","cirrus-drive","instance",url]),"retaining disposable local replacement principal").stdout)
             usage=json.loads(fixture.require(cli("--storage-status"),"measuring local replacement policy").stdout)
             fixture.require(cli("--set-storage-limits",usage["immutable_admission_charge_bytes"]+512*1024*1024,0),"enabling local replacement admission")
@@ -3431,10 +3511,8 @@ def child(root, runtime, container):
             unmount_local_views()
             # Stop mount refresh publication before establishing the final
             # peer proofs; an online listing alone need not win snapshot CAS.
-            fixture.require(cli("--select-space",url,project),"selecting final peer observations")
-            fixture.require(cli("--ls",url),"saving final peer parent")
-            for path in ("/loss-target","/child-target","/automatic-target"):fixture.require(cli("--ls",url,path),"saving final peer self proof "+path)
-            fixture.require(cli("--select-space",url,space),"restoring original peer selection")
+            fixture.require(cli("--ls-space",url,project),"saving final peer parent")
+            for path in ("/loss-target","/child-target","/automatic-target"):fixture.require(cli("--ls-space",url,project,path),"saving final peer self proof "+path)
             with sqlite3.connect(database) as db:
                 for path in ('["loss-target"]','["child-target"]','["automatic-target"]'):
                     assert db.execute("SELECT self_id,self_etag,entries FROM snapshots WHERE space=? AND path=?",(project,path)).fetchone() is not None,"peer self proof not persisted"
@@ -3599,9 +3677,9 @@ def child(root, runtime, container):
             fixture.require(cli("--pin-space",url,space,"/partial-source/nested/pinned"),"pinning exact A version")
             fixture.require(cli("--pin-space",url,space,"/partial-conflict"),"pinning changed-original conflict recovery")
             assert read_file(mountpoint/"partial-source/nested/cached")==original
-            fixture.require(cli("--ls",url),"saving partial-base parent")
+            fixture.require(cli("--ls-space",url,space),"saving partial-base parent")
             for path in ("/partial-source","/partial-source/nested","/partial-final"):
-                fixture.require(cli("--ls",url,path),"saving exact partial-base observation "+path)
+                fixture.require(cli("--ls-space",url,space,path),"saving exact partial-base observation "+path)
             with sqlite3.connect(database) as db:
                 pin_version=json.loads(db.execute("SELECT version FROM files WHERE path='[\"partial-source\",\"nested\",\"pinned\"]'").fetchone()[0])
                 chunks=db.execute("SELECT offset,body,digest FROM chunks WHERE path='[\"partial-source\",\"nested\",\"pinned\"]' ORDER BY offset").fetchall()
@@ -3618,9 +3696,7 @@ def child(root, runtime, container):
             project=json.loads(body)["id"];project_base="/dav/spaces/"+quote(project,safe="")
             reservation_mount.mkdir(mode=0o700)
             fixture.require(cli("--mount-space",url,project,reservation_mount),"mounting partial-base peer");second_mounted=True
-            fixture.require(cli("--select-space",url,project),"selecting peer prefetch")
-            fixture.require(cli("--ls",url),"saving independent root")
-            fixture.require(cli("--select-space",url,space),"restoring partial-base Space")
+            fixture.require(cli("--ls-space",url,project),"saving independent root")
             saved_account=json.loads(fixture.require(fixture.run(["secret-tool","lookup","application","cirrus-drive","instance",url]),"retaining disposable partial-base principal").stdout)
             usage=json.loads(fixture.require(cli("--storage-status"),"sizing partial-base policy").stdout)
             fixture.require(cli("--set-storage-limits",usage["immutable_admission_charge_bytes"]+512*1024*1024,0),"enabling existing partial-base admission")
@@ -3745,15 +3821,15 @@ def child(root, runtime, container):
             for path in directories:assert lab.upstream(container,"MKCOL",base+path)[0]==201,path
             if mixed_graph:
                 assert lab.upstream(container,"MKCOL",base+"/mixed-outside")[0]==201
-                fixture.require(cli("--ls",url),"saving mixed outside remote parent identity")
-                fixture.require(cli("--ls",url,"/mixed-outside"),"saving complete mixed outside target absence")
+                fixture.require(cli("--ls-space",url,space),"saving mixed outside remote parent identity")
+                fixture.require(cli("--ls-space",url,space,"/mixed-outside"),"saving complete mixed outside target absence")
             if outgoing:
                 for path in ("/consumer-outside","/consumer-conflict","/outgoing-source"):
                     assert lab.upstream(container,"MKCOL",base+path)[0]==201
                 assert lab.upstream(container,"PUT",base+"/outgoing-source/file",b"outside conflict original")[0]==201
-                fixture.require(cli("--ls",url),"saving outside parent identity")
+                fixture.require(cli("--ls-space",url,space),"saving outside parent identity")
                 for path in ("/consumer-outside","/consumer-conflict"):
-                    fixture.require(cli("--ls",url,path),"saving outside absence")
+                    fixture.require(cli("--ls-space",url,space,path),"saving outside absence")
                 fixture.require(cli("--pin-space",url,space,"/outgoing-source"),"pinning outgoing conflict tree")
             if chain_remote:
                 assert lab.upstream(container,"MKCOL",base+"/intermediate-source")[0]==201
@@ -3788,7 +3864,7 @@ def child(root, runtime, container):
                     remote[f"incoming-{kind}-tree/kept"]=b"incoming tree marker"
                     remote[f"incoming-{kind}-outside/file"]=b"incoming conflict original"
             for path,data in remote.items():assert lab.upstream(container,"PUT",base+"/"+path,data)[0]==201
-            fixture.require(cli("--ls",url),"saving tree root namespace")
+            fixture.require(cli("--ls-space",url,space),"saving tree root namespace")
             for path in ("/dir-source","/conflict-source","/changed-source","/dest-conflict-source"):
                 fixture.require(cli("--pin-space",url,space,path),"pinning complete original tree "+path)
             if replace_remote:fixture.require(cli("--pin-space",url,space,"/pin-displace-source"),"pinning separate displaced-target control source")
@@ -3800,17 +3876,17 @@ def child(root, runtime, container):
             with open(mountpoint/"dir-source/synced","xb",buffering=0) as file:
                 file.write(b"previously confirmed local-only bytes");os.fsync(file.fileno())
             fixture.require(cli("--sync-space",url,space),"confirming an unpinned local root before tree rename")
-            fixture.require(cli("--ls",url,"/dir-source"),"saving current source after prior confirmed child")
+            fixture.require(cli("--ls-space",url,space,"/dir-source"),"saving current source after prior confirmed child")
             fixture.require(cli("--unmount-space",url,space),"quiescing tree view for remaining pin observations");mounted=False
             if replace_remote:fixture.require(cli("--pin-space",url,space,"/dir-source"),"refreshing full source capture after confirmed child for replacement proof agreement")
             for path in ("/dir-dest","/dir-empty","/remote-target-empty","/nonempty-target","/stale-parent"):
-                fixture.require(cli("--ls",url,path),"saving complete tree parent/empty proof "+path)
+                fixture.require(cli("--ls-space",url,space,path),"saving complete tree parent/empty proof "+path)
             if replace_remote:
                 for path in ("/dir-dest/local-target","/conflict-moved","/changed-moved","/dest-conflict-moved","/remote-pending-target"):
-                    fixture.require(cli("--ls",url,path),"saving exact replacement target "+path)
+                    fixture.require(cli("--ls-space",url,space,path),"saving exact replacement target "+path)
                 fixture.require(cli("--pin-space",url,space,"/remote-target-empty"),"retaining an independently pinned replacement target")
             assert lab.upstream(container,"PUT",base+"/stale-parent/new-child",b"newer parent version")[0]==201
-            fixture.require(cli("--ls",url),"saving newer parent without refreshing its child listing")
+            fixture.require(cli("--ls-space",url,space),"saving newer parent without refreshing its child listing")
             with sqlite3.connect(database) as db:
                 assert db.execute("PRAGMA user_version").fetchone()==(19,)
                 target_row=db.execute("SELECT self_id,self_etag,updated,entries,issuer,subject FROM snapshots WHERE space=? AND path='[\"dir-dest\",\"local-target\"]'",(space,)).fetchone() if replace_remote else None
@@ -3845,10 +3921,8 @@ def child(root, runtime, container):
             for path in (("/loss-source" if paired_pins else ("/loss-parent" if split_pin else "/tree-uncertain")),"/independent"):fixture.require(cli("--pin-space",url,project,path),"pinning second Space")
             if incoming:fixture.require(cli("--pin-space",url,project,"/incoming-loss"),"pinning incoming lost-MOVE original")
             if replace_remote:
-                fixture.require(cli("--select-space",url,project),"selecting second replacement Space")
-                fixture.require(cli("--ls",url,"/loss-moved"),"saving second Space empty replacement target")
-                fixture.require(cli("--ls",url,"/auto-target"),"saving automatic replacement target")
-                fixture.require(cli("--select-space",url,space),"restoring original Space selection")
+                fixture.require(cli("--ls-space",url,project,"/loss-moved"),"saving second Space empty replacement target")
+                fixture.require(cli("--ls-space",url,project,"/auto-target"),"saving automatic replacement target")
             saved_account=json.loads(fixture.require(fixture.run(["secret-tool","lookup","application","cirrus-drive","instance",url]),"retaining disposable tree principal").stdout)
             if focused_pins:
                 if inverse_pin:
@@ -5199,16 +5273,16 @@ def child(root, runtime, container):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             for path in ("/rename-dest","/rename-stale","/rename-unknown"):
                 assert lab.upstream(container,"MKCOL",base + path)[0] == 201
-            fixture.require(cli("--ls",url),"saving offline rename root")
+            fixture.require(cli("--ls-space",url,space),"saving offline rename root")
             for path in ("/folder","/rename-dest","/rename-stale"):
-                fixture.require(cli("--ls",url,path),"saving exact complete rename parent " + path)
+                fixture.require(cli("--ls-space",url,space,path),"saving exact complete rename parent " + path)
             for path in ("rename-a","folder/rename-cross","rename-replace","rename-target","rename-conflict-source","rename-conflict-target"):
                 fixture.require(cli("--pin-space",url,space,"/" + path),"pinning independent rename bytes " + path)
             with sqlite3.connect(database) as db:
                 stale = db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE space=? AND path='[\"rename-stale\"]'",(space,)).fetchone()
                 pin_rows = db.execute("SELECT root,directories,manifest FROM pins WHERE space=? ORDER BY root",(space,)).fetchall()
             assert lab.upstream(container,"PUT",base + "/rename-stale/remote-child",b"stale empty observation must not authorize rename")[0] == 201
-            fixture.require(cli("--ls",url),"refreshing ONLY root after rename parent version change")
+            fixture.require(cli("--ls-space",url,space),"refreshing ONLY root after rename parent version change")
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE space=? AND path='[\"rename-stale\"]'",(space,)).fetchone() == stale
                 observed = next(entry for entry in json.loads(db.execute("SELECT entries FROM snapshots WHERE space=? AND path='[]'",(space,)).fetchone()[0]) if entry["name"] == "rename-stale")
@@ -5388,9 +5462,9 @@ def child(root, runtime, container):
                 assert lab.upstream(container,"MKCOL",base + path)[0] == 201,path
             assert lab.upstream(container,"PUT",base + "/rmdir-parent/kept",b"MOVE sibling retained")[0] == 201
             fixture.require(cli("--pin-space",url,space,"/rmdir-parent/kept"),"pinning sibling for real nonempty tree MOVE")
-            fixture.require(cli("--ls",url),"saving rmdir root identity")
+            fixture.require(cli("--ls-space",url,space),"saving rmdir root identity")
             for path in ("/rmdir-parent", "/rmdir-parent/empty", "/stale-empty", "/rmdir-replaced", "/rmdir-newchild"):
-                fixture.require(cli("--ls",url,path),"saving complete rmdir self observation " + path)
+                fixture.require(cli("--ls-space",url,space,path),"saving complete rmdir self observation " + path)
             fixture.require(cli("--pin-space",url,space,"/folder/nested.bin"),"pinning independent original")
             original = contents["folder/nested.bin"]
             dirty = b"dirty bytes retained outside removed directory"
@@ -5402,7 +5476,7 @@ def child(root, runtime, container):
                 e1 = db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE instance=? AND space=? AND path='[\"stale-empty\"]'",(url,space)).fetchone()
             assert e1[2] == "[]"
             assert lab.upstream(container,"PUT",base + "/stale-empty/new-child",b"must never be hidden")[0] == 201
-            fixture.require(cli("--ls",url),"refreshing ONLY root after server child insertion")
+            fixture.require(cli("--ls-space",url,space),"refreshing ONLY root after server child insertion")
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT self_id,self_etag,entries,updated FROM snapshots WHERE instance=? AND space=? AND path='[\"stale-empty\"]'",(url,space)).fetchone() == e1
                 root_entries = json.loads(db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[]'",(url,space)).fetchone()[0])
@@ -5419,9 +5493,7 @@ def child(root, runtime, container):
             reservation_mount.mkdir(mode=0o700)
             fixture.require(cli("--mount-space",url,project,reservation_mount),"mounting second rmdir Space"); second_mounted = True
             fixture.require(cli("--pin-space",url,project,"/kept"),"pinning independent Space")
-            fixture.require(cli("--select-space",url,project),"selecting disposable second Space")
-            fixture.require(cli("--ls",url,"/remote-dir-uncertain"),"saving second Space complete empty directory")
-            fixture.require(cli("--select-space",url,space),"restoring first Space selection")
+            fixture.require(cli("--ls-space",url,project,"/remote-dir-uncertain"),"saving second Space complete empty directory")
             saved_account = json.loads(fixture.require(fixture.run(["secret-tool","lookup","application","cirrus-drive","instance",url]),"retaining disposable credentials").stdout)
             usage = json.loads(fixture.require(cli("--storage-status"),"sizing rmdir policy").stdout)
             fixture.require(cli("--set-storage-limits",usage["immutable_admission_charge_bytes"] + 512 * 1024 * 1024,0),"enabling real State contention policy")
@@ -5497,7 +5569,7 @@ def child(root, runtime, container):
             peer_env = {key:value for key,value in os.environ.items() if key != "CIRRUS_TEST_NAMESPACE_RECEIPT_WINDOW"}
             peer_env.update(XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "rmdir-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary()),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
             def wait_for(predicate,description):
                 deadline = time.monotonic() + 20
@@ -5507,7 +5579,7 @@ def child(root, runtime, container):
             wait_for(lambda:second_cli("--status").returncode == 0,"rmdir peer unavailable")
             ticks = Path(f"/proc/{second_daemon.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
             print(f"OWNED rmdir peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}",flush=True)
-            fixture.require(second_cli("--ls",url),"warming rmdir State peer")
+            fixture.require(second_cli("--ls-space",url,space),"warming rmdir State peer")
             receipt_window = root / "projection-receipt"; receipt_window.touch(mode=0o600)
             result = []; peer_result = []
             worker = threading.Thread(target=lambda:result.append(cli("--sync-space",url,space))); worker.start()
@@ -5524,7 +5596,7 @@ def child(root, runtime, container):
                     old_parent = db.execute("SELECT entries,self_id,self_etag,updated FROM snapshots WHERE instance=? AND space=? AND path='[\"rmdir-parent\"]'",(url,space)).fetchone()
                     assert next(entry for entry in json.loads(old_parent[0]) if entry["name"] == "empty") == a
                 peer_window.touch(mode=0o600)
-                peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls",url))); peer_worker.start()
+                peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls-space",url,space))); peer_worker.start()
                 wait_for(lambda:peer_window.with_suffix(".waiting").exists(),"rmdir peer did not own State")
                 inode = (database.parent / "state-storage.lock").stat().st_ino
                 owners = [line for line in Path("/proc/locks").read_text().splitlines() if line.split()[5].endswith(":" + str(inode))]
@@ -5572,8 +5644,8 @@ def child(root, runtime, container):
             reconnect(); fixture.require(cli("--sync-space",url,space),"syncing MOVE and later directory create")
             assert lab.upstream(container,"DELETE",base + "/rmdir-moved/empty")[0] == 204
             assert lab.upstream(container,"MKCOL",base + "/rmdir-moved/empty")[0] == 201
-            fixture.require(cli("--ls",url,"/rmdir-moved"),"publishing proven directory replacement B")
-            fixture.require(cli("--ls",url,"/rmdir-moved/empty"),"publishing complete B observation")
+            fixture.require(cli("--ls-space",url,space,"/rmdir-moved"),"publishing proven directory replacement B")
+            fixture.require(cli("--ls-space",url,space,"/rmdir-moved/empty"),"publishing complete B observation")
             with sqlite3.connect(database) as db:
                 b = json.loads(db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[\"rmdir-moved\"]'",(url,space)).fetchone()[0])
                 assert next(entry for entry in b if entry["name"] == "empty")["id"] != a["id"]
@@ -5631,7 +5703,7 @@ def child(root, runtime, container):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             target = "projection-delete"
             original = contents["folder/" + target]
-            fixture.require(cli("--ls",url),"saving projection parent identity")
+            fixture.require(cli("--ls-space",url,space),"saving projection parent identity")
             fixture.require(cli("--pin-space",url,space,"/folder/" + target),"pinning exact deleted A")
             status,_,body = lab.upstream(container,"POST","/graph/v1.0/drives",json.dumps({"name":"Projection independent","driveType":"project"}).encode(),[("Content-Type","application/json")])
             assert status == 201
@@ -5672,7 +5744,7 @@ def child(root, runtime, container):
                 peer_env = {key:value for key,value in os.environ.items() if key != "CIRRUS_TEST_NAMESPACE_RECEIPT_WINDOW"}
                 peer_env.update(XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
                 with (root / "projection-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary()),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
                 def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
                 def wait_for(predicate,description,timeout=15):
                     deadline = time.monotonic() + timeout
@@ -5682,7 +5754,7 @@ def child(root, runtime, container):
                 wait_for(lambda:second_cli("--status").returncode == 0,"projection peer unavailable")
                 ticks = Path(f"/proc/{second_daemon.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
                 print(f"OWNED projection peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}",flush=True)
-                fixture.require(second_cli("--ls",url),"warming actual projection peer")
+                fixture.require(second_cli("--ls-space",url,space),"warming actual projection peer")
                 receipt_window = root / "projection-receipt"; receipt_window.touch(mode=0o600)
                 result = []; peer_result = []
                 worker = threading.Thread(target=lambda:result.append(cli("--sync-space",url,space))); worker.start()
@@ -5694,7 +5766,7 @@ def child(root, runtime, container):
                         assert deletion[1:] == ("uncertain",a["id"],a["etag"]),deletion
                         assert db.execute("SELECT 1 FROM mutation_receipts WHERE operation_id=?",(deletion[0],)).fetchone()
                     peer_window.touch(mode=0o600)
-                    peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls",url))); peer_worker.start()
+                    peer_worker = threading.Thread(target=lambda:peer_result.append(second_cli("--ls-space",url,space))); peer_worker.start()
                     wait_for(lambda:peer_window.with_suffix(".waiting").exists(),"peer never owned actual State reservation")
                     inode = (database.parent / "state-storage.lock").stat().st_ino
                     owners = [line for line in Path("/proc/locks").read_text().splitlines() if line.split()[5].endswith(":" + str(inode))]
@@ -5775,7 +5847,7 @@ def child(root, runtime, container):
             assert lab.upstream(container,"DELETE",base + "/projection-moved/" + target)[0] == 204
             b = b"genuine external replacement B"
             assert lab.upstream(container,"PUT",base + "/projection-moved/" + target,b)[0] == 201
-            fixture.require(cli("--ls",url,"/projection-moved"),"durably publishing genuine replacement B")
+            fixture.require(cli("--ls-space",url,space,"/projection-moved"),"durably publishing genuine replacement B")
             assert read_file(path) == b
             with sqlite3.connect(database) as db:
                 saved_b = json.loads(db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[\"projection-moved\"]'",(url,space)).fetchone()[0])
@@ -5805,7 +5877,7 @@ def child(root, runtime, container):
                 assert lab.upstream(container, "MKCOL", base + path)[0] == 201
             for path, data in (("/source/top", b"saved top"), ("/source/nested/kept", b"pinned original"), ("/source/nested/dirty", b"old dirty base")):
                 assert lab.upstream(container, "PUT", base + path, data)[0] == 201
-            fixture.require(cli("--ls", url), "observing source parent before offline MOVE")
+            fixture.require(cli("--ls-space", url, space), "observing source parent before offline MOVE")
             fixture.require(cli("--pin-space", url, space, "/source"), "pinning real observed source/nested")
             if os.environ.get("CIRRUS_TEST_ORDINARY_MOVED_TREE"):
                 assert lab.upstream(container, "PUT", base + "/source/nested/cache-only", b"cached original")[0] == 201
@@ -5823,7 +5895,7 @@ def child(root, runtime, container):
             # not promote its saved nested payload into an eligible directory.
             for path in ("/orphan", "/orphan/nested"):
                 assert lab.upstream(container, "MKCOL", base + path)[0] == 201
-            fixture.require(cli("--ls", url, "/orphan/nested"), "saving ordinary unbound nested observation")
+            fixture.require(cli("--ls-space", url, space, "/orphan/nested"), "saving ordinary unbound nested observation")
             assert offline_tree_mutations == []
             server.shutdown(); server.server_close(); thread.join(timeout=5)
             server = thread = None
@@ -5838,7 +5910,7 @@ def child(root, runtime, container):
             daemon.wait(timeout=10)
             if os.environ.get("CIRRUS_TEST_ORDINARY_MOVED_TREE"):
                 daemon = start()
-                fixture.require(cli("--mount", url, mountpoint), "ordinary cold offline mount with queued MOVE"); mounted = True
+                resume_mount(space, mountpoint, "ordinary cold offline mount with queued MOVE"); mounted = True
                 assert read_file(mountpoint / "destination/nested/kept") == b"pinned original"
                 assert read_file(mountpoint / "destination/nested/cache-only") == b"cached original"
                 assert read_file(mountpoint / "destination/nested/dirty") == dirty
@@ -5978,7 +6050,7 @@ def child(root, runtime, container):
             peer_env.update(XDG_RUNTIME_DIR=str(peer_runtime))
             peer_env["CIRRUS_TEST_PIN_COMMIT_WINDOW" if journal == "wal" else "CIRRUS_TEST_PIN_PEER_SNAPSHOT_COMMIT_WINDOW"] = str(committing)
             with (root / "pin-read-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY), "--no-auto-sync"], env=peer_env, stdout=subprocess.DEVNULL, stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary()), "--no-auto-sync"], env=peer_env, stdout=subprocess.DEVNULL, stderr=log)
             def second_cli(*args): return fixture.run([str(fixture.BINARY), *map(str,args)], env=peer_env)
             def wait_pin_event(check, message):
                 deadline = time.monotonic() + 12
@@ -5988,7 +6060,7 @@ def child(root, runtime, container):
             wait_pin_event(lambda:second_cli("--status").returncode == 0, "peer did not start")
             ticks = Path(f"/proc/{second_daemon.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
             print(f"OWNED pin-read peer: root={root} runtime={peer_runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}", flush=True)
-            fixture.require(second_cli("--ls", url), "warming peer credential/session and root observation before the pinned-read barrier")
+            fixture.require(second_cli("--ls-space", url, space), "warming peer credential/session and root observation before the pinned-read barrier")
             result = []
             with open(mountpoint / "pin-read-race", "rb", buffering=0) as old:
                 selected.touch(mode=0o600)
@@ -6107,8 +6179,8 @@ def child(root, runtime, container):
             assert clean_before
             if os.environ.get("CIRRUS_TEST_OFFLINE_WRITABLE"):
                 assert lab.upstream(container,"MKCOL",base + "/offline-parent-replaced")[0] == 201
-                fixture.require(cli("--ls",url),"saving offline mkdir parent mapping")
-                fixture.require(cli("--ls",url,"/offline-parent-replaced"),"saving complete identity-bound mkdir parent")
+                fixture.require(cli("--ls-space",url,space),"saving offline mkdir parent mapping")
+                fixture.require(cli("--ls-space",url,space,"/offline-parent-replaced"),"saving complete identity-bound mkdir parent")
                 offline_saved_account = json.loads(fixture.require(fixture.run(["secret-tool","lookup","application","cirrus-drive","instance",url]),"retaining disposable original credential fixture").stdout)
                 observed = json.loads(fixture.require(cli("--storage-status"),"sizing offline writable admission").stdout)
                 fixture.require(cli("--set-storage-limits",observed["immutable_admission_charge_bytes"] + 512 * 1024 * 1024,0),"enabling real offline write admission")
@@ -6355,7 +6427,7 @@ def child(root, runtime, container):
                 peer_runtime = runtime / "offline-peer"; peer_runtime.mkdir(mode=0o700)
                 peer_env = dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime))
                 with (root / "offline-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary()),"--no-auto-sync"],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
                 def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
                 deadline = time.monotonic() + 10
                 while second_cli("--status").returncode != 0:
@@ -6373,8 +6445,8 @@ def child(root, runtime, container):
                         with open(reservation_mount / "file.bin","r+b",buffering=0) as independent:
                             assert os.pwrite(independent.fileno(),project_bytes[:7],0) == 7
                             os.fsync(independent.fileno())
-                        peer = second_cli("--select-space",url,project)
-                        assert peer.returncode != 0 and "another account operation" in peer.stderr,peer
+                        peer = second_cli("--spaces",url)
+                        assert peer.returncode != 0 and peer.stderr.strip() == "account: another account operation is in progress",peer
                         inode = (database.parent / "account.lock").stat().st_ino
                         owners = [line for line in Path("/proc/locks").read_text().splitlines() if line.split()[5].endswith(":" + str(inode))]
                         assert any(line.split()[4] == str(daemon.pid) for line in owners),owners
@@ -6493,8 +6565,8 @@ def child(root, runtime, container):
                 assert lab.upstream(container,"GET",base + "/atomic-target.bin")[2] == b"external replacement"
                 # Final cold offline round: independent real backend conflicts,
                 # not hypothetical absence or remote authority from saved state.
-                fixture.require(cli("--ls",url),"observing conflict parent mapping before final cold round")
-                fixture.require(cli("--ls",url,"/offline-parent-replaced"),"saving complete conflict parent immediately before cold round")
+                fixture.require(cli("--ls-space",url,space),"observing conflict parent mapping before final cold round")
+                fixture.require(cli("--ls-space",url,space,"/offline-parent-replaced"),"saving complete conflict parent immediately before cold round")
                 with sqlite3.connect(database) as db:
                     assert db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[\"offline-parent-replaced\"]'",(url,space)).fetchone() == ("[]",)
                 fixture.require(cli("--stop"),"stopping before offline mkdir conflict round"); daemon.wait(timeout=10)
@@ -6756,21 +6828,13 @@ def child(root, runtime, container):
                 created.write(omitted)
                 os.fsync(created.fileno())
 
-            def verification_ipc(request, environment=os.environ):
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.settimeout(30)
-                    client.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                    client.sendall(b"CIRRUS/2 " + json.dumps(request).encode() + b"\n")
-                    with client.makefile("rb") as response:
-                        return json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
-
             def verification_status(environment=os.environ):
-                reply = verification_ipc({"operation": "StorageStatus"}, environment)
+                reply = lab_account_request({"operation": "StorageStatus"}, environment)
                 assert reply["error"] is None, reply
-                return json.loads(reply["spaces"][0][1])
+                return reply["reply"]["value"]
 
             def verification_budget(value):
-                reply = verification_ipc({"operation": "SetStorageLimits", "limits": {"budget_bytes": value, "free_space_reserve_bytes": 0}})
+                reply = lab_account_request({"operation": "SetStorageLimits", "limits": {"budget_bytes": value, "free_space_reserve_bytes": 0}})
                 assert reply["error"] is None, reply
 
             def verification_state(which, name):
@@ -6811,7 +6875,7 @@ def child(root, runtime, container):
             second_env = {key: value for key, value in os.environ.items() if not key.startswith("CIRRUS_TEST_VERIFICATION_")}
             second_env.update(XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0", CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "verification-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str,args)], env=second_env)
             deadline = time.monotonic() + 10
@@ -6825,7 +6889,7 @@ def child(root, runtime, container):
             with open(reservation_mount / "verification-progress", "wb", buffering=0) as created:
                 created.write(content)
                 os.fsync(created.fileno())
-            fixture.require(second_cli("--ls", url, "/folder"), "warming peer snapshot session")
+            fixture.require(second_cli("--ls-space", url, space, "/folder"), "warming peer snapshot session")
             protected = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in staging.iterdir()}
             worker = peer_worker = None
             try:
@@ -6834,7 +6898,7 @@ def child(root, runtime, container):
                 receipt_window = root / "verification-receipt"
                 result = []
                 receipt_window.touch(mode=0o600)
-                worker = threading.Thread(target=lambda: result.append(cli("--write-turn", url, space)))
+                worker = threading.Thread(target=lambda: result.append(upload_step(url, space)))
                 worker.start()
                 try:
                     verification_wait(receipt_window, worker, result)
@@ -6848,24 +6912,24 @@ def child(root, runtime, container):
                 finally:
                     receipt_window.unlink(missing_ok=True)
                     worker.join(timeout=20)
-                assert not worker.is_alive() and len(result) == 1 and result[0].returncode != 0
+                assert not worker.is_alive() and len(result) == 1 and result[0]["error"] is not None, result
                 omitted_state = verification_state(space,"receipt-omitted")
                 assert omitted_state[0][2] == "uncertain" and omitted_state[1] is None
                 verification_export(space,"receipt-omitted",omitted,"receipt-omitted-pressure")
-                fixture.require(cli("--unmount"), "unmounting before receipt-failure crash")
+                fixture.require(cli("--unmount-space", url, space), "unmounting before receipt-failure crash")
                 mounted = False
                 daemon.kill()
                 daemon.wait(timeout=5)
                 assert verification_state(space,"receipt-omitted") == omitted_state
                 verification_export(space,"receipt-omitted",omitted,"receipt-omitted-crash",second_cli)
                 # Restore space for observations, not permission to replay.
-                reply = verification_ipc({"operation":"SetStorageLimits","limits":{"budget_bytes":high,"free_space_reserve_bytes":0}},second_env)
+                reply = lab_account_request({"operation":"SetStorageLimits","limits":{"budget_bytes":high,"free_space_reserve_bytes":0}},second_env)
                 assert reply["error"] is None, reply
-                turn = fixture.require(second_cli("--write-turn",url,space), "peer observing omitted receipt after crash")
-                assert turn.stdout.strip() == "Attention" and verification_requests["receipt-omitted"]["PUT"] == 1
+                turn = upload_step(url, space, second_env)
+                assert upload_outcome(turn) == "Attention" and verification_requests["receipt-omitted"]["PUT"] == 1
                 daemon = start()
                 verification_owner("restart", daemon)
-                fixture.require(cli("--mount",url,mountpoint), "remounting uncertain local root")
+                fixture.require(cli("--mount-space",url,space,mountpoint), "remounting uncertain local root")
                 mounted = True
                 assert read_file(mountpoint / "receipt-omitted") == omitted
 
@@ -6875,7 +6939,7 @@ def child(root, runtime, container):
                 receipt_window.with_suffix(".waiting").unlink(missing_ok=True)
                 receipt_window.touch(mode=0o600)
                 result = []
-                worker = threading.Thread(target=lambda: result.append(cli("--write-turn",url,project)))
+                worker = threading.Thread(target=lambda: result.append(upload_step(url, project)))
                 worker.start()
                 try:
                     verification_wait(receipt_window, worker, result)
@@ -6888,7 +6952,7 @@ def child(root, runtime, container):
                     receipt_window.unlink(missing_ok=True)
                     worker.join(timeout=20)
                 assert not worker.is_alive() and len(result) == 1
-                assert fixture.require(result[0],"preserving low-policy successful PUT receipt").stdout.strip() == "Retry"
+                assert upload_outcome(result[0]) == "Retry", result
                 before = verification_state(project,"verification-progress")
                 assert before[0][2] == "uncertain" and before[1][3:] == (None,0,0)
                 assert before[1][1:3] == (hashlib.sha256(content).hexdigest(),len(content))
@@ -6901,22 +6965,22 @@ def child(root, runtime, container):
                     window.with_suffix(".waiting").unlink(missing_ok=True)
                     result, peer_result = [], []
                     window.touch(mode=0o600)
-                    worker = threading.Thread(target=lambda: result.append(cli("--write-turn",url,project)))
+                    worker = threading.Thread(target=lambda: result.append(upload_step(url, project)))
                     worker.start()
                     try:
                         verification_wait(window, worker, result)
                         assert verification_state(project,"verification-progress") == before
                         if boundary == "peer":
                             peer_window.touch(mode=0o600)
-                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls",url,"/folder")))
+                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space",url,space,"/folder")))
                             peer_worker.start()
                             verification_wait(peer_window,peer_worker,peer_result)
                             assert [lease["store"] for lease in verification_status()["sql_reservations"]] == ["state"]
                         else:
                             if boundary == "commit":
                                 assert [lease["store"] for lease in verification_status()["sql_reservations"]] == ["state"]
-                                competing = second_cli("--write-turn",url,project)
-                                assert competing.returncode != 0, competing
+                                competing = upload_step(url, project, second_env)
+                                assert competing["error"] is not None, competing
                             verification_budget(max(1,verification_status()["immutable_admission_charge_bytes"] - 1))
                     finally:
                         window.unlink(missing_ok=True)
@@ -6925,7 +6989,7 @@ def child(root, runtime, container):
                         if peer_worker is not None:
                             peer_worker.join(timeout=20)
                     assert not worker.is_alive() and len(result) == 1
-                    assert fixture.require(result[0],"retaining receipt on " + boundary).stdout.strip() == "Retry"
+                    assert upload_outcome(result[0]) == "Retry", (boundary, result)
                     assert verification_state(project,"verification-progress") == before
                     assert verification_requests["verification-progress"]["PUT"] == 1 and verification_status()["sql_reservations"] == []
                     verification_budget(high)
@@ -6933,13 +6997,13 @@ def child(root, runtime, container):
                 # range. Crash with no active lease; the peer must reload that
                 # receipt and continue GET only, including final source digest.
                 (root / "verification-save-error").touch(mode=0o600)
-                turn = fixture.require(cli("--write-turn",url,project), "handling committed progress error")
-                assert turn.stdout.strip() == "Retry"
+                turn = upload_step(url, project)
+                assert upload_outcome(turn) == "Retry", turn
                 saved = verification_state(project,"verification-progress")
                 assert saved[1][3] and saved[1][4] == 131072 and saved[1][0:3] == before[1][0:3]
                 verification_export(project,"verification-progress",content,"progress-error")
                 assert verification_requests["verification-progress"]["PUT"] == 1
-                fixture.require(cli("--unmount"), "unmounting before progress-error crash")
+                fixture.require(cli("--unmount-space", url, space), "unmounting before progress-error crash")
                 mounted = False
                 daemon.kill()
                 daemon.wait(timeout=5)
@@ -6951,8 +7015,8 @@ def child(root, runtime, container):
                 assert verification_requests["verification-progress"]["PUT"] == 1 and verification_requests["verification-progress"]["GET"] > gets_before
                 assert lab.upstream(container,"GET",project_base + "/verification-progress")[2] == content
                 fixture.require(second_cli("--sync-space",url,project), "checking confirmed receipt does not replay")
-                turn = fixture.require(second_cli("--write-turn",url,space), "rechecking omitted receipt uncertainty")
-                assert turn.stdout.strip() == "Attention"
+                turn = upload_step(url, space, second_env)
+                assert upload_outcome(turn) == "Attention", turn
                 assert verification_state(space,"receipt-omitted") == omitted_state
                 assert all(counts["PUT"] == 1 and counts["DELETE"] == counts["MOVE"] == 0 for counts in verification_requests.values())
                 assert {name:hashlib.sha256((staging / name).read_bytes()).digest() for name in protected} == protected
@@ -7008,14 +7072,14 @@ def child(root, runtime, container):
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                         client.settimeout(30)
                         client.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                        client.sendall(b"CIRRUS/2 " + json.dumps(request).encode() + b"\n")
+                        client.sendall(b"CIRRUS/3 " + json.dumps(request).encode() + b"\n")
                         with client.makefile("rb") as response:
-                            return json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                            return json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
 
                 def capture_status():
                     reply = capture_ipc({"operation": "StorageStatus"})
                     assert reply["error"] is None, reply
-                    return json.loads(reply["spaces"][0][1])
+                    return reply["reply"]["value"]
 
                 def capture_budget(value):
                     reply = capture_ipc({"operation": "SetStorageLimits", "limits": {"budget_bytes": value, "free_space_reserve_bytes": 0}})
@@ -7062,7 +7126,7 @@ def child(root, runtime, container):
                 second_env = {key: value for key, value in os.environ.items() if not key.startswith(("CIRRUS_TEST_BASE_CAPTURE_", "CIRRUS_TEST_PREPARATION_")) and key != "CIRRUS_TEST_DIRTY_PROTECTED_WINDOW"}
                 second_env.update(XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0", CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
                 with (root / "base-capture-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
                 def second_cli(*args):
                     return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
                 deadline = time.monotonic() + 10
@@ -7117,7 +7181,7 @@ def child(root, runtime, container):
                         assert capture_refs() == winner and capture_records() == prior
                         if boundary == "peer":
                             peer_window.touch(mode=0o600)
-                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls", url, "/folder")))
+                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space", url, space, "/folder")))
                             peer_worker.start()
                             capture_wait(peer_window, peer_worker, peer_result)
                             assert [lease["store"] for lease in capture_status()["sql_reservations"]] == ["state"]
@@ -7190,11 +7254,11 @@ def child(root, runtime, container):
                 writer = None
                 os.close(peer_reader)
                 peer_reader = None
-                fixture.require(second_cli("--unmount"), "unmounting same-block peer")
+                fixture.require(second_cli("--unmount-space", url, space), "unmounting same-block peer")
                 second_mounted = False
                 fixture.require(second_cli("--stop"), "stopping same-block peer")
                 second_daemon.wait(timeout=5)
-                fixture.require(cli("--unmount"), "unmounting capture roots before restart")
+                fixture.require(cli("--unmount-space", url, space), "unmounting capture roots before restart")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping capture daemon")
                 daemon.wait(timeout=5)
@@ -7202,9 +7266,9 @@ def child(root, runtime, container):
                 server.server_close()
                 thread.join(timeout=5)
                 server = thread = None
-                daemon = start()
+                daemon = start(no_auto_sync=True)
                 capture_owner("restart", daemon)
-                fixture.require(cli("--mount", url, mountpoint), "offline restart of acknowledged capture roots")
+                fixture.require(cli("--mount-offline-space", url, space, mountpoint), "offline restart of acknowledged capture roots")
                 mounted = True
                 assert read_file(target) == expected and capture_records() == prior
                 if preparing:
@@ -7287,9 +7351,11 @@ def child(root, runtime, container):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             staging = database.parent / "staging"
             target = mountpoint / "cli-import-publication"
+            import_path = "/" + target.name
+            attempts = import_puts[target.name] = []
             source = root / "small-cli-import"
-            acknowledged, candidate_bytes = b"A" * 4096, b"later imported candidate " * 400
-            assert lab.upstream(container, "PUT", base + "/" + target.name, b"remote original")[0] == 201
+            original, acknowledged, candidate_bytes = b"remote original", b"A" * 4096, b"later imported candidate " * 400
+            assert lab.upstream(container, "PUT", base + import_path, original)[0] == 201
             assert target.name in os.listdir(mountpoint)
             fixture.require(cli("--pin-space", url, space, "/folder/nested.bin"), "protecting pin before CLI import admission")
 
@@ -7297,11 +7363,11 @@ def child(root, runtime, container):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.settimeout(30)
                     client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                    client.sendall(b"CIRRUS/2 " + json.dumps(request).encode() + b"\n")
+                    client.sendall(b"CIRRUS/3 " + json.dumps(request).encode() + b"\n")
                     with client.makefile("rb") as response:
-                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                        reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
                     assert reply["error"] is None, reply
-                    return json.loads(reply["spaces"][0][1])
+                    return reply["reply"]["value"]
 
             def import_status():
                 return import_ipc({"operation": "StorageStatus"})
@@ -7311,6 +7377,7 @@ def child(root, runtime, container):
 
             def import_records():
                 with sqlite3.connect(database) as db:
+                    db.row_factory = sqlite3.Row
                     ids = "SELECT id FROM operation_journal WHERE path='[\"cli-import-publication\"]'"
                     return (db.execute("SELECT * FROM operation_journal WHERE id IN (" + ids + ") ORDER BY id").fetchall(),
                             db.execute("SELECT * FROM operation_parents WHERE operation_id IN (" + ids + ") ORDER BY operation_id").fetchall(),
@@ -7329,8 +7396,10 @@ def child(root, runtime, container):
 
             log_import_owner("primary", daemon)
             source.write_bytes(acknowledged)
-            fixture.require(cli("--stage-file", url, "/" + target.name, source), "publishing initial acknowledged CLI import")
+            fixture.require(cli("--stage-file-space", url, space, import_path, source), "publishing initial acknowledged CLI import")
             prior = import_records()
+            [old_head] = prior[0]
+            assert old_head["state"] == "pending" and old_head["base_file_id"] and old_head["base_etag"]
             protected = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in staging.iterdir()}
             with sqlite3.connect(database) as db:
                 original_roots = db.execute("SELECT * FROM dirty_roots ORDER BY root").fetchall()
@@ -7344,7 +7413,7 @@ def child(root, runtime, container):
             second_env = {key: value for key, value in os.environ.items() if not key.startswith("CIRRUS_TEST_IMPORT_")}
             second_env.update(XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0", CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "cli-import-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
             deadline = time.monotonic() + 10
@@ -7352,7 +7421,7 @@ def child(root, runtime, container):
                 assert second_daemon.poll() is None and time.monotonic() < deadline
                 time.sleep(0.02)
             log_import_owner("peer", second_daemon)
-            fixture.require(second_cli("--ls", url, "/folder"), "warming independent peer read session")
+            fixture.require(second_cli("--ls-space", url, space, "/folder"), "warming independent peer read session")
             descriptor = os.open(target, os.O_RDONLY)
             worker = peer_worker = None
             try:
@@ -7361,7 +7430,7 @@ def child(root, runtime, container):
                     window.with_suffix(".waiting").unlink(missing_ok=True)
                     result, peer_result = [], []
                     window.touch(mode=0o600)
-                    worker = threading.Thread(target=lambda: result.append(cli("--stage-file", url, "/" + target.name, source)))
+                    worker = threading.Thread(target=lambda: result.append(cli("--stage-file-space", url, space, import_path, source)))
                     worker.start()
                     try:
                         deadline = time.monotonic() + 10
@@ -7373,7 +7442,7 @@ def child(root, runtime, container):
                             # State earlier would now test registry admission,
                             # not this CLI journal-publication boundary.
                             peer_window.touch(mode=0o600)
-                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls", url, "/folder")))
+                            peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space", url, space, "/folder")))
                             peer_worker.start()
                             deadline = time.monotonic() + 10
                             while not peer_window.with_suffix(".waiting").exists() and peer_worker.is_alive() and time.monotonic() < deadline:
@@ -7405,15 +7474,14 @@ def child(root, runtime, container):
                     assert os.pread(descriptor, 4096, 0) == acknowledged
                     os.fsync(descriptor)
                     export_import(boundary)
-                    assert import_publication_puts[0] == 0 and import_status()["pin_payload_bytes"] == pin_bytes
+                    assert not attempts and import_status()["pin_payload_bytes"] == pin_bytes
                     assert {name: hashlib.sha256((staging / name).read_bytes()).digest() for name in protected} == protected
                     import_budget(high)
                 candidate_hashes = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in staging.iterdir() if p.name not in protected}
                 candidate_charge = sum(max((staging / name).stat().st_size, (staging / name).stat().st_blocks * 512) for name in candidate_hashes)
                 assert candidate_hashes and import_status()["observed_staging_charge_bytes"] >= candidate_charge > 0
-                # Existing CLI account ownership is exclusive during an import;
-                # independent Space staging progresses after the denied turn,
-                # not by weakening that ownership or holding a State lease.
+                # Explicit imports share principal ownership; the peer test
+                # above contests the State lease, not that principal binding.
                 status, _, response = lab.upstream(container, "POST", "/graph/v1.0/drives", json.dumps({"name": "CLI import independent", "driveType": "project"}).encode(), [("Content-Type", "application/json")])
                 assert status == 201
                 project = json.loads(response)["id"]
@@ -7422,7 +7490,7 @@ def child(root, runtime, container):
                 assert lab.upstream(container, "GET", "/dav/spaces/" + quote(project, safe="") + "/independent")[2] == candidate_bytes
                 os.close(descriptor)
                 descriptor = None
-                fixture.require(cli("--unmount"), "unmounting old import before offline restart")
+                fixture.require(cli("--unmount-space", url, space), "unmounting old import before offline restart")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping import daemon")
                 daemon.wait(timeout=5)
@@ -7430,9 +7498,9 @@ def child(root, runtime, container):
                 server.server_close()
                 thread.join(timeout=5)
                 server = thread = None
-                daemon = start()
+                daemon = start(no_auto_sync=True)
                 log_import_owner("restart", daemon)
-                fixture.require(cli("--mount", url, mountpoint), "remounting old CLI import offline")
+                fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting old CLI import offline")
                 mounted = True
                 assert read_file(target) == acknowledged and import_records() == prior
                 export_import("restart")
@@ -7441,27 +7509,37 @@ def child(root, runtime, container):
                 server.socket = context.wrap_socket(server.socket, server_side=True)
                 thread = threading.Thread(target=server.serve_forever)
                 thread.start()
-                # CLI imports append history, unlike mounted pending-root CAS.
-                # Confirm the still-unchanged earlier dirty head explicitly
-                # before retry; import/fsync alone is not remote confirmation.
-                fixture.require(cli("--sync-space", url, space), "confirming prior CLI import before retry")
-                assert lab.upstream(container, "GET", base + "/" + target.name)[2] == acknowledged
-                assert import_publication_puts[0] == 1
-                import_publication_puts[0] = 0
-                (root / "import-committed-error").touch(mode=0o600)
-                fixture.require(cli("--stage-file", url, "/" + target.name, source), "retrying import with exact committed-error recovery")
-                assert "cirrus lab import committed-but-returned-error" in (root / "daemon.log").read_text()
-                assert import_publication_puts[0] == 0
+                # The shared fault fires after a staged-head COMMIT. Retry
+                # against the original pending row, not a new remote version.
+                assert lab.upstream(container, "GET", base + import_path)[0::2] == (200, original)
+                commit_error = root / "import-committed-error"
+                log = root / "daemon.log"
+                message = "cirrus lab committed-but-returned-error (not hardware I/O)"
+                prior_errors = log.read_text().count(message)
+                commit_error.touch(mode=0o600)
+                fixture.require(cli("--stage-file-space", url, space, import_path, source), "retrying import with exact committed-error recovery")
+                assert not commit_error.exists() and log.read_text().count(message) == prior_errors + 1
+                replacement = import_records()
+                [new_head] = replacement[0]
+                for field in ("id", "base_file_id", "base_etag", "state", "error_msg"):
+                    assert new_head[field] == old_head[field], field
+                assert replacement[1:] == prior[1:]
+                assert new_head["staged_file"] != old_head["staged_file"]
+                assert staged_bytes(database, new_head["staged_file"]) == candidate_bytes
+                assert staged_bytes(database, old_head["staged_file"]) == acknowledged
+                assert read_file(target) == candidate_bytes and not attempts
                 fixture.require(cli("--sync", url), "syncing admitted CLI import once")
-                assert lab.upstream(container, "GET", base + "/" + target.name)[2] == candidate_bytes
-                assert import_publication_puts[0] == 1
+                assert lab.upstream(container, "GET", base + import_path)[0::2] == (200, candidate_bytes)
+                expected_puts = [(unquote(base) + import_path, old_head["base_etag"], None, candidate_bytes)]
+                assert attempts == expected_puts, attempts
                 fixture.require(cli("--sync", url), "checking no stale CLI import replay")
-                assert import_publication_puts[0] == 1 and import_status()["pin_payload_bytes"] == pin_bytes
+                assert attempts == expected_puts and import_status()["pin_payload_bytes"] == pin_bytes
                 assert {name: hashlib.sha256((staging / name).read_bytes()).digest() for name in candidate_hashes} == candidate_hashes
                 print("PASS: CLI import candidates remain durable/charged across pre-BEGIN pressure, real peer State contention and precommit rollback; prior head/parents/dependencies/bytes/fsync/export survive offline restart; independent Space progresses; retry verifies committed-error candidate before success, then one target PUT/no replay", flush=True)
             finally:
                 for suffix in ("admission", "reserved", "commit"):
                     (root / ("import-publication-" + suffix)).unlink(missing_ok=True)
+                (root / "import-committed-error").unlink(missing_ok=True)
                 peer_window.unlink(missing_ok=True)
                 for running in (worker, peer_worker):
                     if running is not None:
@@ -7486,12 +7564,12 @@ def child(root, runtime, container):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.settimeout(30)
                     client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                    client.sendall(b"CIRRUS/2 " + json.dumps(operation).encode() + b"\n")
+                    client.sendall(b"CIRRUS/3 " + json.dumps(operation).encode() + b"\n")
                     with client.makefile("rb") as response:
                         line = response.readline(262145)
-                    reply = json.loads(line.removeprefix(b"CIRRUS/2 "))
+                    reply = json.loads(line.removeprefix(b"CIRRUS/3 "))
                     assert reply["error"] is None, reply
-                    return json.loads(reply["spaces"][0][1])
+                    return reply["reply"]["value"]
 
             def root_status():
                 return root_ipc({"operation": "StorageStatus"})
@@ -7535,7 +7613,7 @@ def child(root, runtime, container):
                 second_env = {key: value for key, value in os.environ.items() if not key.startswith(("CIRRUS_TEST_ROOT_PUBLICATION_", "CIRRUS_TEST_ROOT_REGISTRATION_"))}
                 second_env.update(XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0")
                 with (root / "root-publication-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
                 def second_cli(*args):
                     return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
                 deadline = time.monotonic() + 10
@@ -7678,7 +7756,7 @@ def child(root, runtime, container):
                 assert candidate_hashes and root_status()["observed_staging_charge_bytes"] >= candidate_charge > 0
                 os.close(writer)
                 writer = None
-                fixture.require(cli("--unmount"), "unmounting denied root for offline restart")
+                fixture.require(cli("--unmount-space", url, space), "unmounting denied root for offline restart")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping denied root daemon")
                 daemon.wait(timeout=5)
@@ -7689,7 +7767,7 @@ def child(root, runtime, container):
                 daemon = start()
                 ticks = Path(f"/proc/{daemon.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
                 print(f"OWNED {boundary_name} restart: pid={daemon.pid} start_ticks={ticks}", flush=True)
-                fixture.require(cli("--mount", url, mountpoint), "offline remount of acknowledged old root")
+                resume_mount(space, mountpoint, "offline remount of acknowledged old root")
                 mounted = True
                 assert read_file(target) == acknowledged and root_records() == prior
                 root_export("restart")
@@ -7739,7 +7817,7 @@ def child(root, runtime, container):
             orphan_hash = hashlib.sha256(orphan.read_bytes()).digest()
             empty_move_paused = [False]
 
-            # Same bounded CIRRUS/2 fixture pattern as the OIDC lab. During an
+            # Same bounded CIRRUS/3 fixture pattern as the OIDC lab. During an
             # empty-move pause the mount state lock is intentionally owned;
             # don't fork/exec inherited FUSE descriptors and wait on their flush.
             def account_ipc(request, environment=os.environ):
@@ -7747,24 +7825,24 @@ def child(root, runtime, container):
                     client.settimeout(30)
                     client.connect(str(Path(environment["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
                     encoded = request.encode() if isinstance(request, str) else json.dumps(request).encode()
-                    client.sendall(b"CIRRUS/2 " + encoded + b"\n")
+                    client.sendall(b"CIRRUS/3 " + encoded + b"\n")
                     with client.makefile("rb") as response:
                         line = response.readline(262145)
-                    assert line.startswith(b"CIRRUS/2 ") and line.endswith(b"\n") and len(line) <= 262144
-                    return line.removeprefix(b"CIRRUS/2 ").decode() if isinstance(request, str) else json.loads(line.removeprefix(b"CIRRUS/2 "))
+                    assert line.startswith(b"CIRRUS/3 ") and line.endswith(b"\n") and len(line) <= 262144
+                    return line.removeprefix(b"CIRRUS/3 ").decode() if isinstance(request, str) else json.loads(line.removeprefix(b"CIRRUS/3 "))
 
             def budget_status(client=cli):
                 if empty_move_paused[0]:
                     response = account_ipc({"operation": "StorageStatus"}, os.environ if client is cli else second_env)
                     assert response["error"] is None, response["error"]
-                    return json.loads(response["spaces"][0][1])
+                    return response["reply"]["value"]
                 return json.loads(fixture.require(client("--storage-status"), "observing configured storage pressure").stdout)
 
             def set_budget(budget, reserve=0):
                 if empty_move_paused[0]:
                     response = account_ipc({"operation": "SetStorageLimits", "limits": {"budget_bytes": budget, "free_space_reserve_bytes": reserve}})
                     assert response["error"] is None, response["error"]
-                    view = json.loads(response["spaces"][0][1])
+                    view = response["reply"]["value"]
                 else:
                     view = json.loads(fixture.require(cli("--set-storage-limits", budget, reserve), "persisting user-chosen storage limits").stdout)
                 assert view["limits"] == {"budget_bytes": budget, "free_space_reserve_bytes": reserve}
@@ -7839,7 +7917,7 @@ def child(root, runtime, container):
                 second_runtime.mkdir(mode=0o700)
                 second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0")
                 with (root / "storage-limits-daemon.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
                 if os.environ.get("CIRRUS_TEST_PENDING_REPLACE_LIMITS") or os.environ.get("CIRRUS_TEST_LOCAL_DIRECTORY_LIMITS") or os.environ.get("CIRRUS_TEST_REMOVE_STAGED_LIMITS"):
                     ticks = Path(f"/proc/{second_daemon.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
                     print(f"OWNED storage peer: pid={second_daemon.pid} start_ticks={ticks}", flush=True)
@@ -8215,23 +8293,24 @@ def child(root, runtime, container):
                     # State lease before BEGIN: peer complete-publication must
                     # refuse, but status/config operations remain independent.
                     set_budget(high_budget)
-                    fixture.require(second_cli("--ls", url, "/folder"), "refreshing peer read session before journal ownership")
+                    fixture.require(second_cli("--ls-space", url, space, "/folder"), "refreshing peer read session before journal ownership")
                     peer_publication = []
-                    peer_request = None
+                    # Complete Graph and upstream DAV before taking the journal
+                    # lease. Release the DAV response only while State is held.
+                    snapshot_entered.clear()
+                    snapshot_continue.clear()
+                    with snapshot_lock:
+                        snapshot_pause[0] = True
                     if moving or removing:
-                        # Finish the proxy's Docker subprocess before holding
-                        # mount state; release its already complete response
-                        # during the pause to test actual peer State admission.
-                        snapshot_entered.clear()
-                        snapshot_continue.clear()
-                        with snapshot_lock:
-                            snapshot_pause[0] = True
-                        peer_request = threading.Thread(target=lambda: peer_publication.append(account_ipc({"operation": "Directory", "instance": url, "path": ["folder"]}, second_env)))
-                        peer_request.start()
-                        assert snapshot_entered.wait(timeout=10)
-                    reserved_window.touch(mode=0o600)
-                    creator, result = start_namespace()
+                        peer_request = threading.Thread(target=lambda: peer_publication.append(account_ipc({"operation": "DirectorySpace", "instance": url, "space": space, "path": ["folder"]}, second_env)))
+                    else:
+                        peer_request = threading.Thread(target=lambda: peer_publication.append(second_cli("--ls-space", url, space, "/folder")))
+                    creator = None
+                    peer_request.start()
                     try:
+                        assert snapshot_entered.wait(timeout=10), ("peer listing did not reach DAV after Graph", peer_publication)
+                        reserved_window.touch(mode=0o600)
+                        creator, result = start_namespace()
                         await_window(reserved_window, creator, result)
                         empty_move_paused[0] = moving or removing
                         reserved_started = time.monotonic()
@@ -8246,15 +8325,15 @@ def child(root, runtime, container):
                         # all cookie/handle witnesses are checked after return.
                         assert journal_rows() == leased_before
                         assert creator.is_alive() and not result, (result, time.monotonic() - reserved_started)
+                        snapshot_continue.set()
+                        peer_request.join(timeout=10)
+                        assert not peer_request.is_alive() and len(peer_publication) == 1, peer_publication
                         if moving or removing:
-                            snapshot_continue.set()
-                            peer_request.join(timeout=10)
-                            assert not peer_request.is_alive() and len(peer_publication) == 1
-                            assert "another account operation is in progress" in (peer_publication[0]["error"] or ""), peer_publication
+                            assert peer_publication[0]["error"] == "another account operation is in progress", peer_publication
                             assert account_ipc("STATUS", second_env).startswith("OK running")
                         else:
-                            refused = second_cli("--ls", url, "/folder")
-                            assert refused.returncode != 0 and "another account operation is in progress" in refused.stderr, (refused.returncode, refused.stderr, result, time.monotonic() - reserved_started, budget_status()["sql_reservations"])
+                            refused = peer_publication[0]
+                            assert refused.returncode != 0 and refused.stderr.strip() == "account: another account operation is in progress", (refused, result, time.monotonic() - reserved_started, budget_status()["sql_reservations"])
                             fixture.require(second_cli("--status"), "ordinary peer status during journal reservation")
                         set_budget(high_budget)  # No global allocator lock spans the window.
                         assert journal_rows() == leased_before
@@ -8263,10 +8342,12 @@ def child(root, runtime, container):
                         set_budget(max(1, budget_status()["immutable_admission_charge_bytes"] - 1))
                     finally:
                         reserved_window.unlink(missing_ok=True)
+                        with snapshot_lock:
+                            snapshot_pause[0] = False
                         snapshot_continue.set()
-                        creator.join(timeout=20)
-                        if peer_request is not None:
-                            peer_request.join(timeout=30)
+                        if creator is not None:
+                            creator.join(timeout=20)
+                        peer_request.join(timeout=30)
                         empty_move_paused[0] = False
                     assert not creator.is_alive() and result == [("errno", errno.ENOSPC)], result
                     assert journal_rows() == leased_before and budget_head() == old_head
@@ -8531,7 +8612,7 @@ def child(root, runtime, container):
                         second_daemon.wait(timeout=5)
                         second_env["CIRRUS_TEST_AUTO_SYNC"] = "1"
                         with (root / "storage-limits-daemon.log").open("a") as log:
-                            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
+                            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env, stdout=subprocess.DEVNULL, stderr=log)
                         for _ in range(150):
                             if second_cli("--status").returncode == 0:
                                 break
@@ -8779,7 +8860,7 @@ def child(root, runtime, container):
                     before_tokens = {entry["token"] for entry in budget_status()["namespace_reservations"]}
                     scratch_window = root / "namespace-scratch-window"
                     scratch_window.touch(mode=0o600)
-                    scratch_client = subprocess.Popen([str(fixture.BINARY), "--ls", url, "/scratch-pressure"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    scratch_client = subprocess.Popen([str(fixture.BINARY), "--ls-space", url, space, "/scratch-pressure"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     try:
                         deadline = time.monotonic() + 10
                         while not scratch_window.with_suffix(".waiting").exists() and time.monotonic() < deadline and scratch_client.poll() is None:
@@ -8802,8 +8883,10 @@ def child(root, runtime, container):
                         assert tight - peer_status["immutable_admission_charge_bytes"] < namespace_ceiling
                         set_budget(tight)
                         assert second_cli("--release-storage-reservation", "namespace", held["token"]).returncode != 0
-                        denied = second_cli("--ls", url, "/scratch-pressure")
-                        assert denied.returncode != 0 and "configured storage pressure limit reached" in denied.stderr
+                        # Fresh Graph does not reserve namespace scratch. Require
+                        # the DAV scratch pressure diagnostic, not just failure.
+                        denied = second_cli("--ls-space", url, space, "/scratch-pressure")
+                        assert denied.returncode != 0 and denied.stderr.strip() == "account: configured storage pressure limit reached", denied
                         assert {entry["token"] for entry in budget_status()["namespace_reservations"]} == before_tokens | {held["token"]}
                         with sqlite3.connect(database) as db:
                             assert db.execute("SELECT entries,updated FROM snapshots WHERE space=? AND path='[\"scratch-pressure\"]'", (space,)).fetchone() == before_snapshot
@@ -8822,7 +8905,7 @@ def child(root, runtime, container):
                     assert scratch_client.returncode == 0, (out, err)
                     assert {line.split("\t")[-1] for line in out.splitlines()} == scratch_names | {"new-child"}
                     assert held["token"] not in {entry["token"] for entry in budget_status()["namespace_reservations"]}
-                    retried = fixture.require(second_cli("--ls", url, "/scratch-pressure"), "retrying namespace allocation after first owner drop without changing budget")
+                    retried = fixture.require(second_cli("--ls-space", url, space, "/scratch-pressure"), "retrying namespace allocation after first owner drop without changing budget")
                     assert {line.split("\t")[-1] for line in retried.stdout.splitlines()} == scratch_names | {"new-child"}
                     os.close(enumeration_fd)
                     enumeration_fd = None
@@ -8922,7 +9005,7 @@ def child(root, runtime, container):
                         unchanged_namespace()
                         snapshot_window = root / "snapshot-storage-window"
                         snapshot_window.touch(mode=0o600)
-                        snapshot_client = subprocess.Popen([str(fixture.BINARY), "--ls", url, "/storage-snapshot"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        snapshot_client = subprocess.Popen([str(fixture.BINARY), "--ls-space", url, space, "/storage-snapshot"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                         try:
                             deadline = time.monotonic() + 10
                             while not snapshot_window.with_suffix(".waiting").exists() and time.monotonic() < deadline and snapshot_client.poll() is None:
@@ -9114,7 +9197,7 @@ def child(root, runtime, container):
                     before_crash_tokens = {entry["token"] for entry in budget_status()["namespace_reservations"]}
                     scratch_window.with_suffix(".waiting").unlink(missing_ok=True)
                     scratch_window.touch(mode=0o600)
-                    scratch_client = subprocess.Popen([str(fixture.BINARY), "--ls", url, "/scratch-pressure"], env=second_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    scratch_client = subprocess.Popen([str(fixture.BINARY), "--ls-space", url, space, "/scratch-pressure"], env=second_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     try:
                         deadline = time.monotonic() + 10
                         while not scratch_window.with_suffix(".waiting").exists() and time.monotonic() < deadline and scratch_client.poll() is None:
@@ -9206,7 +9289,7 @@ def child(root, runtime, container):
                             if error.errno != errno.EIO:
                                 close_errors.append(error)
                 assert not close_errors, close_errors
-            fixture.require(cli("--unmount"), "unmounting configured admission fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting configured admission fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping configured admission fixture")
             daemon.wait(timeout=5)
@@ -9394,7 +9477,7 @@ def child(root, runtime, container):
                 assert {p.name: hashlib.sha256(p.read_bytes()).digest() for p in staging.iterdir()} == dirty_hashes
                 assert read_file(mountpoint / "file.bin") == contents["file.bin"]
                 assert read_file(mountpoint / "storage-dirty") == dirty_bytes
-                fixture.require(cli("--unmount"), "unmounting aggregate storage fixture")
+                fixture.require(cli("--unmount-space", url, space), "unmounting aggregate storage fixture")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping aggregate storage fixture")
                 daemon.wait(timeout=5)
@@ -9500,7 +9583,7 @@ def child(root, runtime, container):
                     second_runtime.mkdir(mode=0o700)
                     second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime), CIRRUS_TEST_AUTO_SYNC="0")
                     with (root / "publication-successor-daemon.log").open("w") as log:
-                        second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+                        second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                                          stdout=subprocess.DEVNULL, stderr=log)
                     def second_cli(*args):
                         return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -9555,12 +9638,12 @@ def child(root, runtime, container):
                                 os.close(descriptor)
                             except OSError as error:
                                 assert error.errno == errno.EIO
-                fixture.require(cli("--unmount"), "unmounting reviewed successor fixture")
+                fixture.require(cli("--unmount-space", url, space), "unmounting reviewed successor fixture")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping reviewed successor fixture")
                 daemon.wait(timeout=5)
                 daemon = start()
-                fixture.require(cli("--mount", url, mountpoint), "remounting reviewed successor fixture")
+                fixture.require(cli("--mount-space", url, space, mountpoint), "remounting reviewed successor fixture")
                 mounted = True
                 assert read_file(target) == candidate_bytes
                 assert cli("--sync-space", url, space).returncode != 0 and uncertain_puts[0] == 1
@@ -9618,13 +9701,13 @@ def child(root, runtime, container):
                 os.fsync(other.fileno())
             fixture.require(cli("--unmount-space", url, project), "unmounting publication independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting fenced publication")
+            fixture.require(cli("--unmount-space", url, space), "unmounting fenced publication")
             mounted = False
             fixture.require(cli("--stop"), "stopping with persistent publication fence")
             daemon.wait(timeout=5)
             publication_automatic[0] = True
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting persistent publication fence")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting persistent publication fence")
             mounted = True
             wait_publication(lambda: publication_status(project)["phase"] == "ObservedIdle", "independent automatic Space never completed")
             assert lab.upstream(container, "GET", project_base + "/publication-independent")[2] == b"independent automatic progress"
@@ -9826,7 +9909,7 @@ def child(root, runtime, container):
                 os.close(writer)
             fixture.require(cli("--unmount-space", url, project), "unmounting independent storage Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting rejected write fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting rejected write fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping after rejected write")
             daemon.wait(timeout=5)
@@ -9835,7 +9918,7 @@ def child(root, runtime, container):
             thread.join(timeout=5)
             server = thread = None
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "offline remount after rejected storage publication")
+            resume_mount(space, mountpoint, "offline remount after rejected storage publication")
             mounted = True
             assert storage_head() == head
             assert read_file(target) == acknowledged
@@ -9930,7 +10013,7 @@ def child(root, runtime, container):
                 assert status == 207
                 responses = ET.fromstring(xml).findall("{DAV:}response")
                 assert len(responses) == 1026, "DAV must include self and every child"
-                fixture.require(cli("--ls", url, "/large-directory-protocol"), "streaming complete 1025-child metadata")
+                fixture.require(cli("--ls-space", url, space, "/large-directory-protocol"), "streaming complete 1025-child metadata")
                 assert set(os.listdir(directory)) == expected
                 with sqlite3.connect(database) as db:
                     snapshot_after = db.execute("SELECT entries,updated FROM snapshots WHERE instance=? AND space=? AND path=?", (url, space, '["large-directory-protocol"]')).fetchone()
@@ -9967,7 +10050,7 @@ def child(root, runtime, container):
                     output.write(block)
                     digest.update(block)
             expected_import = digest.hexdigest()
-            fixture.require(cli("--stage-file", url, "/large-stream-import", source), "streaming an 80 MiB+137 byte CLI import")
+            fixture.require(cli("--stage-file-space", url, space, "/large-stream-import", source), "streaming an 80 MiB+137 byte CLI import")
             imported = next(row for row in retained_rows() if row["path"] == ["large-stream-import"])
             after_import_memory = high_water_kib()
             patch_offset, patch = 65*1024*1024+19, b"retained overlay patch"
@@ -10094,7 +10177,7 @@ def child(root, runtime, container):
                     raise AssertionError("logical size limit was not checked")
             huge.unlink()
             assert sum(path.stat().st_size for path in staging.iterdir()) < 512*1024
-            fixture.require(cli("--unmount"), "unmounting dirty overlay before offline restart")
+            fixture.require(cli("--unmount-space", url, space), "unmounting dirty overlay before offline restart")
             mounted = False
             fixture.require(cli("--stop"), "stopping dirty overlay before offline restart")
             daemon.wait(timeout=5)
@@ -10103,7 +10186,7 @@ def child(root, runtime, container):
             thread.join(timeout=5)
             server = thread = None
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "mounting dirty overlay offline")
+            resume_mount(space, mountpoint, "mounting dirty overlay offline")
             mounted = True
             with open(target, "rb", buffering=0) as reader:
                 assert os.pread(reader.fileno(), 11, 1024*1024+7) == b"first patch"
@@ -10326,7 +10409,7 @@ def child(root, runtime, container):
             dirty_offline[0] = False
             source = root / "large-stream-import"
             source.write_bytes(original)
-            fixture.require(cli("--stage-file", url, "/large-stream-import", source), "streaming a >64 MiB CLI import")
+            fixture.require(cli("--stage-file-space", url, space, "/large-stream-import", source), "streaming a >64 MiB CLI import")
             fixture.require(subprocess.run([str(fixture.BINARY), "--sync", url], env=os.environ, capture_output=True, text=True, timeout=600), "uploading streamed CLI import")
             assert lab.upstream(container, "GET", base + "/large-stream-import")[2] == original
             print("PASS: >64 MiB metadata-only open, durable distant patches, append, sparse EOF, shrink/reextend, offline restart and exact streamed PUT", flush=True)
@@ -10361,7 +10444,7 @@ def child(root, runtime, container):
                 # another commit advanced the global observation fence. Staging
                 # deliberately requires recorded parent evidence, not just 207.
                 def recorded():
-                    listing = fixture.require(cli("--ls", url), "observing automatic fixture parent")
+                    listing = fixture.require(cli("--ls-space", url, space), "observing automatic fixture parent")
                     with sqlite3.connect(database) as db:
                         row = db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[]'", (url, space)).fetchone()
                     return any(line.endswith("\t" + name) for line in listing.stdout.splitlines()) and row and any(entry["name"] == name and entry["directory"] for entry in json.loads(row[0]))
@@ -10682,7 +10765,7 @@ def child(root, runtime, container):
                     peer_runtime=runtime/'owner-peer';peer_runtime.mkdir(mode=0o700)
                     registration=root/'owner-registration'
                     peer_env=dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_ROOT_REGISTRATION_ADMISSION_WINDOW=str(registration))
-                    with (root/'owner-peer.log').open('w') as log:second_daemon=subprocess.Popen([str(fixture.BINARY),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                    with (root/'owner-peer.log').open('w') as log:second_daemon=subprocess.Popen([str(fixture.service_binary()),'--no-auto-sync'],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
                     def peer_cli(*args):return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
                     second_cli=peer_cli # Shared failure cleanup must address this peer's runtime.
                     await_condition(lambda:peer_cli('--status').returncode==0,'owner peer did not start',timeout=10)
@@ -10886,7 +10969,7 @@ def child(root, runtime, container):
                     peer_env = dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_AUTO_SYNC="1",CIRRUS_TEST_NAMESPACE_POLL="1")
                     poll_log = root / "namespace-peer.log"
                     with poll_log.open("w") as log:
-                        second_daemon = subprocess.Popen([str(fixture.BINARY)],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                        second_daemon = subprocess.Popen([str(fixture.service_binary())],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
                     def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
                     await_condition(lambda:second_cli("--status").returncode == 0,"mount daemon B did not start",timeout=10)
                     owner(second_daemon,peer_runtime)
@@ -10906,7 +10989,7 @@ def child(root, runtime, container):
                 for name,body in seeds.items():
                     assert lab.upstream(container,"PUT",base + "/reconcile/" + name,body)[0] == 201
                 assert set(os.listdir(directory)) == set(seeds)
-                fixture.require(poll_cli("--pin",url,"/folder/nested.bin"),"pinning independent recovery bytes")
+                fixture.require(poll_cli("--pin-space",url,space,"/folder/nested.bin"),"pinning independent recovery bytes")
                 with open(directory / "dirty","wb",buffering=0) as writer:
                     writer.write(b"local dirty retained")
                     os.fsync(writer.fileno())
@@ -11095,9 +11178,9 @@ def child(root, runtime, container):
                     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
                         client.settimeout(30)
                         client.connect(str(Path(os.environ["XDG_RUNTIME_DIR"]) / "cirrus-drive.sock"))
-                        client.sendall(b"CIRRUS/2 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
+                        client.sendall(b"CIRRUS/3 " + json.dumps({"operation":"SetStorageLimits","limits":{"budget_bytes":value,"free_space_reserve_bytes":0}}).encode() + b"\n")
                         with client.makefile("rb") as response:
-                            reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/2 "))
+                            reply = json.loads(response.readline(262145).removeprefix(b"CIRRUS/3 "))
                     assert reply["error"] is None,reply
                 def export(path,label,expected):
                     rows = [json.loads(line) for line in fixture.require(cli("--retained-staged",url),"listing pressure recovery").stdout.splitlines()]
@@ -11305,7 +11388,7 @@ def child(root, runtime, container):
                         assert set(os.listdir(directory / name)) == {"nested"}
                         assert set(os.listdir(directory / name / "nested")) == {"old-deep"}
                     assert lab.upstream(container, "PUT", base + "/reconcile/atomic-00/old-pin", b"old pinned bytes retained")[0] == 201
-                    fixture.require(cli("--pin", url, "/reconcile/atomic-00/old-pin"), "pinning old directory identity")
+                    fixture.require(cli("--pin-space", url, space, "/reconcile/atomic-00/old-pin"), "pinning old directory identity")
                     saved(directory / "atomic-00/local-preserved", b"old parent local root retained")
                     with sqlite3.connect(database) as db:
                         retained_root = db.execute("SELECT id,staged_file,base_file_id,base_etag FROM operation_journal WHERE path=? ORDER BY id DESC LIMIT 1", ('["reconcile","atomic-00","local-preserved"]',)).fetchone()
@@ -11339,7 +11422,7 @@ def child(root, runtime, container):
                         assert db.execute("SELECT count(*) FROM chunks").fetchone()[0] > 0
                     fixture.require(cli("--unmount-space", url, project), "unmounting identity fixture second Space")
                     second_mounted = False
-                    fixture.require(cli("--unmount"), "unmounting observed B")
+                    fixture.require(cli("--unmount-space", url, space), "unmounting observed B")
                     mounted = False
                     fixture.require(cli("--stop"), "stopping observed B daemon")
                     daemon.wait(timeout=5)
@@ -11348,7 +11431,7 @@ def child(root, runtime, container):
                     thread.join(timeout=5)
                     server = thread = None
                     daemon = start()
-                    fixture.require(cli("--mount", url, mountpoint), "offline remount after observing B")
+                    resume_mount(space, mountpoint, "offline remount after observing B")
                     mounted = True
                     assert "atomic-00" in os.listdir(directory)
                     try:
@@ -11388,7 +11471,7 @@ def child(root, runtime, container):
                         assert lab.upstream(container, "MKCOL", base + "/reconcile/" + name)[0] == 201
                     expected_names = set(seeds) | bulk_names | additions
                     assert len(expected_names) == 2599 and set(os.listdir(directory)) == expected_names
-                    listing = cli("--ls", url, "/reconcile")
+                    listing = cli("--ls-space", url, space, "/reconcile")
                     assert listing.returncode != 0 and not listing.stdout and "incomplete local message" in listing.stderr, "oversized CLI JSON must retain its existing refusal"
                     assert (root / "daemon.log").read_text().count("cirrus lab directory collect") == trace_before + 1
                     # The unchanged CLI response intentionally owns its bounded
@@ -11397,12 +11480,12 @@ def child(root, runtime, container):
                     small_names = {f"empty-{index:02d}" for index in range(33)}
                     for name in sorted(small_names):
                         assert lab.upstream(container, "PUT", base + "/reconcile/pin-folder/" + name, b"")[0] == 201
-                    listing = fixture.require(cli("--ls", url, "/reconcile/pin-folder"), "preserving a complete bounded CLI response")
+                    listing = fixture.require(cli("--ls-space", url, space, "/reconcile/pin-folder"), "preserving a complete bounded CLI response")
                     assert {line.rsplit("\t", 1)[-1] for line in listing.stdout.splitlines()} == small_names
                     assert (root / "daemon.log").read_text().count("cirrus lab directory collect") == trace_before + 1
                     trace_before += 1
-                    fixture.require(cli("--pin", url, "/reconcile/" + patch_name), "pinning a file in a 2599-entry directory")
-                    fixture.require(cli("--pin", url, "/reconcile/pin-folder"), "pinning through a 32-record traversal boundary")
+                    fixture.require(cli("--pin-space", url, space, "/reconcile/" + patch_name), "pinning a file in a 2599-entry directory")
+                    fixture.require(cli("--pin-space", url, space, "/reconcile/pin-folder"), "pinning through a 32-record traversal boundary")
                     assert hashlib.sha256(read_file(directory / patch_name)).digest() == hashlib.sha256(patch_original).digest()
                     assert set(os.listdir(directory / "pin-folder")) == small_names
                     with sqlite3.connect(database) as db:
@@ -11412,7 +11495,7 @@ def child(root, runtime, container):
                     # not only mounted staging or the automatic executor.
                     imported = root / "manual-import"
                     imported.write_bytes(b"explicit manual source bytes")
-                    fixture.require(cli("--stage-file", url, "/reconcile/manual-file", imported), "staging indexed manual import")
+                    fixture.require(cli("--stage-file-space", url, space, "/reconcile/manual-file", imported), "staging indexed manual import")
                     os.rename(directory / "rename-source", directory / "manual-renamed")
                     (directory / "deleted").unlink()
                     (directory / "manual-dir-00").rmdir()
@@ -11427,7 +11510,7 @@ def child(root, runtime, container):
 
                     local = b"manual conflict copy must retain these exact bytes"
                     imported.write_bytes(local)
-                    fixture.require(cli("--stage-file", url, "/reconcile/dirty", imported), "staging manual conflict")
+                    fixture.require(cli("--stage-file-space", url, space, "/reconcile/dirty", imported), "staging manual conflict")
                     assert lab.upstream(container, "PUT", base + "/reconcile/dirty", b"external edit survives")[0] == 204
                     assert cli("--sync", url).returncode != 0, "manual conflict was concealed"
                     status, _, raw = lab.upstream(container, "PROPFIND", base + "/reconcile", headers=[("Depth", "1")])
@@ -11447,7 +11530,7 @@ def child(root, runtime, container):
                     # the new remote identity and must never replay the PUT.
                     verification_bytes = b"same bytes are not proof of the uploaded identity"
                     imported.write_bytes(verification_bytes)
-                    fixture.require(cli("--stage-file", url, "/reconcile/manual-verify", imported), "staging verification identity race")
+                    fixture.require(cli("--stage-file-space", url, space, "/reconcile/manual-verify", imported), "staging verification identity race")
                     manual_verification_replacement[0] = verification_bytes
                     assert cli("--sync", url).returncode != 0, "remote identity replacement verified incorrectly"
                     assert manual_verification_replacement[0] is None and manual_verification_puts[0] == 1
@@ -11461,7 +11544,7 @@ def child(root, runtime, container):
 
                     fixture.require(cli("--unmount-space", url, project), "unmounting independent manual Space")
                     second_mounted = False
-                    fixture.require(cli("--unmount"), "unmounting before pinned offline restart")
+                    fixture.require(cli("--unmount-space", url, space), "unmounting before pinned offline restart")
                     mounted = False
                     fixture.require(cli("--stop"), "stopping before pinned offline restart")
                     daemon.wait(timeout=5)
@@ -11469,15 +11552,15 @@ def child(root, runtime, container):
                     server.server_close()
                     thread.join(timeout=5)
                     server = thread = None
-                    daemon = start()
-                    fixture.require(cli("--mount", url, mountpoint), "remounting pins offline")
+                    daemon = start(no_auto_sync=True)
+                    fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting pins offline")
                     mounted = True
                     assert hashlib.sha256(read_file(directory / patch_name)).digest() == hashlib.sha256(patch_original).digest()
                     assert read_file(directory / "pin-folder/empty-32") == b""
                     assert read_file(directory / "dirty") == local
                     assert read_file(directory / "manual-verify") == verification_bytes
-                    fixture.require(cli("--unpin", url, "/reconcile/" + patch_name), "unpinning large-parent file offline")
-                    fixture.require(cli("--unpin", url, "/reconcile/pin-folder"), "unpinning paged subtree offline")
+                    fixture.require(cli("--unpin-space", url, space, "/reconcile/" + patch_name), "unpinning large-parent file offline")
+                    fixture.require(cli("--unpin-space", url, space, "/reconcile/pin-folder"), "unpinning paged subtree offline")
                     with sqlite3.connect(database) as db:
                         assert db.execute("SELECT count(*) FROM pins").fetchone()[0] == 0
                         assert db.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
@@ -11555,7 +11638,7 @@ def child(root, runtime, container):
                         nonlocal daemon, mounted, second_mounted
                         fixture.require(cli("--unmount-space", url, project), "unmounting independent tree Space")
                         second_mounted = False
-                        fixture.require(cli("--unmount"), "unmounting tree Space")
+                        fixture.require(cli("--unmount-space", url, space), "unmounting tree Space")
                         mounted = False
                         fixture.require(cli("--stop"), "stopping tree fixture daemon")
                         daemon.wait(timeout=5)
@@ -11892,7 +11975,7 @@ def child(root, runtime, container):
                     trace = (root / "daemon.log").read_text()
                     admitted_before = trace.count("cirrus lab IPC foreground admitted")
                     print("PRIORITY BARRIER: count=2 before IPC launch=" + str("cirrus lab priority requested: count=2" in trace), flush=True)
-                    foreground = subprocess.Popen([str(fixture.BINARY), "--ls", url, "/slow-verify"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    foreground = subprocess.Popen([str(fixture.BINARY), "--ls-space", url, space, "/slow-verify"], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     # Tree preparation and its account waiter each own local
                     # priority. count=2 alone no longer proves IPC admission;
                     # stop may otherwise close a not-yet-accepted client.
@@ -12000,14 +12083,14 @@ def child(root, runtime, container):
 
             assert lab.upstream(container, "MKCOL", base + "/auto-tree")[0] == 201
             assert lab.upstream(container, "PUT", base + "/auto-tree/child", b"tree MOVE child")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing automatic tree fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing automatic tree fixture")
             os.rename(mountpoint / "auto-tree", mountpoint / "auto-tree-moved")
             await_condition(lambda: state(["auto-tree"]) == "synced", "automatic tree MOVE receipt did not finish")
             assert lab.upstream(container, "GET", base + "/auto-tree-moved/child")[2] == b"tree MOVE child"
             assert lab.upstream(container, "PROPFIND", base + "/auto-tree", headers=[("Depth", "0")])[0] == 404
 
             assert lab.upstream(container, "PUT", base + "/auto-source", original)[0] == 201
-            fixture.require(cli("--ls", url), "refreshing remote rename source")
+            fixture.require(cli("--ls-space", url, space), "refreshing remote rename source")
             os.rename(mountpoint / "auto-source", mountpoint / "auto-destination")
             await_condition(lambda: state(["auto-destination"]) == "uncertain", "rename destination did not upload")
             assert auto_requests["auto-source"]["DELETE"] == 0, "rename source deleted before destination verification"
@@ -12083,7 +12166,7 @@ def child(root, runtime, container):
             with sqlite3.connect(database) as db:
                 lost = db.execute("SELECT staged_file FROM operation_journal WHERE path=? AND state='uncertain'", ('["uncertain-edit"]',)).fetchone()[0]
             assert staged_bytes(database, lost) == b"ambiguous automatic bytes retained"
-            fixture.require(cli("--unmount"), "unmounting ambiguous automatic edit")
+            fixture.require(cli("--unmount-space", url, space), "unmounting ambiguous automatic edit")
             mounted = False
             fixture.require(cli("--stop"), "joining automatic scheduler")
             daemon.wait(timeout=10)
@@ -12105,8 +12188,8 @@ def child(root, runtime, container):
             source = root / "resumable-source"
             source.write_bytes(original)
             fixture.require(cli("--stage-file-space", url, space, "/resumable-upload", source), "staging multi-range upload")
-            turn = fixture.require(cli("--write-turn", url, space), "starting bounded upload")
-            assert turn.stdout.strip() == "Yielded", turn.stdout
+            turn = upload_step(url, space)
+            assert upload_outcome(turn) == "Yielded", turn
             with sqlite3.connect(database) as db:
                 row = db.execute("SELECT j.staged_file,j.state,v.verified_offset,v.digest,v.version FROM operation_journal j JOIN upload_verifications v ON v.operation_id=j.id WHERE j.path=?", ('["resumable-upload"]',)).fetchone()
             assert row and row[1] == "uncertain" and 0 < row[2] < len(original) and len(row[3]) == 64 and row[4], row
@@ -12123,7 +12206,7 @@ def child(root, runtime, container):
             independent = root / "resumable-independent"
             independent.write_bytes(b"independent Space progressed")
             fixture.require(cli("--stage-file-space", url, project, "/independent", independent), "staging independent upload")
-            fixture.require(cli("--write-turn", url, project), "advancing another Space")
+            fixture.require(cli("--sync-space", url, project), "advancing another Space")
             assert lab.upstream(container, "GET", "/dav/spaces/" + quote(project, safe="") + "/independent")[2] == independent.read_bytes()
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT state FROM operation_journal WHERE staged_file=?", (row[0],)).fetchone() == ("uncertain",)
@@ -12135,15 +12218,15 @@ def child(root, runtime, container):
                 writer.truncate(0)
                 writer.write(later)
                 os.fsync(writer.fileno())
-            fixture.require(cli("--unmount"), "unmounting before verification crash")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before verification crash")
             mounted = False
             daemon.kill()
             daemon.wait(timeout=10)
             daemon = start()
             gets_before = resumable_requests["resumable-upload"]["GET"]
             for _ in range(16):
-                turn = fixture.require(cli("--write-turn", url, space), "resuming verification after crash")
-                assert turn.stdout.strip() == "Yielded", turn.stdout
+                turn = upload_step(url, space)
+                assert upload_outcome(turn) == "Yielded", turn
                 assert resumable_requests["resumable-upload"]["PUT"] == 1, resumable_requests
                 with sqlite3.connect(database) as db:
                     rows = db.execute("SELECT state,staged_file,base_file_id,base_etag FROM operation_journal WHERE path=? ORDER BY id", ('["resumable-upload"]',)).fetchall()
@@ -12159,14 +12242,15 @@ def child(root, runtime, container):
             print("PASS: bounded verification yields, another Space progresses, crash resumes GET-only and successor edit survives", flush=True)
 
             fixture.require(cli("--stage-file-space", url, space, "/resumable-manual", source), "staging manual continuation")
-            assert fixture.require(cli("--write-turn", url, space), "yielding before manual continuation").stdout.strip() == "Yielded"
+            assert upload_outcome(upload_step(url, space)) == "Yielded", "preparing manual continuation"
             fixture.require(cli("--sync-space", url, space), "draining existing continuation with manual sync")
             assert resumable_requests["resumable-manual"]["PUT"] == 1
             assert lab.upstream(container, "GET", base + "/resumable-manual")[2] == original
-            assert fixture.require(cli("--write-turn", url, space), "checking drained Space").stdout.strip() == "Idle"
+            assert upload_outcome(upload_step(url, space)) == "Idle", "checking drained Space"
 
             fixture.require(cli("--stage-file-space", url, space, "/resumable-tampered", source), "staging digest fence fixture")
-            fixture.require(cli("--write-turn", url, space), "partially verifying digest fixture")
+            turn = upload_step(url, space)
+            assert upload_outcome(turn) == "Yielded", turn
             with sqlite3.connect(database) as db:
                 staged = db.execute("SELECT staged_file FROM operation_journal WHERE path=?", ('["resumable-tampered"]',)).fetchone()[0]
             staged_path = staged_payload_path(database, staged)
@@ -12176,8 +12260,8 @@ def child(root, runtime, container):
             fixture.require(cli("--stop"), "stopping before reopened digest check")
             daemon.wait(timeout=10)
             daemon = start()
-            turn = fixture.require(cli("--write-turn", url, space), "checking reopened snapshot digest")
-            assert turn.stdout.strip() == "Attention", turn.stdout
+            turn = upload_step(url, space)
+            assert upload_outcome(turn) == "Attention", turn
             assert cli("--sync-space", url, space).returncode != 0
             assert resumable_requests["resumable-tampered"]["PUT"] == 1
             assert staged_path.read_bytes().startswith(b"same length edit")
@@ -12187,12 +12271,12 @@ def child(root, runtime, container):
             source.write_bytes(b"lost-response bytes remain fenced")
             fixture.require(cli("--stage-file-space", url, space, "/uncertain-edit", source), "staging ambiguous upload")
             lost_response[0] = True
-            turn = fixture.require(cli("--write-turn", url, space), "losing PUT response")
-            assert turn.stdout.strip() == "Attention", turn.stdout
+            turn = upload_step(url, space)
+            assert upload_outcome(turn) == "Attention", turn
             fixture.require(cli("--stop"), "stopping after lost response")
             daemon.wait(timeout=10)
             daemon = start()
-            assert fixture.require(cli("--write-turn", url, space), "checking ambiguous upload after restart").stdout.strip() == "Attention"
+            assert upload_outcome(upload_step(url, space)) == "Attention", "checking ambiguous upload after restart"
             assert cli("--sync-space", url, space).returncode != 0 and uncertain_puts[0] == 1
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT count(*) FROM upload_verifications").fetchone() == (0,)
@@ -12271,7 +12355,7 @@ def child(root, runtime, container):
             target = mountpoint / "folder" / "rename-stale-target"
             remote_source = base + "/folder/rename-stale-source"
             assert lab.upstream(container, "PUT", remote_source, b"old remote bytes")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing stale rename fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing stale rename fixture")
             marker = root / "rename-hydration-window"
             failures = []
             with open(source, "rb", buffering=0):
@@ -12366,7 +12450,7 @@ def child(root, runtime, container):
             assert lab.upstream(container, "MKCOL", base + "/folder/noreplace-source")[0] == 201
             assert lab.upstream(container, "MKCOL", base + "/folder/noreplace-target")[0] == 201
             assert "noreplace-source" in os.listdir(mountpoint / "folder")
-            fixture.require(cli("--ls", url), "invalidating rename listings")
+            fixture.require(cli("--ls-space", url, space), "invalidating rename listings")
             rename_directory_pause[0] = "/folder/noreplace-target"
             outcome = []
             def rename_noreplace():
@@ -12399,7 +12483,7 @@ def child(root, runtime, container):
                             "staging independent Space write")
             assert lab.upstream(container, "MKCOL", base + "/unknown-tree")[0] == 201
             assert lab.upstream(container, "PUT", base + "/unknown-tree/file", b"remote file retained")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing damaged-state fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing damaged-state fixture")
             with open(mountpoint / "unknown-write", "wb", buffering=0) as writer:
                 writer.write(b"local copy retained")
                 os.fsync(writer.fileno())
@@ -12434,7 +12518,7 @@ def child(root, runtime, container):
                             "staging independent Space write")
             assert lab.upstream(container, "MKCOL", base + "/negative-tree")[0] == 201
             assert lab.upstream(container, "PUT", base + "/negative-tree/file", b"remote file retained")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing negative tree fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing negative tree fixture")
             os.rename(mountpoint / "negative-tree", mountpoint / "negative-moved")
             fixture.require(cli("--unmount-space", url, space), "unmounting before state damage")
             mounted = False
@@ -12451,7 +12535,8 @@ def child(root, runtime, container):
                     db.execute("INSERT INTO operation_journal(instance,space,path,op_type,staged_file,state,updated_at) VALUES (?,?,?,?,?,'resolved',0)", (url, 'zero-boundary-lab', json.dumps([f'boundary-{index}']), 'write', f'boundary-{index}'))
                 for entry_id in (0, -2):
                     db.execute("INSERT INTO operation_journal(id,instance,space,path,op_type,staged_file,state,updated_at) VALUES (?,?,?,?,?,?,'resolved',0)", (entry_id, url, 'zero-boundary-lab', json.dumps([f'boundary-{entry_id}']), 'write', f'boundary-{entry_id}'))
-            assert cli("--ls", url).returncode != 0, "negative-ID damaged tree metadata was skipped"
+            damaged_listing = cli("--ls-space", url, space)
+            assert damaged_listing.returncode != 0 and damaged_listing.stderr.strip() == "account: invalid directory metadata", damaged_listing
             journal = fixture.require(cli("--journal-space", url, space, "1"), "reading nonpositive journal entries")
             assert "/damaged-second" in journal.stdout and "/damaged-negative" in journal.stdout
             older = fixture.require(cli("--journal-space", url, space, "-1"), "paging damaged journal entries")
@@ -12485,7 +12570,7 @@ def child(root, runtime, container):
                 peer_runtime.mkdir(mode=0o700)
                 peer_env = dict(os.environ,XDG_RUNTIME_DIR=str(peer_runtime),CIRRUS_TEST_AUTO_SYNC="0")
                 with (root / "empty-preparation-peer.log").open("w") as log:
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())],env=peer_env,stdout=subprocess.DEVNULL,stderr=log)
                 def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=peer_env)
                 deadline = time.monotonic()+10
                 while second_cli("--status").returncode != 0:
@@ -12499,7 +12584,7 @@ def child(root, runtime, container):
                 second_mounted = True
                 assert set(os.listdir(reservation_mount / "folder/prepare-source")) == ({"file"} if concurrent_tree else set())
                 if concurrent_tree:
-                    fixture.require(cli("--pin",url,"/folder/prepare-source"),"pinning original tree before unlocked preparation")
+                    fixture.require(cli("--pin-space",url,space,"/folder/prepare-source"),"pinning original tree before unlocked preparation")
                     tree_writer = open(mountpoint / "folder/prepare-source/file","r+b",buffering=0)
                     tree_reader = open(mountpoint / "folder/prepare-source/file","rb",buffering=0)
                     tree_writer.write(b"initial dirty child")
@@ -12671,7 +12756,7 @@ def child(root, runtime, container):
                     while not marker.with_suffix(".waiting").exists() and time.monotonic() < deadline:
                         time.sleep(0.02)
                     assert marker.with_suffix(".waiting").exists(), "rename did not reach scan window"
-                    fixture.require(cli("--ls", url), "invalidating directory rename listings")
+                    fixture.require(cli("--ls-space", url, space), "invalidating directory rename listings")
                     rename_directory_pause[0] = "/folder/" + (source if mode == "source" else destination)
                     marker.unlink()
                     assert directory_entered.wait(timeout=10), "directory rename scan did not reach the server"
@@ -12723,7 +12808,7 @@ def child(root, runtime, container):
                     while not marker.with_suffix(".waiting").exists() and time.monotonic() < deadline:
                         time.sleep(0.02)
                     assert marker.with_suffix(".waiting").exists(), "rename did not reach scan window"
-                    fixture.require(cli("--ls", url), "invalidating rename parent listing")
+                    fixture.require(cli("--ls-space", url, space), "invalidating rename parent listing")
                     create_pause[0] = True
                     marker.unlink()
                     assert directory_entered.wait(timeout=10), "rename parent scan did not reach the server"
@@ -12758,7 +12843,7 @@ def child(root, runtime, container):
             assert lab.upstream(container, "PUT", project_base + "/independent-tree/file", b"independent tree")[0] in (200, 201, 204)
             assert lab.upstream(container, "MKCOL", base + "/damaged-tree")[0] == 201
             assert lab.upstream(container, "PUT", base + "/damaged-tree/file", b"remote file retained")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing tree fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing tree fixture")
             os.rename(mountpoint / "damaged-tree", mountpoint / "damaged-moved")
             fixture.require(cli("--unmount-space", url, space), "unmounting Space before state damage")
             mounted = False
@@ -12788,7 +12873,7 @@ def child(root, runtime, container):
                 source = base + f"/page-tree-{index:03}"
                 assert lab.upstream(container, "MKCOL", source)[0] == 201
                 assert lab.upstream(container, "PUT", source + "/file", f"tree {index}".encode())[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing tree page fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing tree page fixture")
             for index in range(34):
                 os.rename(mountpoint / f"page-tree-{index:03}", mountpoint / f"page-moved-{index:03}")
             os.mkdir(mountpoint / "page-moved-032" / "local-child")
@@ -12872,7 +12957,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_SYNC_NAMESPACE_PAGES"):
             for index in range(33):
                 assert lab.upstream(container, "PUT", base + f"/page-delete-{index:03}", b"remove")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing namespace page fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing namespace page fixture")
             os.mkdir(mountpoint / "page-parent")
             os.mkdir(mountpoint / "page-parent" / "nested")
             for index in range(33):
@@ -12949,12 +13034,12 @@ def child(root, runtime, container):
                 assert staged_bytes(database, entries[path][1]) == data
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting affected Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting affected Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before parent conflict restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting affected Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting affected Space")
             mounted = True
             fixture.require(cli("--mount-space", url, project, reservation_mount), "remounting independent Space")
             second_mounted = True
@@ -12976,7 +13061,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_WRITE_TREE_RACE"):
             assert lab.upstream(container, "MKCOL", base + "/race-tree")[0] == 201
             assert lab.upstream(container, "PUT", base + "/race-tree/existing", b"remote child")[0] in (200, 201, 204)
-            fixture.require(cli("--ls", url), "refreshing tree race fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing tree race fixture")
             assert read_file(mountpoint / "race-tree" / "existing") == b"remote child"
             with open(mountpoint / "tree-race-trigger", "wb", buffering=0) as writer:
                 writer.write(b"upload trigger")
@@ -12986,7 +13071,7 @@ def child(root, runtime, container):
             marker = root / "write-tree-window"
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime),
                               CIRRUS_TEST_WRITE_TREE_WINDOW=str(marker))
-            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -13056,12 +13141,12 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_RMDIR_INFLIGHT_CHILD"):
             assert lab.upstream(container, "MKCOL", base + "/inflight-parent")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing parent fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing parent fixture")
             assert os.listdir(mountpoint / "inflight-parent") == []
             second_runtime = runtime / "inflight-rmdir-daemon"
             second_runtime.mkdir(mode=0o700)
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
-            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -13283,12 +13368,12 @@ def child(root, runtime, container):
             assert row and row[0] == "uncertain" and "conflict-copy upload /" in row[1], row
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting conflicted Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting conflicted Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before conflict-copy restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting conflicted Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting conflicted Space")
             mounted = True
             fixture.require(cli("--mount-space", url, project, reservation_mount), "remounting independent Space")
             second_mounted = True
@@ -13334,12 +13419,12 @@ def child(root, runtime, container):
                 assert lab.upstream(container, "GET", base + "/" + source)[0] == 404
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting affected Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting affected Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before deletion restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting affected Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting affected Space")
             mounted = True
             fixture.require(cli("--mount-space", url, project, reservation_mount), "remounting independent Space")
             second_mounted = True
@@ -13392,12 +13477,12 @@ def child(root, runtime, container):
             assert "0 uncertain or in progress" in independent.stderr and "1 historically synced" in independent.stderr, independent.stderr
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting uncertain Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting uncertain Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before uncertain-upload restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting uncertain Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting uncertain Space")
             mounted = True
             fixture.require(cli("--mount-space", url, project, reservation_mount), "remounting independent Space")
             second_mounted = True
@@ -13439,13 +13524,13 @@ def child(root, runtime, container):
             assert read_file(mountpoint / "same-space-later") == b"fenced edit retained"
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting rejected Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting rejected Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before rejected-upload restart")
             daemon.wait(timeout=5)
             reject_upload[0] = False
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting rejected Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting rejected Space")
             mounted = True
             assert read_file(mountpoint / "rejected-upload") == b"rejected edit retained"
             fixture.require(cli("--sync", url), "retrying rejected Space after restart")
@@ -13478,12 +13563,12 @@ def child(root, runtime, container):
             hidden_space[0] = None
             fixture.require(cli("--unmount-space", url, project), "unmounting unlisted Space fixture")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting listed Space fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting listed Space fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping before unlisted Space restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting listed Space fixture")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting listed Space fixture")
             mounted = True
             fixture.require(cli("--mount-space", url, project, reservation_mount), "remounting revalidated Space")
             second_mounted = True
@@ -13510,7 +13595,7 @@ def child(root, runtime, container):
                 source = "tree-uncertain" if mode == "tree-uncertain" else "tree-source"
                 assert lab.upstream(container, "MKCOL", base + "/" + source)[0] == 201
                 assert lab.upstream(container, "PUT", base + "/" + source + "/remote", b"remote original")[0] in (200, 201, 204)
-                fixture.require(cli("--ls", url), "refreshing tree conflict fixture")
+                fixture.require(cli("--ls-space", url, space), "refreshing tree conflict fixture")
                 os.rename(mountpoint / source, mountpoint / "conflicting-directory")
             else:
                 os.mkdir(mountpoint / "conflicting-directory")
@@ -13537,12 +13622,12 @@ def child(root, runtime, container):
             assert lab.upstream(container, "GET", project_base + "/later-file")[2] == b"later independent data"
             fixture.require(cli("--unmount-space", url, project), "unmounting independent Space")
             second_mounted = False
-            fixture.require(cli("--unmount"), "unmounting conflicted Space")
+            fixture.require(cli("--unmount-space", url, space), "unmounting conflicted Space")
             mounted = False
             fixture.require(cli("--stop"), "stopping before conflict restart")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting conflicted Space")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting conflicted Space")
             mounted = True
             assert read_file(mountpoint / "conflicting-directory" / "local-child") == b"child retained locally"
             assert cli("--sync", url).returncode != 0, "directory conflict was lost after restart"
@@ -13618,14 +13703,14 @@ def child(root, runtime, container):
             assert row and row[1] == "uncertain", row
             assert staged_bytes(database, row[0]) == data
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting after cancelled verification")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting after cancelled verification")
             mounted = True
             assert read_file(mountpoint / "cancel-verification") == data
             print("PASS: shutdown cancels upload verification between ranges and preserves the uncertain edit across restart", flush=True)
             return
         if os.environ.get("CIRRUS_TEST_RMDIR_SYNC_RACE"):
             assert lab.upstream(container, "MKCOL", base + "/rmdir-sync-race")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing rmdir sync fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing rmdir sync fixture")
             assert os.listdir(mountpoint / "rmdir-sync-race") == []
             with open(mountpoint / "rmdir-sync-trigger", "wb", buffering=0) as trigger:
                 trigger.write(b"sync trigger")
@@ -13633,7 +13718,7 @@ def child(root, runtime, container):
             second_runtime = runtime / "rmdir-sync-daemon"
             second_runtime.mkdir(mode=0o700)
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
-            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -13646,7 +13731,7 @@ def child(root, runtime, container):
             else:
                 raise RuntimeError("second rmdir sync daemon did not start")
             reservation_mount.mkdir(mode=0o700)
-            fixture.require(second_cli("--mount", url, reservation_mount), "mounting second rmdir sync fixture")
+            fixture.require(second_cli("--mount-space", url, space, reservation_mount), "mounting second rmdir sync fixture")
             second_mounted = True
             assert os.listdir(reservation_mount / "rmdir-sync-race") == []
             blocked_put[0] = "/rmdir-sync-trigger"
@@ -13684,7 +13769,7 @@ def child(root, runtime, container):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             with sqlite3.connect(database) as db:
                 assert not db.execute("SELECT 1 FROM operation_journal WHERE path=? AND op_type='rmdir'", ('[\"rmdir-sync-race\"]',)).fetchone()
-            fixture.require(second_cli("--unmount"), "unmounting second rmdir sync fixture")
+            fixture.require(second_cli("--unmount-space", url, space), "unmounting second rmdir sync fixture")
             second_mounted = False
             fixture.require(second_cli("--stop"), "stopping second rmdir sync daemon")
             second_daemon.wait(timeout=5)
@@ -13725,7 +13810,7 @@ def child(root, runtime, container):
             second_runtime.mkdir(mode=0o700)
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
             with (root / "parallel-daemon.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+                second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                                  stdout=subprocess.DEVNULL, stderr=log)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -13768,7 +13853,13 @@ def child(root, runtime, container):
                 try:
                     assert put_entered.wait(timeout=10), "first daemon did not reach upload window"
                     assert second_cli("--sync", url).returncode != 0, "second sync entered while first was active"
-                    assert second_cli("--select-space", url, space).returncode != 0, "account selection changed during sync"
+                    # --spaces takes principal ownership, not the sync lock.
+                    spaces_probe = second_cli("--spaces", url)
+                    assert spaces_probe.returncode != 0 and spaces_probe.stderr.strip() == "account: another account operation is in progress", spaces_probe
+                    account_lock = runtime / "home/.local/state/cirrus-drive/account.lock"
+                    inode = account_lock.stat().st_ino
+                    owners = [line for line in Path("/proc/locks").read_text().splitlines() if line.split()[5].endswith(":" + str(inode))]
+                    assert any(line.split()[4] == str(daemon.pid) for line in owners), owners
                     other_status = fixture.require(second_cli("--journal-space", url, space), "checking cross-daemon upload status")
                     assert "uncertain or operation in progress" in other_status.stdout, other_status.stdout
                     assert "1 uncertain or in progress" in other_status.stderr, other_status.stderr
@@ -13804,12 +13895,12 @@ def child(root, runtime, container):
             fixture.require(second_cli("--stop"), "stopping second daemon")
             second_daemon.wait(timeout=5)
             if uncertain:
-                fixture.require(cli("--unmount"), "unmounting before uncertainty restart")
+                fixture.require(cli("--unmount-space", url, space), "unmounting before uncertainty restart")
                 mounted = False
                 fixture.require(cli("--stop"), "stopping before uncertainty restart")
                 daemon.wait(timeout=5)
                 daemon = start()
-                fixture.require(cli("--mount", url, mountpoint), "remounting uncertain edit")
+                fixture.require(cli("--mount-space", url, space, mountpoint), "remounting uncertain edit")
                 mounted = True
                 assert read_file(mountpoint / filename) == b"second"
                 assert cli("--sync", url).returncode != 0, "uncertain upload was replayed after restart"
@@ -13818,12 +13909,12 @@ def child(root, runtime, container):
             print("PASS: second daemon stages edits during sync; competing operations and " + ("uncertain replay" if uncertain else "account changes") + " are fenced", flush=True)
             return
         if os.environ.get("CIRRUS_TEST_SQLITE_LOCK"):
-            fixture.require(cli("--pin", url, "/file.bin"), "saving original pin")
+            fixture.require(cli("--pin-space", url, space, "/file.bin"), "saving original pin")
             database = runtime / "home/.local/state/cirrus-drive/state.db"
             tx_marker = root / "sqlite-tx"
             open_marker = root / "sqlite-open"
             tx_marker.touch(mode=0o600)
-            repin = subprocess.Popen([str(fixture.BINARY), "--pin", url, "/file.bin"], env=os.environ,
+            repin = subprocess.Popen([str(fixture.BINARY), "--pin-space", url, space, "/file.bin"], env=os.environ,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             reader = None
             try:
@@ -13871,10 +13962,10 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_PIN_DOWNLOAD") or os.environ.get("CIRRUS_TEST_PIN_METADATA"):
             metadata_only = bool(os.environ.get("CIRRUS_TEST_PIN_METADATA"))
-            fixture.require(cli("--pin", url, "/file.bin"), "saving original pin")
+            fixture.require(cli("--pin-space", url, space, "/file.bin"), "saving original pin")
             marker = root / "pin-download"
             marker.touch(mode=0o600)
-            repin = subprocess.Popen([str(fixture.BINARY), "--pin", url, "/file.bin"], env=os.environ,
+            repin = subprocess.Popen([str(fixture.BINARY), "--pin-space", url, space, "/file.bin"], env=os.environ,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             writer = None
             try:
@@ -13905,7 +13996,7 @@ def child(root, runtime, container):
             else:
                 assert repin.returncode != 0, (stdout, stderr)
                 assert "offline metadata changed" in stderr, stderr
-            fixture.require(cli("--unmount"), "unmounting after interrupted pin")
+            fixture.require(cli("--unmount-space", url, space), "unmounting after interrupted pin")
             mounted = False
             fixture.require(cli("--stop"), "stopping after interrupted pin")
             daemon.wait(timeout=5)
@@ -13913,8 +14004,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "mounting interrupted pin offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting interrupted pin offline")
             mounted = True
             assert read_file(mountpoint / "file.bin") == contents["file.bin"]
             if metadata_only:
@@ -13967,7 +14058,7 @@ def child(root, runtime, container):
                 first = db.execute("SELECT staged_file FROM operation_journal WHERE path=? AND op_type='move-tree' AND state='pending'", ('["outer","inner","source-tree"]',)).fetchone()
                 second = db.execute("SELECT staged_file FROM operation_journal WHERE path=? AND op_type='move-tree' AND state='pending'", ('["folder","source-tree"]',)).fetchone()
             assert mkdir and first and second, (mkdir, first, second)
-            fixture.require(cli("--unmount"), "unmounting before tree ancestor replacement")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before tree ancestor replacement")
             mounted = False
             fixture.require(cli("--stop"), "stopping before tree ancestor replacement")
             daemon.wait(timeout=5)
@@ -13997,7 +14088,7 @@ def child(root, runtime, container):
             with open(mountpoint / "folder" / "missing-parent-record", "wb", buffering=0) as writer:
                 writer.write(b"retained if parent evidence is missing")
                 os.fsync(writer.fileno())
-            fixture.require(cli("--unmount"), "unmounting before parent-record loss")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before parent-record loss")
             mounted = False
             fixture.require(cli("--stop"), "stopping before parent-record loss")
             daemon.wait(timeout=5)
@@ -14072,7 +14163,7 @@ def child(root, runtime, container):
             second_env = {key:value for key,value in os.environ.items() if key not in ("CIRRUS_TEST_NAMESPACE_RECEIPT_WINDOW",)}
             second_env.update(XDG_RUNTIME_DIR=str(second_runtime),CIRRUS_TEST_AUTO_SYNC="0",CIRRUS_TEST_SNAPSHOT_RESERVATION_WINDOW=str(peer_window))
             with (root / "manual-namespace-peer.log").open("w") as log:
-                second_daemon = subprocess.Popen([str(fixture.BINARY)],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
+                second_daemon = subprocess.Popen([str(fixture.service_binary())],env=second_env,stdout=subprocess.DEVNULL,stderr=log)
             def second_cli(*args): return fixture.run([str(fixture.BINARY),*map(str,args)],env=second_env)
             deadline = time.monotonic() + 10
             while second_cli("--status").returncode != 0:
@@ -14080,7 +14171,7 @@ def child(root, runtime, container):
                 time.sleep(0.02)
             ticks = Path(f"/proc/{second_daemon.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
             print(f"OWNED manual namespace peer: root={root} runtime={runtime} container={container} pid={second_daemon.pid} start_ticks={ticks}",flush=True)
-            fixture.require(second_cli("--ls",url,"/folder"),"warming manual namespace peer")
+            fixture.require(second_cli("--ls-space",url,space,"/folder"),"warming manual namespace peer")
             receipt_window = root / "namespace-receipt"
             peer_worker = worker = None
             try:
@@ -14104,7 +14195,7 @@ def child(root, runtime, container):
                     if name == "receipt-proof":
                         peer_window.touch(mode=0o600)
                         peer_result = []
-                        peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls",url,"/folder")))
+                        peer_worker = threading.Thread(target=lambda: peer_result.append(second_cli("--ls-space",url,space,"/folder")))
                         peer_worker.start()
                         deadline = time.monotonic() + 10
                         while not peer_window.with_suffix(".waiting").exists() and peer_worker.is_alive() and time.monotonic() < deadline: time.sleep(0.02)
@@ -14141,7 +14232,7 @@ def child(root, runtime, container):
                         assert exported.read_bytes() == b"Xocal nested content"
                         fixture.require(cli("--set-storage-limits",receipt_budget,0),"restoring manual receipt room")
                         fixture.require(cli("--sync",url),"GET-only manual receipt continuation after crash")
-                        fixture.require(cli("--mount",url,mountpoint),"remounting after manual receipt confirmation")
+                        fixture.require(cli("--mount-space",url,space,mountpoint),"remounting after manual receipt confirmation")
                         mounted = True
                     with sqlite3.connect(database) as db:
                         assert db.execute("SELECT state FROM operation_journal WHERE id=?",(selected,)).fetchone() == ('synced',)
@@ -14165,7 +14256,7 @@ def child(root, runtime, container):
             assert row and len(json.loads(row[1])) == 2, row
             staged = database.parent / "staging" / row[0]
             assert staged_bytes(database, staged.name) == b"retained pending content"
-            fixture.require(cli("--unmount"), "unmounting before ancestor replacement")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before ancestor replacement")
             mounted = False
             fixture.require(cli("--stop"), "stopping before ancestor replacement")
             daemon.wait(timeout=5)
@@ -14193,7 +14284,7 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_RESERVED_OFFLINE_ID"):
             assert "folder" in os.listdir(mountpoint)
-            fixture.require(cli("--unmount"), "unmounting before offline identity check")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before offline identity check")
             mounted = False
             fixture.require(cli("--stop"), "stopping before offline identity check")
             daemon.wait(timeout=5)
@@ -14210,8 +14301,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            result = cli("--mount", url, mountpoint)
+            daemon = start(no_auto_sync=True)
+            result = cli("--mount-offline-space", url, space, mountpoint)
             assert result.returncode != 0 and "invalid offline metadata" in result.stderr, result.stderr
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[]'", (url, space)).fetchone() == (poisoned,)
@@ -14296,7 +14387,7 @@ def child(root, runtime, container):
             assert lab.upstream(container, "GET", base + "/rename-identity-source")[2] == body
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT state FROM operation_journal WHERE path=? AND op_type='move-source'", ('["rename-identity-source"]',)).fetchone() == ("conflict",)
-            fixture.require(cli("--unmount"), "unmounting after rename identity conflict")
+            fixture.require(cli("--unmount-space", url, space), "unmounting after rename identity conflict")
             mounted = False
             fixture.require(cli("--stop"), "stopping after rename identity conflict")
             daemon.wait(timeout=5)
@@ -14637,7 +14728,7 @@ def child(root, runtime, container):
                     while not marker.with_suffix(".waiting").exists() and time.monotonic() < deadline:
                         time.sleep(0.02)
                     assert marker.with_suffix(".waiting").exists(), "mkdir did not reach its scan window"
-                    fixture.require(cli("--ls", url), "invalidating mkdir parent listing")
+                    fixture.require(cli("--ls-space", url, space), "invalidating mkdir parent listing")
                     create_pause[0] = True
                     marker.unlink()
                     assert directory_entered.wait(timeout=10), "mkdir parent scan did not start"
@@ -14685,7 +14776,7 @@ def child(root, runtime, container):
                     while not marker.with_suffix(".waiting").exists() and time.monotonic() < deadline:
                         time.sleep(0.02)
                     assert marker.with_suffix(".waiting").exists(), "create did not reach its scan window"
-                    fixture.require(cli("--ls", url), "invalidating create parent listing")
+                    fixture.require(cli("--ls-space", url, space), "invalidating create parent listing")
                     create_pause[0] = True
                     marker.unlink()
                     assert directory_entered.wait(timeout=10), "create parent scan did not start"
@@ -14720,7 +14811,7 @@ def child(root, runtime, container):
                 assert marker.with_suffix(".waiting").exists(), "competing create did not reach its scan window"
                 source = root / "competing-create-source"
                 source.write_bytes(b"independently staged child")
-                fixture.require(cli("--stage-file", url, "/folder/competing-create", source), "staging a competing create")
+                fixture.require(cli("--stage-file-space", url, space, "/folder/competing-create", source), "staging a competing create")
             finally:
                 marker.unlink(missing_ok=True)
                 creator.join(timeout=30)
@@ -14762,11 +14853,11 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_SNAPSHOT_ORDER"):
             database = runtime / "home/.local/state/cirrus-drive/state.db"
-            fixture.require(cli("--ls", url, "/folder"), "seeding folder snapshot")
+            fixture.require(cli("--ls-space", url, space, "/folder"), "seeding folder snapshot")
             second_runtime = runtime / "snapshot-daemon"
             second_runtime.mkdir(mode=0o700)
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
-            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -14778,7 +14869,7 @@ def child(root, runtime, container):
                 time.sleep(0.02)
             else:
                 raise RuntimeError("second snapshot daemon did not start")
-            fixture.require(second_cli("--ls", url, "/folder"), "warming second snapshot daemon")
+            fixture.require(second_cli("--ls-space", url, space, "/folder"), "warming second snapshot daemon")
 
             def race_snapshot(name, remove_before_newer):
                 if remove_before_newer:
@@ -14788,7 +14879,7 @@ def child(root, runtime, container):
                 with snapshot_lock:
                     snapshot_pause[0] = True
                 results = []
-                worker = threading.Thread(target=lambda: results.append(cli("--ls", url, "/folder")))
+                worker = threading.Thread(target=lambda: results.append(cli("--ls-space", url, space, "/folder")))
                 worker.start()
                 try:
                     assert snapshot_entered.wait(timeout=10), "older directory response did not pause"
@@ -14796,7 +14887,7 @@ def child(root, runtime, container):
                         assert lab.upstream(container, "DELETE", base + "/folder/" + name)[0] == 204
                     else:
                         assert lab.upstream(container, "PUT", base + "/folder/" + name, b"fixture")[0] == 201
-                    newer = fixture.require(second_cli("--ls", url, "/folder"), "reading newer folder snapshot").stdout
+                    newer = fixture.require(second_cli("--ls-space", url, space, "/folder"), "reading newer folder snapshot").stdout
                     assert (name in newer) != remove_before_newer, newer
                 finally:
                     snapshot_continue.set()
@@ -14813,7 +14904,7 @@ def child(root, runtime, container):
             race_snapshot("unchanged-entry", True)
             fixture.require(second_cli("--stop"), "stopping second snapshot daemon")
             second_daemon.wait(timeout=5)
-            fixture.require(cli("--unmount"), "unmounting ordered snapshots")
+            fixture.require(cli("--unmount-space", url, space), "unmounting ordered snapshots")
             mounted = False
             fixture.require(cli("--stop"), "stopping ordered snapshots")
             daemon.wait(timeout=5)
@@ -14821,8 +14912,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting ordered snapshots offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting ordered snapshots offline")
             mounted = True
             names = set(os.listdir(mountpoint / "folder"))
             assert "newer-entry" in names and "unchanged-entry" not in names, names
@@ -14865,7 +14956,7 @@ def child(root, runtime, container):
                 except OSError:
                     pass
                 writer = None
-                fixture.require(cli("--mount", url, mountpoint), "remounting after reservation crash")
+                fixture.require(cli("--mount-space", url, space, mountpoint), "remounting after reservation crash")
                 mounted = True
                 assert read_file(target) == b"durable original"
                 orphans = {path.name for path in staging.iterdir()} - before
@@ -14883,7 +14974,7 @@ def child(root, runtime, container):
                         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                         os.close(fd)
                         fillers.append(path)
-                    rejected = cli("--stage-file", url, "/after-reservation-crash", source)
+                    rejected = cli("--stage-file-space", url, space, "/after-reservation-crash", source)
                     assert rejected.returncode and "staging capacity exhausted" in rejected.stderr, rejected.stderr
                     assert read_file(target) == b"durable original"
                 finally:
@@ -14918,7 +15009,7 @@ def child(root, runtime, container):
                     second_runtime = runtime / "reservation-daemon"
                     second_runtime.mkdir(mode=0o700)
                     second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
-                    second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+                    second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     def second_cli(*args):
                         return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -15011,7 +15102,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_STAGING_BOUND"):
             source = root / "capacity-source"
             source.write_bytes(b"retained local data")
-            fixture.require(cli("--stage-file", url, "/capacity-seed", source), "staging capacity seed")
+            fixture.require(cli("--stage-file-space", url, space, "/capacity-seed", source), "staging capacity seed")
             staging = runtime / "home/.local/state/cirrus-drive/staging"
             existing = list(staging.iterdir())
             assert 0 < len(existing) < 4096
@@ -15022,7 +15113,7 @@ def child(root, runtime, container):
                     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                     os.close(fd)
                     fillers.append(path)
-                rejected = cli("--stage-file", url, "/capacity-second", source)
+                rejected = cli("--stage-file-space", url, space, "/capacity-second", source)
                 assert rejected.returncode and "staging capacity exhausted" in rejected.stderr, rejected.stderr
                 try:
                     fd = os.open(mountpoint / "capacity-mount", os.O_CREAT | os.O_WRONLY, 0o600)
@@ -15034,7 +15125,7 @@ def child(root, runtime, container):
                 assert len(list(staging.iterdir())) == 4096
                 assert read_file(mountpoint / "capacity-seed") == b"retained local data"
                 fillers.pop().unlink()
-                fixture.require(cli("--stage-file", url, "/capacity-second", source), "staging after capacity is freed")
+                fixture.require(cli("--stage-file-space", url, space, "/capacity-second", source), "staging after capacity is freed")
                 assert read_file(mountpoint / "capacity-second") == b"retained local data"
             finally:
                 for path in fillers:
@@ -15043,7 +15134,7 @@ def child(root, runtime, container):
             return
         if os.environ.get("CIRRUS_TEST_RMDIR_RACE"):
             assert lab.upstream(container, "MKCOL", base + "/rmdir-race")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing rmdir race fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing rmdir race fixture")
             assert os.listdir(mountpoint / "rmdir-race") == []
             source = root / "staged-rmdir-child"
             source.write_bytes(b"concurrent local child")
@@ -15063,7 +15154,7 @@ def child(root, runtime, container):
                 while not marker.with_suffix(".waiting").exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 assert marker.with_suffix(".waiting").exists(), "rmdir did not reach the publication window"
-                fixture.require(cli("--stage-file", url, "/rmdir-race/child", source), "staging a concurrent child")
+                fixture.require(cli("--stage-file-space", url, space, "/rmdir-race/child", source), "staging a concurrent child")
             finally:
                 marker.unlink(missing_ok=True)
                 worker.join(timeout=20)
@@ -15073,12 +15164,12 @@ def child(root, runtime, container):
             with sqlite3.connect(database) as db:
                 assert not db.execute("SELECT 1 FROM operation_journal WHERE path=? AND op_type='rmdir'", ('["rmdir-race"]',)).fetchone()
             assert lab.upstream(container, "MKCOL", base + "/rmdir-mount-race")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing mounted rmdir race fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing mounted rmdir race fixture")
             assert os.listdir(mountpoint / "rmdir-mount-race") == []
             second_runtime = runtime / "rmdir-daemon"
             second_runtime.mkdir(mode=0o700)
             second_env = dict(os.environ, XDG_RUNTIME_DIR=str(second_runtime))
-            second_daemon = subprocess.Popen([str(fixture.BINARY)], env=second_env,
+            second_daemon = subprocess.Popen([str(fixture.service_binary())], env=second_env,
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             def second_cli(*args):
                 return fixture.run([str(fixture.BINARY), *map(str, args)], env=second_env)
@@ -15092,7 +15183,7 @@ def child(root, runtime, container):
                 raise RuntimeError("second rmdir daemon did not start")
             second_mount = root / "rmdir-second-mount"
             second_mount.mkdir(mode=0o700)
-            fixture.require(second_cli("--mount", url, second_mount), "mounting second rmdir fixture")
+            fixture.require(second_cli("--mount-space", url, space, second_mount), "mounting second rmdir fixture")
             second_mounted = True
             assert os.listdir(second_mount / "rmdir-mount-race") == []
             marker.with_suffix(".waiting").unlink()
@@ -15124,7 +15215,7 @@ def child(root, runtime, container):
             assert read_file(mountpoint / "rmdir-mount-race" / "child") == b"concurrent mounted child"
             with sqlite3.connect(database) as db:
                 assert not db.execute("SELECT 1 FROM operation_journal WHERE path=? AND op_type='rmdir'", ('["rmdir-mount-race"]',)).fetchone()
-            fixture.require(second_cli("--unmount"), "unmounting second rmdir fixture")
+            fixture.require(second_cli("--unmount-space", url, space), "unmounting second rmdir fixture")
             second_mounted = False
             fixture.require(second_cli("--stop"), "stopping second rmdir daemon")
             second_daemon.wait(timeout=5)
@@ -15133,7 +15224,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_PARENT_DELETE"):
             assert lab.upstream(container, "MKCOL", base + "/uncertain-parent")[0] == 201
             assert lab.upstream(container, "PUT", base + "/uncertain-parent/child", b"child before delete")[0] == 201
-            fixture.require(cli("--ls", url), "refreshing parent-delete fixture")
+            fixture.require(cli("--ls-space", url, space), "refreshing parent-delete fixture")
             assert os.listdir(mountpoint / "uncertain-parent") == ["child"]
             os.unlink(mountpoint / "uncertain-parent" / "child")
             os.rmdir(mountpoint / "uncertain-parent")
@@ -15149,12 +15240,12 @@ def child(root, runtime, container):
                 assert db.execute("SELECT state FROM operation_journal WHERE path=? AND op_type='unlink'", ('["uncertain-parent","child"]',)).fetchone()[0] == "uncertain"
                 # Model a server whose parent ETag did not change on child deletion.
                 assert db.execute("UPDATE operation_journal SET base_etag=? WHERE path=? AND op_type='rmdir' AND state='pending'", (etag, '["uncertain-parent"]')).rowcount == 1
-            fixture.require(cli("--unmount"), "unmounting with uncertain child deletion")
+            fixture.require(cli("--unmount-space", url, space), "unmounting with uncertain child deletion")
             mounted = False
             fixture.require(cli("--stop"), "stopping with uncertain child deletion")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting with uncertain child deletion")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting with uncertain child deletion")
             mounted = True
             assert cli("--sync", url).returncode != 0, "parent delete ignored the uncertain child"
             assert parent_delete_requests[0] == 0, "parent DELETE was sent despite uncertain child"
@@ -15165,7 +15256,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_DAV_DIAGNOSTIC"):
             assert lab.upstream(container, "MKCOL", base + "/transient-dav")[0] == 201
             inject_dav_425[0] = True
-            result = cli("--ls", url, "/transient-dav")
+            result = cli("--ls-space", url, space, "/transient-dav")
             assert result.returncode != 0, "denied DAV properties must not produce a listing"
             assert "DAV status 403; properties:" in result.stderr, result.stderr
             assert "resourcetype" in result.stderr, result.stderr
@@ -15237,7 +15328,7 @@ def child(root, runtime, container):
                         break
                     time.sleep(0.05)
                 assert prefetched, "sequential reads did not produce bounded read-ahead"
-            fixture.require(cli("--unmount"), "unmounting read-ahead fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting read-ahead fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping read-ahead daemon")
             daemon.wait(timeout=5)
@@ -15245,8 +15336,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "mounting read-ahead fixture offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting read-ahead fixture offline")
             mounted = True
             with open(path, "rb", buffering=0) as reader:
                 assert os.pread(reader.fileno(), 32, 50000) == contents["file.bin"][50000:50032]
@@ -15309,7 +15400,7 @@ def child(root, runtime, container):
             staged_source = root / "eviction-dirty"
             staged_source.write_bytes(b"pending edit survives eviction")
             fixture.require(cli("--stage-file-space", url, space, "/folder/local-edit", staged_source), "staging before eviction")
-            fixture.require(cli("--unmount"), "unmounting cached range")
+            fixture.require(cli("--unmount-space", url, space), "unmounting cached range")
             mounted = False
             fixture.require(cli("--stop"), "stopping cached range daemon")
             daemon.wait(timeout=5)
@@ -15317,8 +15408,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "mounting cached range offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting cached range offline")
             mounted = True
             with open(path, "rb", buffering=0) as reader:
                 assert os.pread(reader.fileno(), 16, 10016) == contents["file.bin"][10016:10032]
@@ -15339,11 +15430,11 @@ def child(root, runtime, container):
             assert after["bytes"] < before["bytes"] and after["ranges"] < before["ranges"], (before, after)
             assert read_file(mountpoint / "folder/nested.bin") == contents["folder/nested.bin"]
             assert read_file(mountpoint / "folder/local-edit") == b"pending edit survives eviction"
-            fixture.require(cli("--unmount"), "unmounting before cache corruption probe")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before cache corruption probe")
             mounted = False
             with sqlite3.connect(cache) as db:
                 assert db.execute("UPDATE ranges SET body=zeroblob(length(body)) WHERE offset=10000").rowcount == 1
-            fixture.require(cli("--mount", url, mountpoint), "mounting with a corrupt cached range")
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting with a corrupt cached range")
             mounted = True
             fd = os.open(path, os.O_RDONLY)
             try:
@@ -15507,12 +15598,12 @@ def child(root, runtime, container):
             if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
                 g10_selection = g10_export_pair("before-restart", ["uncertain", "pending"])
             # END OPTIONAL G10 CLI EXPORT
-            fixture.require(cli("--unmount"), "unmounting with uncertain upload and later write")
+            fixture.require(cli("--unmount-space", url, space), "unmounting with uncertain upload and later write")
             mounted = False
             fixture.require(cli("--stop"), "stopping with uncertain upload and later write")
             daemon.wait(timeout=5)
             daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting uncertain write")
+            fixture.require(cli("--mount-space", url, space, mountpoint), "remounting uncertain write")
             mounted = True
             assert read_file(mountpoint / "uncertain-edit") == b"second"
             assert cli("--sync", url).returncode != 0 and uncertain_puts[0] == 1, "uncertain upload was replayed"
@@ -15551,7 +15642,7 @@ def child(root, runtime, container):
             # BEGIN OPTIONAL G10 CLI EXPORT
             if os.environ.get("CIRRUS_TEST_G10_EXPORT_DIR"):
                 g10_export_pair("after-acknowledgement", ["resolved", "conflict"], g10_selection)
-                fixture.require(cli("--pin", url, "/overwrite.bin"), "G10 retaining a real known remote file")
+                fixture.require(cli("--pin-space", url, space, "/overwrite.bin"), "G10 retaining a real known remote file")
                 pins = [json.loads(line) for line in fixture.require(cli("--retained-pins", url), "G10 listing active retained pins").stdout.splitlines()]
                 assert any(pin["space"] == space and pin["root"] == ["overwrite.bin"] for pin in pins)
                 files = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/overwrite.bin"), "G10 listing exact retained file selection").stdout.splitlines()]
@@ -15568,13 +15659,13 @@ def child(root, runtime, container):
                     former, current = b"former pinned A copy", b"new active B from local tree"
                     assert lab.upstream(container, "MKCOL", base + "/g10-copy-target")[0] == 201
                     assert lab.upstream(container, "PUT", base + "/g10-copy-target/item", former)[0] == 201
-                    fixture.require(cli("--pin", url, "/g10-copy-target"), "G10 pinning former A tree")
+                    fixture.require(cli("--pin-space", url, space, "/g10-copy-target"), "G10 pinning former A tree")
                     assert lab.upstream(container, "DELETE", base + "/g10-copy-target/item")[0] == 204
                     assert lab.upstream(container, "PUT", base + "/g10-original", b"Q" * 262144)[0] == 201
-                    fixture.require(cli("--unmount"), "G10 saving final replacement observations without mount refresh")
+                    fixture.require(cli("--unmount-space", url, space), "G10 saving final replacement observations without mount refresh")
                     mounted = False
-                    fixture.require(cli("--ls", url), "G10 saving real root and never-read original metadata")
-                    fixture.require(cli("--ls", url, "/g10-copy-target"), "G10 saving actual empty replacement target")
+                    fixture.require(cli("--ls-space", url, space), "G10 saving real root and never-read original metadata")
+                    fixture.require(cli("--ls-space", url, space, "/g10-copy-target"), "G10 saving actual empty replacement target")
                     fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "G10 same-path writable offline replacement mount")
                     mounted = True
                     os.mkdir(mountpoint / "g10-copy-source")
@@ -15590,14 +15681,14 @@ def child(root, runtime, container):
                     entry = next(row for row in entries if row["kind"] == "file" and row["path"] == ["g10-copy-target", "item"])
                     fixture.require(cli("--export-pin-copy", url, space, copy_id, "/g10-copy-target/item", entry["selector"], export_dir / "pin-copy-old"), "G10 exporting former A copy")
                     assert (export_dir / "pin-copy-old").read_bytes() == former
-                    fixture.require(cli("--unmount"), "G10 closing offline replacement mount")
+                    fixture.require(cli("--unmount-space", url, space), "G10 closing offline replacement mount")
                     mounted = False
-                    fixture.require(cli("--mount", url, mountpoint), "G10 resuming existing online RW mount")
+                    fixture.require(cli("--mount-space", url, space, mountpoint), "G10 resuming existing online RW mount")
                     mounted = True
                     assert cli("--sync", url).returncode != 0, "original unrelated conflict must remain visible"
                     assert uncertain_puts[0] == 1 and lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"first!"
                     assert lab.upstream(container, "GET", base + "/g10-copy-target/item")[2] == current
-                    fixture.require(cli("--pin", url, "/g10-copy-target"), "G10 pinning new active B tree")
+                    fixture.require(cli("--pin-space", url, space, "/g10-copy-target"), "G10 pinning new active B tree")
                     active = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/g10-copy-target"), "G10 selecting new active B").stdout.splitlines()]
                     assert len(active) == 1 and active[0]["path"] == ["g10-copy-target", "item"]
                     fixture.require(cli("--export-retained", url, space, "/g10-copy-target", "/g10-copy-target/item", active[0]["selector"], export_dir / "pin-copy-active-new"), "G10 exporting new active B")
@@ -15688,33 +15779,33 @@ def child(root, runtime, container):
         assert read_file(mountpoint / "file.bin") == contents["file.bin"]
         assert read_file(mountpoint / "unavailable.bin") == contents["unavailable.bin"]
         assert "folder" in os.listdir(mountpoint)
-        fixture.require(cli("--pin", url, "/file.bin"), "pinning file")
-        fixture.require(cli("--pin", url, "/folder"), "pinning folder")
+        fixture.require(cli("--pin-space", url, space, "/file.bin"), "pinning file")
+        fixture.require(cli("--pin-space", url, space, "/folder"), "pinning folder")
         database = runtime / "home/.local/state/cirrus-drive/state.db"
         assert database.stat().st_mode & 0o777 == 0o600
         assert database.parent.stat().st_mode & 0o777 == 0o700
-        listing = fixture.require(cli("--pins", url), "listing pins").stdout
+        listing = fixture.require(cli("--pins-space", url, space, "--check-remote"), "listing pins").stdout
         assert "available offline\t/file.bin" in listing and "available offline\t/folder" in listing, listing
         if os.environ.get("CIRRUS_TEST_PINNED_VIM"):
-            fixture.require(cli("--pin", url, "/vim-default.txt"), "pinning Vim fixture")
+            fixture.require(cli("--pin-space", url, space, "/vim-default.txt"), "pinning Vim fixture")
             result = subprocess.run([shutil.which("vim"), "-Nu", "NONE", "-i", "NONE", "-n", "-es", "-c", "%s/before/after/", "-c", "wq", str(mountpoint / "vim-default.txt")], capture_output=True, timeout=60)
             assert result.returncode == 0, f"pinned Vim save failed: {result.stderr.decode(errors='replace')}"
             assert not (mountpoint / "vim-default.txt~").exists()
-            listing = fixture.require(cli("--pins", url), "checking pin after Vim").stdout
+            listing = fixture.require(cli("--pins-space", url, space, "--check-remote"), "checking pin after Vim").stdout
             assert "\t/vim-default.txt\n" in listing and "\t/vim-default.txt~\n" not in listing, listing
             fixture.require(cli("--sync", url), "syncing pinned Vim save")
-            listing = fixture.require(cli("--pins", url), "checking pin after sync").stdout
+            listing = fixture.require(cli("--pins-space", url, space, "--check-remote"), "checking pin after sync").stdout
             assert "stale\t/vim-default.txt\n" in listing, listing
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            fixture.require(cli("--unmount"), "unmounting pinned Vim fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting pinned Vim fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping pinned Vim fixture")
             daemon.wait(timeout=5)
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting pinned Vim fixture offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting pinned Vim fixture offline")
             mounted = True
             check_io_error(mountpoint / "vim-default.txt")
             rows = [json.loads(line) for line in fixture.require(cli("--retained-files", url, space, "/vim-default.txt"), "listing historical pin").stdout.splitlines()]
@@ -15726,17 +15817,17 @@ def child(root, runtime, container):
             server.socket = context.wrap_socket(server.socket, server_side=True)
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
-            fixture.require(cli("--pin", url, "/vim-default.txt"), "repinning saved Vim file")
+            fixture.require(cli("--pin-space", url, space, "/vim-default.txt"), "repinning saved Vim file")
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            fixture.require(cli("--unmount"), "unmounting repinned Vim fixture")
+            fixture.require(cli("--unmount-space", url, space), "unmounting repinned Vim fixture")
             mounted = False
             fixture.require(cli("--stop"), "stopping repinned Vim fixture")
             daemon.wait(timeout=5)
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting repinned Vim fixture offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting repinned Vim fixture offline")
             mounted = True
             assert read_file(mountpoint / "vim-default.txt") == b"after\n"
             print("PASS: pinned Vim save keeps the original pin, retained recovery and explicit offline repin", flush=True)
@@ -15746,7 +15837,7 @@ def child(root, runtime, container):
             marker.touch(mode=0o600)
             with sqlite3.connect(database) as db:
                 before = db.execute("SELECT entries FROM snapshots WHERE instance=? AND space=? AND path='[]'", (url, space)).fetchone()[0]
-            repin = subprocess.Popen([str(fixture.BINARY), "--pin", url, "/file.bin"], env=os.environ,
+            repin = subprocess.Popen([str(fixture.BINARY), "--pin-space", url, space, "/file.bin"], env=os.environ,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             try:
                 for _ in range(500):
@@ -15773,12 +15864,12 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            fixture.require(cli("--unmount"), "unmounting retried pin")
+            fixture.require(cli("--unmount-space", url, space), "unmounting retried pin")
             mounted = False
             fixture.require(cli("--stop"), "stopping after retried pin")
             daemon.wait(timeout=5)
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting retried pin offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting retried pin offline")
             mounted = True
             assert read_file(mountpoint / "file.bin") == newer
             print("PASS: interrupted pin retries fresh metadata and serves the new version offline", flush=True)
@@ -15787,7 +15878,7 @@ def child(root, runtime, container):
             marker = root / "pin-snapshot-window"
             marker.touch(mode=0o600)
             pin_path = "/file.bin" if os.environ["CIRRUS_TEST_PIN_RACE"] == "unrelated" else "/folder"
-            repin = subprocess.Popen([str(fixture.BINARY), "--pin", url, pin_path], env=os.environ,
+            repin = subprocess.Popen([str(fixture.BINARY), "--pin-space", url, space, pin_path], env=os.environ,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 for _ in range(500):
@@ -15808,12 +15899,12 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            fixture.require(cli("--unmount"), "unmounting raced pin move")
+            fixture.require(cli("--unmount-space", url, space), "unmounting raced pin move")
             mounted = False
             fixture.require(cli("--stop"), "stopping after pin snapshot race")
             daemon.wait(timeout=5)
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting raced pin move offline")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting raced pin move offline")
             mounted = True
             if os.environ.get("CIRRUS_TEST_BLOCKER_TRACE"):
                 with sqlite3.connect(database) as db:
@@ -15824,13 +15915,13 @@ def child(root, runtime, container):
                     print(f"MOVED LOCAL INSPECTION {path}: exit={local.returncode} {local.stdout} {local.stderr}", flush=True)
             assert read_file(mountpoint / "folder-raced/nested.bin") == contents["folder/nested.bin"]
             assert not (mountpoint / "folder").exists()
-            assert "\t/folder-raced\n" in fixture.require(cli("--pins", url), "checking raced pin").stdout
+            assert "\t/folder-raced\n" in fixture.require(cli("--pins-space", url, space), "checking raced local pin").stdout
             print("PASS: overlapping repin cannot overwrite a moved tree snapshot", flush=True)
             return
         if os.environ.get("CIRRUS_TEST_REPIN_SCENARIO"):
             stage = os.environ["CIRRUS_TEST_REPIN_SCENARIO"]
             assert stage in ("before-commit", "after-commit")
-            fixture.require(cli("--unmount"), "unmounting before repin crash test")
+            fixture.require(cli("--unmount-space", url, space), "unmounting before repin crash test")
             mounted = False
             fixture.require(cli("--stop"), "stopping before repin crash test")
             daemon.wait(timeout=5)
@@ -15839,7 +15930,7 @@ def child(root, runtime, container):
             newer = b"new pinned version after crash\n"
             assert lab.upstream(container, "PUT", base + "/file.bin", newer)[0] in (200, 204)
             log_offset = (root / "daemon.log").stat().st_size
-            repin = subprocess.Popen([str(fixture.BINARY), "--pin", url, "/file.bin"], env=os.environ,
+            repin = subprocess.Popen([str(fixture.BINARY), "--pin-space", url, space, "/file.bin"], env=os.environ,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             try:
                 for _ in range(1000):
@@ -15914,8 +16005,8 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "mounting after repin crash")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting after repin crash")
             mounted = True
             with sqlite3.connect(database) as db:
                 assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -15929,10 +16020,12 @@ def child(root, runtime, container):
                 raise AssertionError((stage, len(recovered), len(expected), recovered[:64], records, pins))
             if stage == "before-commit":
                 check_io_error(mountpoint / "file.bin")
-                assert "stale\t/file.bin" in fixture.require(cli("--pins", url), "checking old pin after crash").stdout
+                pins = fixture.require(cli("--pins-space", url, space), "checking old local pin after crash").stdout
+                assert "stale (local metadata; remote not checked)\t/file.bin" in pins.splitlines(), pins
             else:
                 assert read_file(mountpoint / "file.bin") == newer
-                assert "available offline\t/file.bin" in fixture.require(cli("--pins", url), "checking committed pin after crash").stdout
+                pins = fixture.require(cli("--pins-space", url, space), "checking committed local pin after crash").stdout
+                assert "available offline (local state; remote not checked)\t/file.bin" in pins.splitlines(), pins
             print(f"PASS: repin {stage} crash and offline recovery", flush=True)
             return
         if os.environ.get("CIRRUS_TEST_STALE_PIN"):
@@ -15943,8 +16036,8 @@ def child(root, runtime, container):
             thread.join(timeout=5)
             server = thread = None
             check_io_error(mountpoint / "file.bin")
-            pins = fixture.require(cli("--pins", url), "checking older retained pin").stdout
-            assert "stale\t/file.bin" in pins, pins
+            pins = fixture.require(cli("--pins-space", url, space), "checking older retained pin").stdout
+            assert "stale (local metadata; remote not checked)\t/file.bin" in pins.splitlines(), pins
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT count(*) FROM chunks WHERE path=?", ('["file.bin"]',)).fetchone()[0] > 0
             print("PASS: older pinned bytes retained but not presented as a newer snapshot", flush=True)
@@ -15952,7 +16045,7 @@ def child(root, runtime, container):
         if os.environ.get("CIRRUS_TEST_PIN_MOVE_STOP"):
             stage = os.environ["CIRRUS_TEST_PIN_MOVE_STOP"]
             assert stage in ("before-commit", "after-commit")
-            fixture.require(cli("--pin", url, "/folder/nested.bin"), "pinning overlapping file")
+            fixture.require(cli("--pin-space", url, space, "/folder/nested.bin"), "pinning overlapping file")
             renamer = subprocess.Popen([sys.executable, "-c", "import os,sys; os.rename(sys.argv[1],sys.argv[2])",
                                         str(mountpoint / "folder"), str(mountpoint / "folder-renamed")],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -15976,15 +16069,15 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            daemon = start()
+            daemon = start(no_auto_sync=True)
             fixture.require(cli("--recover-mount", mountpoint), "recovering crashed pin move mount")
-            fixture.require(cli("--mount", url, mountpoint), "mounting after pin move crash")
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "mounting after pin move crash")
             mounted = True
             expected = "folder" if stage == "before-commit" else "folder-renamed"
             other = "folder-renamed" if stage == "before-commit" else "folder"
             assert not (mountpoint / other).exists()
             assert read_file(mountpoint / expected / "nested.bin") == contents["folder/nested.bin"]
-            pins = fixture.require(cli("--pins", url), "checking pins after crash").stdout
+            pins = fixture.require(cli("--pins-space", url, space), "checking local pins after crash").stdout
             assert f"\t/{expected}\n" in pins and f"\t/{expected}/nested.bin\n" in pins, pins
             with sqlite3.connect(database) as db:
                 assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -16008,7 +16101,7 @@ def child(root, runtime, container):
                     assert available > 1024 * 1024
                     with open(filler, "xb", buffering=0) as full:
                         os.posix_fallocate(full.fileno(), 0, available - 64 * 1024)
-                        pin_result = cli("--pin", url, "/file.bin")
+                        pin_result = cli("--pin-space", url, space, "/file.bin")
                         assert pin_result.returncode != 0, "repinning unexpectedly succeeded on a full filesystem"
                         assert "local storage capacity exhausted" in pin_result.stderr, pin_result.stderr
                         try:
@@ -16033,12 +16126,12 @@ def child(root, runtime, container):
             server.server_close()
             thread.join(timeout=5)
             server = thread = None
-            fixture.require(cli("--unmount"), "unmounting after disk-full failures")
+            fixture.require(cli("--unmount-space", url, space), "unmounting after disk-full failures")
             mounted = False
             fixture.require(cli("--stop"), "stopping after disk-full failures")
             daemon.wait(timeout=5)
-            daemon = start()
-            fixture.require(cli("--mount", url, mountpoint), "remounting after disk-full failures")
+            daemon = start(no_auto_sync=True)
+            fixture.require(cli("--mount-offline-space", url, space, mountpoint), "remounting after disk-full failures")
             mounted = True
             assert read_file(mountpoint / "file.bin") == contents["file.bin"]
             assert read_file(mountpoint / "disk-full-target") == b"preserved before full filesystem"
@@ -16046,14 +16139,34 @@ def child(root, runtime, container):
             assert not (mountpoint / "disk-full-folder").exists()
             print("PASS: disk-full repin, pinned rename and staged truncate preserve prior data across offline restart", flush=True)
             return
+
+        def import_rows(name, state=None):
+            with sqlite3.connect(database) as db:
+                return db.execute(
+                    "SELECT id,staged_file,state,base_file_id,base_etag FROM operation_journal "
+                    "WHERE instance=? AND space=? AND path=? AND op_type='write' AND (? IS NULL OR state=?) "
+                    "ORDER BY id", (url, space, json.dumps([name]), state, state)).fetchall()
+
+        def retained_root_names():
+            # This local read requires a matching retained activation and a
+            # complete saved root. Do not infer absence from a failed listing.
+            listing = fixture.require(cli("--ls-offline-space", url, space, "/"), "checking retained import parent").stdout
+            return {line.rsplit("\t", 1)[-1] for line in listing.splitlines()}
+
+        import_puts["local-edit"] = []
         source = root / "local-edit"
         local_bytes = b"locally staged without remote writes"
         source.write_bytes(local_bytes)
-        fixture.require(cli("--stage-file", url, "/local-edit", source), "staging local edit")
+        fixture.require(cli("--stage-file-space", url, space, "/local-edit", source), "staging local edit")
         assert "pending" in fixture.require(cli("--journal", url), "listing staged edit").stdout
-        assert "available offline\t/file.bin" in fixture.require(cli("--pins", url), "checking pins").stdout
+        assert "available offline\t/file.bin" in fixture.require(cli("--pins-space", url, space, "--check-remote"), "checking pins").stdout
         assert read_file(mountpoint / "local-edit") == local_bytes
         assert lab.upstream(container, "GET", base + "/local-edit")[0] == 404, "staging wrote to server"
+        [original_import] = import_rows("local-edit", "pending")
+        assert original_import[3:] == (None, None), original_import
+        staged = database.parent / "staging" / original_import[1]
+        assert staged_bytes(database, staged.name) == local_bytes and staged.stat().st_mode & 0o777 == 0o600
+        assert not import_puts["local-edit"], import_puts
 
         server.shutdown()
         server.server_close()
@@ -16062,14 +16175,17 @@ def child(root, runtime, container):
         offline_source = root / "offline-edit"
         offline_bytes = b"saved while disconnected"
         offline_source.write_bytes(offline_bytes)
-        fixture.require(cli("--stage-file", url, "/local-edit", offline_source), "staging a second offline version")
+        assert "local-edit" in retained_root_names()
+        fixture.require(cli("--stage-file-offline-space", url, space, "/local-edit", offline_source), "staging a second offline version")
         assert read_file(mountpoint / "local-edit") == offline_bytes
+        [offline_import] = import_rows("local-edit", "pending")
+        assert offline_import[3:] == original_import[3:], (original_import, offline_import)
         assert "folder" in os.listdir(mountpoint)
         assert read_file(mountpoint / "file.bin") == contents["file.bin"]
         assert read_file(mountpoint / "folder/nested.bin") == contents["folder/nested.bin"]
         assert read_file(mountpoint / "unavailable.bin") == contents["unavailable.bin"]
         check_io_error(mountpoint / "never-read.bin")
-        fixture.require(cli("--unmount"), "unmounting before restart")
+        fixture.require(cli("--unmount-space", url, space), "unmounting before restart")
         mounted = False
         fixture.require(cli("--stop"), "stopping daemon")
         daemon.wait(timeout=5)
@@ -16083,80 +16199,87 @@ def child(root, runtime, container):
         fenced_source = root / "fenced-edit"
         fenced_bytes = b"saved with a fenced account"
         fenced_source.write_bytes(fenced_bytes)
-        fixture.require(cli("--stage-file", url, "/fenced-edit", fenced_source), "staging with fenced credentials")
+        assert "fenced-edit" not in retained_root_names()
+        fixture.require(cli("--stage-file-offline-space", url, space, "/fenced-edit", fenced_source), "staging with fenced credentials")
         account["refresh_in_progress"] = False
         account["expires_at"] = int(time.time()) + 3600
         fixture.require(fixture.run(["secret-tool", "store", "--label=cirrus-opencloud-lab", "application",
                                     "cirrus-drive", "instance", url], input=json.dumps(account)), "restoring lab account")
-        fixture.require(cli("--mount", url, mountpoint), "mounting offline after restart")
+        # The default service still sets the automatic flag even when the fault
+        # fixture disables the scheduler, so only writable offline mounts are
+        # admitted without changing how the daemon is launched.
+        assert {"local-edit", "fenced-edit"} <= retained_root_names()
+        fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "mounting offline after restart")
         mounted = True
         assert read_file(mountpoint / "file.bin") == contents["file.bin"]
         assert read_file(mountpoint / "folder/nested.bin") == contents["folder/nested.bin"]
         assert read_file(mountpoint / "local-edit") == offline_bytes
+        assert read_file(mountpoint / "fenced-edit") == fenced_bytes
         assert read_file(mountpoint / "unavailable.bin") == contents["unavailable.bin"]
         check_io_error(mountpoint / "never-read.bin")
         saved = fixture.require(fixture.run(["secret-tool", "lookup", "application", "cirrus-drive",
                                              "instance", url]), "loading lab account")
         assert not json.loads(saved.stdout).get("refresh_in_progress", False)
         assert "pending" in fixture.require(cli("--journal", url), "listing staged edit after restart").stdout
-        with sqlite3.connect(database) as db:
-            rows = db.execute("SELECT staged_file, state FROM operation_journal ORDER BY id").fetchall()
-        assert len(rows) == 3 and all(row[1] == "pending" for row in rows)
-        staged = database.parent / "staging" / rows[0][0]
-        staged_offline = database.parent / "staging" / rows[1][0]
-        staged_fenced = database.parent / "staging" / rows[2][0]
-        assert staged_bytes(database, staged.name) == local_bytes and staged.stat().st_mode & 0o777 == 0o600
+        assert import_rows("local-edit", "pending") == [offline_import]
+        [fenced_import] = import_rows("fenced-edit", "pending")
+        assert fenced_import[0] != offline_import[0] and fenced_import[1] != offline_import[1]
+        staged_offline = database.parent / "staging" / offline_import[1]
+        staged_fenced = database.parent / "staging" / fenced_import[1]
         assert staged_bytes(database, staged_offline.name) == offline_bytes and staged_offline.stat().st_mode & 0o777 == 0o600
         assert staged_bytes(database, staged_fenced.name) == fenced_bytes and staged_fenced.stat().st_mode & 0o777 == 0o600
-        assert staged.parent.stat().st_mode & 0o777 == 0o700
+        assert staged_offline.parent.stat().st_mode & 0o777 == 0o700
         # Remove independent clean copies so the following assertions exercise pin integrity.
         with sqlite3.connect(database.parent / "cache.db") as db:
             db.execute("DELETE FROM ranges WHERE json_extract(version, '$.path') IN (?, ?)",
                        ('["file.bin"]', '["folder","nested.bin"]'))
-        fixture.require(cli("--unmount"), "clearing in-memory ranges before pin corruption")
+        fixture.require(cli("--unmount-space", url, space), "clearing in-memory ranges before pin corruption")
         mounted = False
-        fixture.require(cli("--mount", url, mountpoint), "remounting without clean cached copies")
+        assert "file.bin" in retained_root_names()
+        fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "remounting without clean cached copies")
         mounted = True
         with sqlite3.connect(database) as db:
             removed = db.execute("DELETE FROM chunks WHERE path=? AND offset=0", ('["file.bin"]',)).rowcount
         assert removed == 1
-        listing = fixture.require(cli("--pins", url), "checking incomplete pin").stdout
-        assert "incomplete\t/file.bin" in listing, listing
+        listing = fixture.require(cli("--pins-space", url, space), "checking incomplete local pin").stdout
+        assert "incomplete (local state; remote not checked)\t/file.bin" in listing.splitlines(), listing
         check_io_error(mountpoint / "file.bin")
-        fixture.require(cli("--unpin", url, "/file.bin"), "unpinning file")
+        fixture.require(cli("--unpin-space", url, space, "/file.bin"), "unpinning file")
         check_io_error(mountpoint / "file.bin")
-        fixture.require(cli("--unpin", url, "/folder"), "unpinning folder")
+        fixture.require(cli("--unpin-space", url, space, "/folder"), "unpinning folder")
         check_io_error(mountpoint / "folder/nested.bin")
+        fixture.require(cli("--unmount-space", url, space), "closing the offline import mount before reconnect")
+        mounted = False
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
-        result = cli("--sync", url)
-        assert result.returncode != 0, "second staged version should be reported as a conflict"
+        fixture.require(cli("--mount-space", url, space, mountpoint), "mounting online after import reconnect")
+        mounted = True
+        fixture.require(cli("--sync", url), "syncing latest offline version and independent fenced edit")
+        assert import_puts["local-edit"] == [(unquote(base) + "/local-edit", None, "*", offline_bytes)], import_puts
+        assert len(import_rows("local-edit", "synced")) == len(import_rows("fenced-edit", "synced")) == 1
         journal = fixture.require(cli("--journal", url), "checking sync results").stdout
-        assert "synced" in journal and "conflict" in journal, journal
-        listing = fixture.require(cli("--ls", url), "listing conflict copy").stdout
-        copies = [line.split("\t")[-1] for line in listing.splitlines() if "local-edit (conflict " in line]
-        assert len(copies) == 1, listing
-        status, _, conflict_copy = lab.upstream(container, "GET", base + "/" + quote(copies[0], safe=""))
-        assert status == 200 and conflict_copy == offline_bytes
+        assert "synced" in journal, journal
+        listing = fixture.require(cli("--ls-space", url, space), "checking for repeated-save conflict copies").stdout
+        assert "local-edit (conflict " not in listing, listing
         status, _, remote = lab.upstream(container, "GET", base + "/local-edit")
-        assert status == 200 and remote == local_bytes
+        assert status == 200 and remote == offline_bytes
         assert read_file(mountpoint / "local-edit") == offline_bytes
         status, _, remote = lab.upstream(container, "GET", base + "/fenced-edit")
         assert status == 200 and remote == fenced_bytes
         overwrite = root / "overwrite-edit"
         overwrite.write_bytes(b"updated local version")
-        fixture.require(cli("--stage-file", url, "/overwrite.bin", overwrite), "staging overwrite")
-        assert cli("--sync", url).returncode != 0, "existing conflicts must remain visible"
+        fixture.require(cli("--stage-file-space", url, space, "/overwrite.bin", overwrite), "staging overwrite")
+        fixture.require(cli("--sync", url), "syncing overwrite without a repeated-save conflict")
         status, _, remote = lab.upstream(container, "GET", base + "/overwrite.bin")
         assert status == 200 and remote == b"updated local version"
         local_conflict = root / "conflicting-edit"
         local_conflict.write_bytes(b"local edit preserved")
-        fixture.require(cli("--stage-file", url, "/file.bin", local_conflict), "staging existing remote file")
+        fixture.require(cli("--stage-file-space", url, space, "/file.bin", local_conflict), "staging existing remote file")
         assert lab.upstream(container, "PUT", base + "/file.bin", b"newer remote edit")[0] == 204
         assert cli("--sync", url).returncode != 0, "observed remote conflict was not reported"
-        listing = fixture.require(cli("--ls", url), "listing remote-edit conflict").stdout
+        listing = fixture.require(cli("--ls-space", url, space), "listing remote-edit conflict").stdout
         copies = [line.split("\t")[-1] for line in listing.splitlines() if "file (conflict " in line and line.endswith(".bin")]
         assert len(copies) == 1, listing
         status, _, conflict_copy = lab.upstream(container, "GET", base + "/" + quote(copies[0], safe=""))
@@ -16166,47 +16289,61 @@ def child(root, runtime, container):
         assert read_file(mountpoint / "file.bin") == b"local edit preserved"
         with sqlite3.connect(database) as db:
             conflicts = [row[0] for row in db.execute("SELECT staged_file FROM operation_journal WHERE state='conflict'")]
-        assert len(conflicts) == 2
+        assert len(conflicts) == 1
         for staged_name in conflicts:
             fixture.require(cli("--acknowledge", url, staged_name), "acknowledging inspected conflict")
             assert (database.parent / "staging" / staged_name).is_file()
         assert "resolved" in fixture.require(cli("--journal", url), "listing acknowledged conflicts").stdout
         fixture.require(cli("--sync", url), "checking resolved journal")
+        import_puts["uncertain-edit"] = []
         uncertain_source = root / "uncertain-edit"
-        uncertain_source.write_bytes(b"remote outcome may be uncertain")
-        fixture.require(cli("--stage-file", url, "/uncertain-edit", uncertain_source), "staging uncertain edit")
+        uncertain_bytes = b"remote outcome may be uncertain"
+        uncertain_source.write_bytes(uncertain_bytes)
+        fixture.require(cli("--stage-file-space", url, space, "/uncertain-edit", uncertain_source), "staging uncertain edit")
         lost_response[0] = True
         assert cli("--sync", url).returncode != 0, "lost upload response was reported as success"
         assert "uncertain" in fixture.require(cli("--journal", url), "checking uncertain upload").stdout
-        assert lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"remote outcome may be uncertain"
+        [uncertain] = import_rows("uncertain-edit", "uncertain")
+        assert staged_bytes(database, uncertain[1]) == uncertain_bytes
+        assert lab.upstream(container, "GET", base + "/uncertain-edit")[0::2] == (200, uncertain_bytes)
+        first_put = [(unquote(base) + "/uncertain-edit", None, "*", uncertain_bytes)]
+        assert import_puts["uncertain-edit"] == first_put, import_puts
         assert cli("--sync", url).returncode != 0 and uncertain_puts[0] == 1, "uncertain write was retried"
+        assert import_puts["uncertain-edit"] == first_put, import_puts
         successor_source = root / "uncertain-successor"
-        successor_source.write_bytes(b"later independently staged edit")
-        fixture.require(cli("--stage-file", url, "/uncertain-edit", successor_source), "staging after uncertain upload")
+        successor_bytes = b"later independently staged edit"
+        successor_source.write_bytes(successor_bytes)
+        fixture.require(cli("--stage-file-space", url, space, "/uncertain-edit", successor_source), "staging after uncertain upload")
+        assert read_file(mountpoint / "uncertain-edit") == successor_bytes
         assert cli("--sync", url).returncode != 0 and uncertain_puts[0] == 1, "later write crossed uncertain predecessor"
-        assert lab.upstream(container, "GET", base + "/uncertain-edit")[2] == b"remote outcome may be uncertain"
-        fixture.require(cli("--unmount"), "unmounting later uncertain write")
+        assert import_puts["uncertain-edit"] == first_put, import_puts
+        assert lab.upstream(container, "GET", base + "/uncertain-edit")[0::2] == (200, uncertain_bytes)
+        fixture.require(cli("--unmount-space", url, space), "unmounting later uncertain write")
         mounted = False
         fixture.require(cli("--stop"), "stopping with later uncertain write")
         daemon.wait(timeout=5)
         daemon = start()
-        fixture.require(cli("--mount", url, mountpoint), "remounting later uncertain write")
+        fixture.require(cli("--mount-space", url, space, mountpoint), "remounting later uncertain write")
         mounted = True
         assert cli("--sync", url).returncode != 0 and uncertain_puts[0] == 1, "later write crossed uncertain predecessor after restart"
-        assert read_file(mountpoint / "uncertain-edit") == b"later independently staged edit"
-        with sqlite3.connect(database) as db:
-            uncertain = db.execute("SELECT staged_file FROM operation_journal WHERE state='uncertain'").fetchone()
-        assert uncertain is not None
-        fixture.require(cli("--acknowledge", url, uncertain[0]), "acknowledging inspected uncertain result")
-        assert (database.parent / "staging" / uncertain[0]).is_file()
-        with sqlite3.connect(database) as db:
-            successor = db.execute("SELECT staged_file,state FROM operation_journal WHERE path=? AND id>(SELECT id FROM operation_journal WHERE staged_file=?) ORDER BY id DESC LIMIT 1", ('["uncertain-edit"]', uncertain[0])).fetchone()
-        assert successor is not None and successor[1] == "conflict", successor
-        assert staged_bytes(database, successor[0]) == b"later independently staged edit"
-        fixture.require(cli("--acknowledge", url, successor[0]), "acknowledging retained later edit")
+        assert import_puts["uncertain-edit"] == first_put, import_puts
+        assert read_file(mountpoint / "uncertain-edit") == successor_bytes
+        predecessor, successor = import_rows("uncertain-edit")
+        assert predecessor == uncertain and successor[2] == "pending", (predecessor, successor)
+        assert staged_bytes(database, successor[1]) == successor_bytes
+        fixture.require(cli("--acknowledge", url, uncertain[1]), "acknowledging inspected uncertain result")
+        assert staged_bytes(database, uncertain[1]) == uncertain_bytes
+        predecessor, retained = import_rows("uncertain-edit")
+        assert predecessor[:2] == uncertain[:2] and predecessor[2] == "resolved", predecessor
+        assert retained[:2] == successor[:2] and retained[2] == "conflict", retained
+        assert staged_bytes(database, retained[1]) == successor_bytes
+        assert cli("--sync", url).returncode != 0, "retained successor conflict was not reported"
+        assert import_puts["uncertain-edit"] == first_put, import_puts
+        assert lab.upstream(container, "GET", base + "/uncertain-edit")[0::2] == (200, uncertain_bytes)
+        fixture.require(cli("--acknowledge", url, retained[1]), "acknowledging retained later edit")
         assert lab.upstream(container, "MKCOL", base + "/tree-uncertain")[0] == 201
         assert lab.upstream(container, "PUT", base + "/tree-uncertain/file", b"remote tree")[0] == 201
-        fixture.require(cli("--pin", url, "/tree-uncertain"), "pinning tree before uncertain MOVE")
+        fixture.require(cli("--pin-space", url, space, "/tree-uncertain"), "pinning tree before uncertain MOVE")
         os.rename(mountpoint / "tree-uncertain", mountpoint / "tree-uncertain-target")
         lost_tree_move[0] = True
         assert cli("--sync", url).returncode != 0, "lost tree MOVE response reported as success"
@@ -16216,12 +16353,12 @@ def child(root, runtime, container):
         assert lab.upstream(container, "GET", base + "/tree-uncertain-target/file")[2] == b"remote tree"
         assert read_file(mountpoint / "tree-uncertain-target/file") == b"remote tree"
         assert cli("--sync", url).returncode != 0 and tree_moves[0] == 1, "uncertain tree MOVE retried"
-        fixture.require(cli("--unmount"), "unmounting uncertain tree MOVE")
+        fixture.require(cli("--unmount-space", url, space), "unmounting uncertain tree MOVE")
         mounted = False
         fixture.require(cli("--stop"), "stopping with uncertain tree MOVE")
         daemon.wait(timeout=5)
         daemon = start()
-        fixture.require(cli("--mount", url, mountpoint), "remounting uncertain tree MOVE")
+        fixture.require(cli("--mount-space", url, space, mountpoint), "remounting uncertain tree MOVE")
         mounted = True
         assert cli("--sync", url).returncode != 0 and tree_moves[0] == 1, "uncertain tree MOVE retried after restart"
         assert read_file(mountpoint / "tree-uncertain-target/file") == b"remote tree"
@@ -16313,7 +16450,7 @@ def child(root, runtime, container):
         assert lab.upstream(container, "PUT", base + "/fenced-edit", b"newer remote content")[0] == 204
         assert lab.upstream(container, "MKCOL", base + "/delete-parent")[0] == 201
         assert lab.upstream(container, "PUT", base + "/delete-parent/child", b"remove before parent")[0] == 201
-        fixture.require(cli("--ls", url), "refreshing the remote snapshot")
+        fixture.require(cli("--ls-space", url, space), "refreshing the remote snapshot")
         assert os.listdir(mountpoint / "delete-dir") == []
         assert os.listdir(mountpoint / "delete-parent") == ["child"]
         assert os.listdir(mountpoint / "remote-empty-dir") == []
@@ -16407,12 +16544,13 @@ def child(root, runtime, container):
         assert read_file(mountpoint / "fuse-created") == b"mounted edit"
         assert read_file(mountpoint / "fuse-offline") == b"offline mounted edit"
         assert read_file(mountpoint / "offline-target.bin") == b"offline atomic save"
-        fixture.require(cli("--unmount"), "unmounting writable lab before restart")
+        fixture.require(cli("--unmount-space", url, space), "unmounting writable lab before restart")
         mounted = False
         fixture.require(cli("--stop"), "stopping writable lab")
         daemon.wait(timeout=5)
         daemon = start()
-        fixture.require(cli("--mount", url, mountpoint), "remounting staged edits offline")
+        assert {"moved-empty-dir", "fuse-offline"} <= retained_root_names()
+        fixture.require(cli("--mount-offline-writable-space", url, space, mountpoint), "remounting staged edits offline")
         mounted = True
         assert not (mountpoint / "remote-empty-dir").exists()
         assert os.listdir(mountpoint / "moved-empty-dir") == []
@@ -16432,10 +16570,14 @@ def child(root, runtime, container):
         assert read_file(mountpoint / "folder" / "moved.bin") == b"renamed data after"
         assert not (mountpoint / "delete-file.bin").exists()
         assert not (mountpoint / "delete-dir").exists()
+        fixture.require(cli("--unmount-space", url, space), "closing the offline staged edits mount before reconnect")
+        mounted = False
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
+        fixture.require(cli("--mount-space", url, space, mountpoint), "mounting online after staged edits reconnect")
+        mounted = True
         assert cli("--sync", url).returncode != 0, "mounted conflict was not reported"
         assert lab.upstream(container, "GET", base + "/fuse-created")[2] == b"mounted edit"
         assert lab.upstream(container, "GET", base + "/fuse-offline")[2] == b"offline mounted edit"
@@ -16593,7 +16735,7 @@ def child(root, runtime, container):
         try:
             file = race_file
             file.write(b"original mounted edit")
-            fixture.require(cli("--stage-file", url, "/fuse-race", source), "staging concurrent edit")
+            fixture.require(cli("--stage-file-space", url, space, "/fuse-race", source), "staging concurrent edit")
             try:
                 file.write(b" must not be hidden")
             except OSError as error:
@@ -16629,7 +16771,7 @@ def child(root, runtime, container):
         with sqlite3.connect(database) as db:
             old_copy = db.execute("SELECT staged_file FROM operation_journal WHERE path=? AND error_msg='unlinked open file; staged copies retained'", ('["open-unlink"]',)).fetchone()
         assert old_copy is not None and staged_bytes(database, old_copy[0]) == b"old version "
-        fixture.require(cli("--unmount"), "unmounting lab")
+        fixture.require(cli("--unmount-space", url, space), "unmounting lab")
         mounted = False
         fixture.require(cli("--stop"), "stopping daemon")
         daemon.wait(timeout=5)
@@ -16685,11 +16827,16 @@ def child(root, runtime, container):
                 except (OSError,subprocess.TimeoutExpired) as error:
                     cleanup_errors.append(f"owner helper {helper.pid} close failed: {type(error).__name__}")
                     fixture.stop_process(helper)
-        cleanup_mounts = ([(True,process,client,args,path) for process,client,args,path in owner_cleanup_mounts]
-            if owner_cleanup_mounts else [(mounted,daemon,cli,('--unmount',),mountpoint),
-                (second_mounted,second_daemon,locals().get('second_cli'),('--unmount',),reservation_mount)])
-        for active, process, client, args, path in cleanup_mounts:
-            if active and process and process.poll() is None:
+        cleanup_mounts = list(owner_cleanup_mounts)
+        if not owner_cleanup_mounts and (mounted or second_mounted):
+            for process in (daemon, second_daemon):
+                if process is not None and process.poll() is None:
+                    try:
+                        cleanup_mounts.extend(fallback_cleanup_mounts(process))
+                    except (OSError, RuntimeError, AssertionError, ValueError, KeyError, TypeError) as error:
+                        cleanup_errors.append(f"owned fixture mount inventory failed for pid={process.pid}: {error}")
+        for process, client, args, path in cleanup_mounts:
+            if process and process.poll() is None:
                 try:
                     if owner_cleanup_mounts:print(f'DIAGNOSTIC owner cleanup request: pid={process.pid} mount={path} command={args[0]}',flush=True)
                     result = client(*args)

@@ -1000,16 +1000,19 @@
     }
   ],
   "inputs": {
-    "Cargo.toml": "ecf804e502242746a7ca920fd18c12926ae804a00ced394a343d555c5141266b",
-    "crates/cirrus-account/Cargo.toml": "28faebfc680a14501fa62240041745d488f9c217c4ce097c6bd1abe3e177554f",
-    "crates/cirrus-daemon/Cargo.toml": "402b3922e34ebe7bd7a9ac9c11bebf3784143cc5926f39f89e287bc46de9624b",
+    "Cargo.toml": "bb6d0f85857036102fe547d4792309c0f8fcb86a876a02885204b7cafaf018b0",
+    "crates/cirrus-account/Cargo.toml": "599c42327cd9ba9afa93cb9dd4b17f41a0d720c60b94b627b734b343008dae46",
+    "crates/cirrus-api/Cargo.toml": "833398527cbff874c2c0dadfe39358d0c6cc240830b1540893ca8433d4f80570",
+    "crates/cirrus-cli/Cargo.toml": "3c0b1fbf8a0e48da6467c73ce0eee236ef5cd6ef211db42c8ad81d8414a9460e",
+    "crates/cirrus-client/Cargo.toml": "72fe71955cc66dd6194ae784296287b74d7c15bf90df483294ad7748681c492e",
+    "crates/cirrus-daemon/Cargo.toml": "eb6a3844c9a7b8fb8b6acaf250281d0e23b47e242edd3f392d27a94631521532",
     "crates/cirrus-discovery/Cargo.toml": "c0f4bff87a8db791dd0a542cf5c069b02a02f72cf8cfb10dcbb9118a020f1ace",
     "crates/cirrus-fuse/Cargo.toml": "07f970330e0e2015b47ad306217f8f6f7bee41480862bda055cae29c7e300266",
     "crates/cirrus-runtime/Cargo.toml": "2af5e5cee104e99b26312ea6828b5cce05111569126cd5f843430650c1116bfb",
     "crates/cirrus-ui/Cargo.toml": "465713821870b9ef397c84bd2bd6f32670ff1253b8050a1c3a74ab22ae39014b",
     "rust-toolchain.toml": "85db324345b7937c49ea2ac8b962d741f710719f4f751cab809985cbe6afbe3c"
   },
-  "lock_sha256": "b4889ecbfd462f276fbc3aeb01ca712db146b111d859ce27b0c2699a54765ec9",
+  "lock_sha256": "33ed6b6e35d7dda3a5cd6a62b8b9b31ea8317895b3823b3948de3aaa84d84d5f",
   "metadata_command": [
     "cargo",
     "metadata",
@@ -16300,6 +16303,7 @@
   ],
   "qualification": "source-notices-only; historical native evidence is not current artifact qualification",
   "roots": [
+    "cirrus-cli",
     "cirrus-daemon",
     "cirrus-ui"
   ],

@@ -5,18 +5,14 @@ enum ApplicationOperation: Sendable {
     case connect(String)
     case spaces(String)
     case spacePage(Int)
-    case bind(instance: String, space: String)
     case prepareFinderDomain(instance: String, space: String)
     case restoreFinderDomains
-    case directory(path: [String], parentID: String)
-    case directoryPage(UInt64)
 }
 enum ApplicationReply: Sendable {
     case connected
     case finderDomain(FinderDomainDescriptor)
     case restoredDomains(RestoredFinderDomains)
     case spaces([ApplicationSpace], Int)
-    case directory([RetainedEntry], UInt64)
 }
 enum ApplicationError: Error { case protectedStorageUnavailable }
 
@@ -82,7 +78,7 @@ private let applicationBrowser: CirrusApplicationBrowser = { context, text in
     return delivery.wait()
 }
 
-// A single OS thread owns the only Core, its snapshots, binding and attempt.
+// A single OS thread owns the Core, Space snapshot, mount binding and sign-in attempt.
 // The mailbox never transports RetainedHandle. Only cancellation borrows its
 // pointer under the same mutex used to remove it before owner-thread teardown.
 final class ApplicationWorker: @unchecked Sendable {
@@ -201,14 +197,12 @@ final class ApplicationWorker: @unchecked Sendable {
     private func run() {
         var core: RetainedCore?
         var spaces: ApplicationSpaces?
-        var binding: RetainedBinding?
-        var listing: RetainedListing?
         var dispatcher: RetainedDispatcher?
         var nextTurn = Date(timeIntervalSinceNow: 2)
         defer {
             condition.lock(); background = nil; condition.unlock()
             dispatcher = nil
-            listing = nil; binding = nil; spaces = nil; core = nil
+            spaces = nil; core = nil
         }
         while true {
             condition.lock()
@@ -237,7 +231,7 @@ final class ApplicationWorker: @unchecked Sendable {
                         dispatcher = nil
                         if let callback = syncObservation { DispatchQueue.main.async { callback(nil) } }
                         if case RetainedError.internalFailure = error {
-                            listing = nil; binding = nil; spaces = nil; core = nil
+                            spaces = nil; core = nil
                         }
                     }
                 }
@@ -263,8 +257,7 @@ final class ApplicationWorker: @unchecked Sendable {
                     case .restoreFinderDomains:
                         return .restoredDomains(try core.restoreFinderDomains())
                     case .prepareFinderDomain(let instance, let space):
-                        // Fresh authenticated membership, independent of the
-                        // retained browsing binding/snapshot on this owner.
+                        // Mount preparation requires fresh authenticated membership.
                         let selected = try core.bindOnline(instance: instance, space: space)
                         return .finderDomain(try selected.prepareFinderDomain())
                     case .connect(let instance):
@@ -287,12 +280,12 @@ final class ApplicationWorker: @unchecked Sendable {
                             withExtendedLifetime(signIn) {}
                         }
                         // Invalidate prior snapshots before changing credentials.
-                        spaces = nil; listing = nil; binding = nil
+                        spaces = nil
                         try core.connect(instance: instance, attempt: signIn, browser: applicationBrowser,
                                          context: Unmanaged.passUnretained(self).toOpaque())
                         return .connected
                     case .spaces(let instance):
-                        spaces = nil; listing = nil; binding = nil
+                        spaces = nil
                         spaces = try core.spaces(instance: instance)
                         guard let spaces else { throw RetainedError.unavailable }
                         let page = try spaces.page(after: 0)
@@ -301,32 +294,13 @@ final class ApplicationWorker: @unchecked Sendable {
                         guard let spaces else { throw RetainedError.unavailable }
                         let page = try spaces.page(after: offset)
                         return .spaces(page.spaces, page.next)
-                    case .bind(let instance, let space):
-                        binding = nil; listing = nil
-                        binding = try core.bindOnline(instance: instance, space: space)
-                        // Inspect the engine's canonical immutable identity, never
-                        // infer a principal or globally select a display-name row.
-                        _ = try binding?.currentIdentity()
-                        listing = try binding?.observe(path: [], parentID: "")
-                    case .directory(let path, let parentID):
-                        listing = nil
-                        guard let binding else { throw RetainedError.unavailable }
-                        listing = try binding.observe(path: path, parentID: parentID)
-                    case .directoryPage:
-                        break
                     }
-                    guard let listing else { throw RetainedError.unavailable }
-                    let request = try RetainedRequest()
-                    let after: UInt64
-                    if case .directoryPage(let cookie) = job.operation { after = cookie } else { after = 0 }
-                    let page = try listing.page(after: after, request: request)
-                    return .directory(page.entries, page.next)
                 }
             }
             if case .failure(let error) = result,
                let retained = error as? RetainedError, case .internalFailure = retained {
                 // ABI INTERNAL requires discarding the entire session, close only.
-                dispatcher = nil; listing = nil; binding = nil; spaces = nil; core = nil
+                dispatcher = nil; spaces = nil; core = nil
             }
             condition.lock()
             if case .connect = job.operation { connect = .absent }

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cirrus_account::{
     AccountError, Accounts, DirectorySnapshot, DirtyMutation, FileVersion, MountBinding,
+    MountStartup,
 };
 use cirrus_runtime::RuntimeDir;
 use fuser::{
@@ -200,23 +201,7 @@ impl std::fmt::Debug for Mounted {
 }
 
 impl Mounted {
-    /// Mounts a previously selected Space at an existing empty private directory.
-    ///
-    /// # Errors
-    /// Returns an error if the account, mountpoint or FUSE session cannot be validated.
-    pub fn start(
-        accounts: Arc<Accounts>,
-        instance: String,
-        path: &Path,
-        runtime: RuntimeDir,
-    ) -> io::Result<Self> {
-        let space = accounts
-            .check_mount_access(&instance)
-            .map_err(io::Error::other)?;
-        Self::start_bound(accounts, instance, space, path, runtime)
-    }
-
-    /// Mounts an explicitly verified Space without changing account selection.
+    /// Mounts an explicit Space, allowing retained startup only at a custom path.
     ///
     /// # Errors
     /// Returns an error if the Space, mountpoint or FUSE session cannot be validated.
@@ -227,9 +212,15 @@ impl Mounted {
         path: Option<&Path>,
         runtime: RuntimeDir,
     ) -> io::Result<Self> {
-        let space = accounts
-            .bind_space(&instance, id)
-            .map_err(io::Error::other)?;
+        let (space, startup) = if path.is_some() {
+            accounts.bind_mount_space(&instance, id)
+        } else {
+            accounts
+                .bind_space(&instance, id)
+                .map(|binding| (binding, MountStartup::Normal))
+        }
+        .map_err(io::Error::other)?;
+        let instance = space.instance().to_owned();
         let created_default = path.is_none();
         let default_path;
         let path = if let Some(path) = path {
@@ -243,7 +234,7 @@ impl Mounted {
             default_path = create_default_mountpoint(name)?;
             &default_path
         };
-        Self::start_bound(accounts, instance, space, path, runtime).map_err(|error| {
+        Self::start_bound(accounts, instance, space, path, runtime, startup).map_err(|error| {
             if created_default {
                 io::Error::new(
                     error.kind(),
@@ -272,7 +263,14 @@ impl Mounted {
         let space = accounts
             .bind_offline_space(instance, id)
             .map_err(io::Error::other)?;
-        Self::start_bound(accounts, space.instance().to_owned(), space, path, runtime)
+        Self::start_bound(
+            accounts,
+            space.instance().to_owned(),
+            space,
+            path,
+            runtime,
+            MountStartup::Normal,
+        )
     }
 
     /// Mounts retained files for explicit local editing and file creation.
@@ -289,7 +287,14 @@ impl Mounted {
         let space = accounts
             .bind_writable_offline_space(instance, id)
             .map_err(io::Error::other)?;
-        Self::start_bound(accounts, space.instance().to_owned(), space, path, runtime)
+        Self::start_bound(
+            accounts,
+            space.instance().to_owned(),
+            space,
+            path,
+            runtime,
+            MountStartup::Normal,
+        )
     }
 
     fn start_bound(
@@ -298,11 +303,14 @@ impl Mounted {
         space: MountBinding,
         path: &Path,
         runtime: RuntimeDir,
+        startup: MountStartup,
     ) -> io::Result<Self> {
         recovery::ensure_available(&runtime, path)?;
-        accounts
-            .mount_directory(&instance, &space, &[], "")
-            .map_err(io::Error::other)?;
+        if matches!(startup, MountStartup::Normal) {
+            accounts
+                .mount_directory(&instance, &space, &[], "")
+                .map_err(io::Error::other)?;
+        }
         let dir = validate_mountpoint(path)?;
         let identity = fs::fstat(&dir).map_err(io::Error::from)?;
         let rechecked = validate_mountpoint(path)?;
@@ -382,10 +390,10 @@ impl Mounted {
             runtime,
             refresh,
         };
-        if let Err(error) = if offline {
-            Ok(())
-        } else {
+        if let Err(error) = if !offline && matches!(startup, MountStartup::Normal) {
             activation_accounts.activate_sync(&activation)
+        } else {
+            Ok(())
         } {
             // Activation can refuse after FUSE starts. Do not return an
             // unregistered live mount or leave its prepared owner record on
@@ -517,14 +525,6 @@ fn fault_stop(stage: &str) -> io::Result<()> {
 /// Returns an error if the record, mount identity or unmount cannot be verified.
 pub fn recover(runtime: &RuntimeDir, path: &Path) -> io::Result<()> {
     recovery::recover(runtime, path)
-}
-
-/// Checks whether a prior mount owner record exists in the runtime directory.
-///
-/// # Errors
-/// Returns an error if the owner record is unsafe or invalid.
-pub fn recovery_pending(runtime: &RuntimeDir) -> io::Result<bool> {
-    recovery::pending(runtime)
 }
 
 /// Lists paths and FUSE sources from verified mount owner records.

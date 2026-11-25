@@ -16,6 +16,77 @@ do {
 }
 
 #if CIRRUS_ACCEPTANCE
+private func encodedPath(_ components: [String]) throws -> String {
+    guard components.count <= 128,
+          components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") }),
+          let text = String(data: try JSONEncoder().encode(components), encoding: .utf8),
+          text.utf8.count <= 16384 else { throw RetainedError.invalidABI }
+    return text
+}
+
+extension RetainedCore {
+    fileprivate func bind(instance: String, space: String) throws -> FixtureBinding {
+        onOwnerThread()
+        var result: UnsafeMutableRawPointer?
+        try withRetainedText(instance) { instance in
+            try withRetainedText(space) { try checked(cirrus_retained_fixture_bind(raw, instance, $0, &result)) }
+        }
+        guard let result else { throw RetainedError.internalFailure }
+        return FixtureBinding(taking: result)
+    }
+}
+
+private struct FixtureEntry: Decodable {
+    let cookie: UInt64
+    let name: String
+    let id: String
+    let etag: String?
+    let size: UInt64?
+    let directory: Bool
+}
+
+private final class FixtureBinding: RetainedHandle {
+    func enumerate(_ path: [String], request: RetainedRequest) throws -> FixtureListing {
+        onOwnerThread()
+        var result: UnsafeMutableRawPointer?
+        try withRetainedText(try encodedPath(path)) {
+            try checked(cirrus_retained_fixture_list(raw, $0, request.raw, &result))
+        }
+        guard let result else { throw RetainedError.internalFailure }
+        return FixtureListing(taking: result)
+    }
+    func open(_ path: [String], entry: FixtureEntry, request: RetainedRequest) throws -> RetainedVersion {
+        onOwnerThread()
+        guard !entry.directory, let size = entry.size, let etag = entry.etag else {
+            throw RetainedError.unavailable
+        }
+        var result: UnsafeMutableRawPointer?
+        try withRetainedText(try encodedPath(path)) { path in
+            try withRetainedText(entry.id) { id in
+                try withRetainedText(etag) {
+                    try checked(cirrus_retained_fixture_version(raw, path, id, $0, size, request.raw, &result))
+                }
+            }
+        }
+        guard let result else { throw RetainedError.internalFailure }
+        return RetainedVersion(taking: result)
+    }
+}
+
+private final class FixtureListing: RetainedHandle {
+    func page(after: UInt64, request: RetainedRequest) throws -> (entries: [FixtureEntry], next: UInt64) {
+        onOwnerThread()
+        var bytes = [UInt8](repeating: 0, count: Int(CIRRUS_RETAINED_PAGE_BYTES))
+        var written = 0
+        var next = after
+        try bytes.withUnsafeMutableBufferPointer {
+            try checked(cirrus_retained_fixture_page(raw, after, request.raw, $0.baseAddress, $0.count, &written, &next))
+        }
+        guard written >= 0, written <= bytes.count else { throw RetainedError.internalFailure }
+        return (try JSONDecoder().decode([FixtureEntry].self, from: Data(bytes.prefix(written))), next)
+    }
+}
+
 guard CommandLine.arguments.count == 2 else { fatalError("explicit new private APFS fixture required") }
 let fixture = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 let container = fixture.appendingPathComponent("container", isDirectory: true)
@@ -42,7 +113,7 @@ func scenario() throws {
     var observation = [UInt8](repeating: 0, count: Int(CIRRUS_RETAINED_PAGE_BYTES))
     var observedCount = 0
     try observation.withUnsafeMutableBufferPointer {
-        try checked(cirrus_retained_operation(version.raw, request.raw, $0.baseAddress, $0.count, &observedCount))
+        try checked(cirrus_retained_fixture_operation(version.raw, request.raw, $0.baseAddress, $0.count, &observedCount))
     }
     let observed = try JSONSerialization.jsonObject(with: Data(observation.prefix(observedCount))) as? [String: Any]
     let exactResult = observed?["result"] as? [String: Any]
@@ -74,7 +145,7 @@ func scenario() throws {
         fatalError("existing destination was replaced")
     } catch RetainedError.unavailable {}
     require(try FileManager.default.contentsOfDirectory(atPath: output.path) == ["exact.bin"], "failure cleanup touched destination/leaked candidate")
-    print("Swift -> production C ABI -> real account/SQLite/APFS: exact \(offset) bytes; cancellation cleanup and no-replace PASS")
+    print("Swift -> fixture C adapter and shared materialize/verify -> real account/SQLite/APFS: exact \(offset) bytes; cancellation cleanup and no-replace PASS")
 }
 try scenario()
 #endif

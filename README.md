@@ -45,19 +45,45 @@ systemctl --user start cirrus-drive.service
 
 The installer uses the debug binaries in `target/debug`, installs user-local binaries, a systemd user service and a desktop launcher, and refuses to replace existing installation files. It does not start or enable the service. To use release binaries instead, build with `cargo build --locked --workspace --release` and run `CIRRUS_BIN_DIR="$PWD/target/release" ./packaging/install.sh`. An experimental Arch package recipe is described in [packaging/arch/README.md](packaging/arch/README.md). Both recipes include the retained [license and notice bundle](THIRD_PARTY_NOTICES.md); release-specific dependency review and actual package qualification remain incomplete and are required before distribution.
 
-Alternatively, run `target/debug/cirrus-daemon` in a terminal. The daemon must remain running while the mount is in use. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
+Alternatively, run `target/debug/cirrus-drive-service` in a terminal. The service must remain running while the mount is in use. `cirrus-daemon` is the command client; it never starts the service. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
+
+Use matching versions of all three binaries. Before upgrading, unmount and stop the old service with its existing client, then start the new service. The new local protocol rejects clients and services that use the old protocol.
 
 ## Connect and mount
 
 ```sh
 cirrus-daemon --connect https://cloud.example
 cirrus-daemon --spaces https://cloud.example
-cirrus-daemon --select-space https://cloud.example SPACE_ID
 cirrus-daemon --mount-space https://cloud.example SPACE_ID /absolute/path/to/empty-directory
 cirrus-daemon --mounts
 ```
 
-Replace the URL and Space ID with those of your instance. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
+Replace the URL and use the ID from `--spaces`. The mountpoint must be an existing empty, user-owned directory with mode `0700`. Omit the mountpoint to create a default directory under your home; this always requires a fresh authenticated Space listing with a unique, safe name. For a private CA, append `--ca-cert /path/to/ca.pem` to `--connect`. Closing the window does not stop the daemon.
+
+Space operations take an explicit ID and no longer save a selected Space. This build cannot read older disposable sign-ins saved with Space-selection fields.
+
+With an explicit mountpoint, `--mount-space` can resume an ordinary mount if the very first connection to the server for the Space listing is refused or the host or network is unreachable. It requires readable, complete saved credentials with no interrupted refresh, a prior activation for that exact Space, and a retained root directory that matches the saved account identity. It does not fall back on ambiguous timeouts, TLS or HTTP failures, incomplete listings, or a listing that omits the Space. The same mount can use the server again when connectivity returns and access checks succeed.
+
+## List and import files
+
+List the Space root and stage a local file using the signed-in account:
+
+```sh
+cirrus-daemon --ls-space https://cloud.example SPACE_ID
+cirrus-daemon --stage-file-space https://cloud.example SPACE_ID /draft.txt /absolute/path/to/local-draft.txt
+```
+
+Omitting the listing path lists the root. The import takes the destination path inside the Space first, then the absolute path to a regular local source file. It stages the whole file; success does not confirm an upload.
+
+To stage using only retained state, use `--stage-file-offline-space` instead:
+
+```sh
+cirrus-daemon --stage-file-offline-space https://cloud.example SPACE_ID /draft.txt /absolute/path/to/local-draft.txt
+```
+
+This needs a matching retained account and previously activated Space, plus saved directory evidence for the destination. It does not use credentials, contact the server or activate sync. It does not turn off background sync for a Space that was already activated.
+
+`cirrus-daemon --pins-space https://cloud.example SPACE_ID` reports local pin status, not server freshness. Append `--check-remote` to request an authenticated comparison; if the service cannot complete it, check stderr for the reason. An `available offline` result can still be based on local state alone.
 
 ## Sync, status and recovery
 
@@ -69,13 +95,17 @@ cirrus-daemon --journal https://cloud.example
 cirrus-daemon --unmount-space https://cloud.example SPACE_ID
 ```
 
-A successful mount enables automatic write-back for that Space. Explicit sync is also available. Check sync status and the journal for pending, conflict or uncertain operations. Do not assume a failed or uncertain operation was applied or safely replayed. If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
+A successful online mount records that Space as activated for automatic write-back. Starting `cirrus-drive-service --no-auto-sync` disables the worker, not explicit sync. `--sync-space` targets one Space; `--sync HTTPS_URL` is account-wide. `--sync-status` reports local status for one Space. `--journal HTTPS_URL` reads the account-wide local journal without syncing; use `--journal-space HTTPS_URL SPACE_ID` to narrow it. If the client reports an unknown outcome after submission, inspect the relevant local state before repeating a change.
+
+If the daemon crashes, restart it and use `cirrus-daemon --recover-mount /absolute/path/to/mountpoint` for each recorded mount before mounting again. Recovery checks ownership and does not remove the mountpoint.
 
 Retained staged files and pinned copies can be inspected and exported using the commands in `cirrus-daemon --help`; retain the local state when investigating a problem. Saved metadata can be stale, and offline reads fail when the necessary content is unavailable. Do not delete local state or keyring entries to resolve an error without first preserving the data you need.
 
 Online mounts require authentication and network access for uncached data and remote checks. Pinning is explicit; merely listing or opening a file does not make a whole Space available offline. `--mount-offline-space` exposes retained data read-only without credentials/network and requires the service's `--no-auto-sync` option. `--mount-offline-writable-space` explicitly permits bounded local edits and namespace changes against the retained identity; the mount does not check the remote state. It needs saved parent/directory evidence and available original content, not just a remembered pathname. Unavailable content, incomplete trees and unsafe replacements are refused. Offline mount access does not disable authenticated background sync for activated Spaces when automatic sync is enabled.
 
-Local write/flush/`fsync` success is not remote confirmation or a power-loss guarantee. Check `--sync-status` and `--journal`; an uncertain outcome may already have changed the server. Preserve and export retained versions before resolving a conflict or using `--acknowledge`; acknowledgement is not a merge or proof of the remote bytes. Export with `--export-staged`, `--export-retained` or `--export-pin-copy`, using selectors from the corresponding retained-data listings and a new absolute local destination outside FUSE, in a user-owned directory not writable by others. Missing or corrupt required bytes can fail export and leave partial output; a retained copy may be stale and does not establish the server outcome. No safe concurrent-server-editing mode is currently qualified.
+Repeated saves to the same file replace the queued local version while it is still unsent, without changing its original remote base. If an upload has started, a later save can be visible locally while waiting for confirmation of the earlier version. An uncertain upload may already have changed the server: Cirrus does not replay it just because sync is run again, and later saves do not bypass it.
+
+Local write/flush/`fsync` success is not remote confirmation or a power-loss guarantee. Check `--sync-status` and `--journal` for pending, conflict or uncertain operations. Preserve and export retained versions before resolving a conflict or using `--acknowledge`; acknowledgement is not a merge or proof of the remote bytes and does not authorize replay. Export with `--export-staged`, `--export-retained` or `--export-pin-copy`, using selectors from the corresponding retained-data listings and a new absolute local destination outside FUSE, in a user-owned directory not writable by others. Missing or corrupt required bytes can fail export and leave partial output; a retained copy may be stale and does not establish the server outcome. No safe concurrent-server-editing mode is currently qualified.
 
 Use `--storage-status` to inspect local usage and `--storage-limits` / `--set-storage-limits BUDGET_BYTES RESERVE_BYTES` for opt-in admission controls. These are not a hard global quota or a guarantee against disk exhaustion: database, temporary and retained-history growth are not completely bounded by them. Automatic reclamation removes only persisted clean cache, never staged edits, pins, recovery copies or charged orphan files. Retained data can keep growing; preserve exports and independent backups before explicitly removing it.
 

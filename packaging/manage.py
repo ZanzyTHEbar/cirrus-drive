@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Install/remove known user artifacts; never recursively remove user state."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -9,15 +8,13 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import pwd
 import re
-import sqlite3
 import stat
 import subprocess
 import sys
-from contextlib import closing
+from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-APP_ID = 0x43445231
 
 
 def absolute(name, value):
@@ -38,6 +35,7 @@ def locations():
         return dest / path.relative_to("/") if dest else path
     targets = {
         "daemon": physical(prefix / "bin/cirrus-daemon"),
+        "service_binary": physical(prefix / "bin/cirrus-drive-service"),
         "ui": physical(prefix / "bin/cirrus-ui"),
         "service": physical(home / ".config/systemd/user/cirrus-drive.service"),
         "desktop": physical(prefix / "share/applications/cirrus-drive.desktop"),
@@ -125,26 +123,27 @@ def install(args):
     notices = notice_bundle()
     targets.update(notice_targets(prefix, physical, notices))
     bindir = Path(os.environ.get("CIRRUS_BIN_DIR", str(ROOT / "target/debug")))
-    sources = [bindir / "cirrus-daemon", bindir / "cirrus-ui"]
-    if not all(path.is_file() and os.access(path, os.X_OK) for path in sources):
-        raise ValueError("build cirrus-daemon and cirrus-ui before installing")
-    capability = subprocess.run([str(sources[0]), "--lab-capabilities"], capture_output=True, text=True, timeout=10)
-    if capability.returncode == 0 and capability.stdout.strip() == "cirrus-drive disposable account and mount lab v1":
-        raise ValueError("refusing to install a fault-injection daemon; rebuild without the feature")
+    sources = {key: bindir / targets[key].name for key in ("daemon", "service_binary", "ui")}
+    if not all(path.is_file() and os.access(path, os.X_OK) for path in sources.values()):
+        raise ValueError("build cirrus-daemon, cirrus-drive-service and cirrus-ui before installing")
+    for key in ("daemon", "service_binary"):
+        capability = subprocess.run([str(sources[key]), "--lab-capabilities"], capture_output=True, text=True, timeout=10)
+        if capability.returncode != 2:
+            raise ValueError("refusing fault-injection or incompatible Cirrus executable; rebuild without the feature")
     service = (HERE / "cirrus-drive.service").read_text()
     daemon = str(prefix / "bin/cirrus-daemon")
-    service = service.replace("ExecStart=cirrus-daemon\n", f"ExecStart={daemon}\n")
+    service = service.replace("ExecStart=cirrus-drive-service\n", f"ExecStart={prefix}/bin/cirrus-drive-service\n")
     service = service.replace("cirrus-daemon --stop", f"{daemon} --stop")
     desktop = (HERE / "cirrus-drive.desktop").read_text().replace("Exec=cirrus-ui\n", f"Exec={prefix}/bin/cirrus-ui\n")
-    contents = {"daemon": sources[0].read_bytes(), "ui": sources[1].read_bytes(),
-                "service": service.encode(), "desktop": desktop.encode()}
+    contents = {key: path.read_bytes() for key, path in sources.items()}
+    contents.update(service=service.encode(), desktop=desktop.encode())
     contents.update({"notice:" + name: data for name, data in notices.items()})
     if manifest.exists() or manifest.is_symlink() or any(path.exists() or path.is_symlink() for path in targets.values()):
         raise ValueError("installation target already exists; no existing files were replaced")
     written = []
     try:
         for key, path in targets.items():
-            create(path, contents[key], 0o755 if key in ("daemon", "ui") else 0o644)
+            create(path, contents[key], 0o755 if key in sources else 0o644)
             written.append(path)
         record = {key: digest(contents[key]) for key in targets}
         create(manifest, (json.dumps(record, sort_keys=True) + "\n").encode(), 0o600)
@@ -158,126 +157,83 @@ def install(args):
     print("installed user artifacts; enable the user service explicitly if desired")
 
 
-def state_guard(state):
-    """Return held lock fds and known clean files, or fail without deleting anything."""
-    if not state.exists() and not state.is_symlink():
-        return [], []
-    current = Path("/")
-    for part in state.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            raise ValueError("state path contains a symlink; state preserved")
-    info = state.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError("state directory is not a private user-owned directory")
-    names = {p.name for p in state.iterdir()}
-    if names - {"state.db", "cache.db", "account.lock", "sync.lock", "staging.lock", "scheduler.lock", "staging", "directory-snapshots"}:
-        raise ValueError("unrecognized state or SQLite recovery files; state preserved")
-    staging = state / "staging"
-    if "staging" in names:
-        entry = staging.lstat()
-        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) != 0o700 or any(staging.iterdir()):
-            raise ValueError("staging contains data or is unsafe; state preserved")
-    if "directory-snapshots" in names:
-        snapshots = state / "directory-snapshots"
-        entry = snapshots.lstat()
-        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) != 0o700 or any(snapshots.iterdir()):
-            raise ValueError("directory snapshots contain files or are unsafe; state preserved")
-    locks = []
-    try:
-        for name, content in (("sync.lock", b"cirrus-drive sync lock v1\n"),
-                              ("account.lock", b"cirrus-drive account lock v1\n"),
-                              ("staging.lock", b"cirrus-drive staging lock v1\n"),
-                              ("scheduler.lock", b"cirrus-drive scheduler lock v1\n")):
-            if name not in names:
-                continue
-            marker = state / name
-            if not regular(marker) or stat.S_IMODE(marker.stat().st_mode) != 0o600 or marker.read_bytes() != content:
-                raise ValueError("unrecognized coordination lock; state preserved")
-            fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            locks.append(fd)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise ValueError("account state is in use; state preserved")
-        db = state / "state.db"
-        if "state.db" in names:
-            if not regular(db) or stat.S_IMODE(db.stat().st_mode) != 0o600:
-                raise ValueError("offline database is unsafe; state preserved")
-            with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
-                app = conn.execute("PRAGMA application_id").fetchone()[0]
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                expected = {"account_identities", "snapshots", "pins", "files", "chunks", "operation_journal", "directory_moves", "tree_proofs", "tree_targets", "write_dependencies", "operation_parents", "removal_versions", "upload_verifications", "sync_spaces", "sync_reads", "mutation_receipts", "verified_uploads", "dirty_roots", "dirty_bases", "dirty_preparations"}
-                if app != APP_ID:
-                    raise ValueError("unrecognized offline database; state preserved")
-                if version != 17:
-                    raise ValueError("unsupported offline database version; state preserved")
-                expected |= {"pin_copies", "pin_copy_files", "pin_copy_chunks", "sqlite_sequence"}
-                if tables != expected:
-                    raise ValueError("unrecognized offline database; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM pins)").fetchone()[0]:
-                    raise ValueError("pins exist; state preserved")
-                if any(conn.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0] for table in ("pin_copies", "pin_copy_files", "pin_copy_chunks")):
-                    raise ValueError("retained pin copies exist; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM operation_journal)").fetchone()[0]:
-                    raise ValueError("journal entries exist; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM directory_moves)").fetchone()[0]:
-                    raise ValueError("directory move records exist; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM write_dependencies)").fetchone()[0]:
-                    raise ValueError("write dependencies exist; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM operation_parents)").fetchone()[0]:
-                    raise ValueError("operation parent records exist; state preserved")
-                if conn.execute("SELECT EXISTS(SELECT 1 FROM upload_verifications)").fetchone()[0]:
-                    raise ValueError("upload verification records exist; state preserved")
-                for table in ("tree_proofs", "tree_targets", "removal_versions", "sync_reads", "mutation_receipts", "verified_uploads", "dirty_roots", "dirty_bases", "dirty_preparations"):
-                    if conn.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()[0]:
-                        raise ValueError("sync operation records exist; state preserved")
-        if "cache.db" in names:
-            cache = state / "cache.db"
-            if not regular(cache) or stat.S_IMODE(cache.stat().st_mode) != 0o600:
-                raise ValueError("clean cache is unsafe; state preserved")
-            with closing(sqlite3.connect(f"file:{cache}?mode=ro", uri=True)) as conn:
-                app = conn.execute("PRAGMA application_id").fetchone()[0]
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if app != 0x43444331 or version != 2 or tables != {"ranges", "generation"}:
-                    raise ValueError("unrecognized clean cache; state preserved")
-        return locks, [state / name for name in ("state.db", "cache.db", "sync.lock", "account.lock", "staging.lock", "scheduler.lock", "staging", "directory-snapshots") if name in names]
-    except BaseException:
-        for fd in locks:
-            os.close(fd)
-        raise
+def verify_mount_inventory(output):
+    """Check the installed daemon's JSON Lines MountInfo inventory."""
+    if not output:
+        return  # The CLI prints nothing for an empty inventory.
+
+    unverifiable = "cannot verify mount inventory; daemon and files preserved"
+    required = {"instance", "space_id", "space_name", "path", "state"}
+    optional = {"offline_read_only", "offline_writable"}
+    paths, spaces = set(), set()
+
+    def unique_fields(pairs):
+        row = dict(pairs)
+        if len(row) != len(pairs):
+            raise ValueError("duplicate JSON field")
+        return row
+
+    for line in output.removesuffix("\n").split("\n"):
+        try:
+            row = json.loads(line, object_pairs_hook=unique_fields)
+            if (not isinstance(row, dict) or not required <= row.keys()
+                    or row.keys() - required - optional
+                    or any(not isinstance(row[key], str) or not row[key] or "\0" in row[key]
+                           for key in required)
+                    or any(type(row[key]) is not bool for key in optional & row.keys())):
+                raise ValueError("invalid mount row")
+            url = row["instance"]
+            instance = urlsplit(url)
+            # Rust treats repeated leading slashes as the same absolute path.
+            path = Path(re.sub(r"^/+", "/", row["path"]))
+            space = (url, row["space_id"])
+            if (instance.scheme != "https" or not instance.hostname
+                    or instance.username is not None or re.search(r"[\s?#\\]", url)
+                    or not path.is_absolute() or ".." in path.parts
+                    or path in paths or space in spaces
+                    or (row.get("offline_read_only") and row.get("offline_writable"))):
+                raise ValueError("invalid or ambiguous mount identity")
+        except (ValueError, RecursionError):
+            raise ValueError(unverifiable) from None
+        if row["state"] == "RecoveryRequired":
+            raise ValueError("mount recovery required; inspect it before uninstalling")
+        if row["state"] != "Mounted":
+            raise ValueError(unverifiable)
+        paths.add(path)
+        spaces.add(space)
 
 
 def stop_daemon(daemon, dest, home):
     if dest or home != Path(pwd.getpwuid(os.geteuid()).pw_dir):
-        return False
+        return
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         raise ValueError("XDG_RUNTIME_DIR is required to verify daemon and mount state")
     runtime = absolute("XDG_RUNTIME_DIR", runtime)
-    socket = runtime / "cirrus-drive.sock"
-    record = runtime / "cirrus-drive.mount"
-    if not socket.exists() and not socket.is_symlink():
-        if record.exists() or record.is_symlink():
-            raise ValueError("mount recovery record exists; inspect it before uninstalling")
-        return False
-    if not regular(daemon) or not os.access(daemon, os.X_OK):
-        raise ValueError("cannot verify or stop the running daemon")
-    status = subprocess.run([str(daemon), "--mount-status"], capture_output=True, text=True, timeout=20)
-    if status.returncode:
-        raise ValueError("cannot verify mount status; daemon and files preserved")
-    mounted = "mounted:" in status.stdout
-    stop = subprocess.run([str(daemon), "--stop"], capture_output=True, text=True, timeout=40)
-    if stop.returncode or socket.exists() or socket.is_symlink():
-        raise ValueError("daemon did not stop safely; files preserved")
-    return mounted
+    socket = "cirrus-drive.sock"
+    # Check entry names without following symlinks, and propagate listing errors.
+    entries = {path.name for path in runtime.iterdir()}
+    if socket in entries:
+        if not regular(daemon) or not os.access(daemon, os.X_OK):
+            raise ValueError("cannot verify or stop the running daemon")
+        status = subprocess.run([str(daemon), "--mounts"], capture_output=True, encoding="utf-8", timeout=20)
+        if status.returncode or status.stderr:
+            raise ValueError("cannot verify mount inventory; daemon and files preserved")
+        verify_mount_inventory(status.stdout)
+        stop = subprocess.run([str(daemon), "--stop"], capture_output=True, text=True, timeout=40)
+        if stop.returncode:
+            raise ValueError("daemon did not stop safely; files preserved")
+        entries = {path.name for path in runtime.iterdir()}
+        if socket in entries:
+            raise ValueError("daemon did not stop safely; files preserved")
+    # The daemon reserves this prefix, including the legacy singleton name.
+    if any(name.startswith("cirrus-drive.mount") for name in entries):
+        raise ValueError("mount recovery record exists; inspect it before uninstalling")
 
 
 def uninstall(args):
-    if args not in ([], ["--purge-clean-state"]):
-        raise ValueError("usage: uninstall.sh [--purge-clean-state]")
+    if args:
+        raise ValueError("usage: uninstall.sh")
     home, prefix, dest, physical, targets, manifest = locations()
     if not regular(manifest):
         raise ValueError("installation manifest is missing or unsafe")
@@ -286,45 +242,19 @@ def uninstall(args):
         raise ValueError("unrecognized installation manifest")
     # Use installed ownership, not the current checkout's possibly newer bundle.
     # Historical four-file installs remain removable without claiming notices.
+    if "service_binary" not in record:
+        targets.pop("service_binary")
     targets.update(notice_targets(prefix, physical, [key.removeprefix("notice:") for key in record if key.startswith("notice:")]))
     if set(record) != set(targets):
         raise ValueError("unrecognized installation manifest")
     for key, path in targets.items():
         if not regular(path) or digest(path.read_bytes()) != record[key]:
             raise ValueError(f"installed {key} changed or is missing; no files removed")
-    mounted = stop_daemon(targets["daemon"], dest, home)
-    reason = None
-    locks, clean = [], []
-    state = physical(home / ".local/state/cirrus-drive")
-    if args:
-        try:
-            if mounted:
-                raise ValueError("a mount was active; state preserved")
-            if not dest and home == Path(pwd.getpwuid(os.geteuid()).pw_dir) and " - fuse.cirrus-drive " in Path("/proc/self/mountinfo").read_text():
-                raise ValueError("a Cirrus mount is active; state preserved")
-            if not dest and home == Path(pwd.getpwuid(os.geteuid()).pw_dir) and (state.exists() or state.is_symlink()):
-                raise ValueError("automatic purge of live account state is not yet qualified; state preserved")
-            locks, clean = state_guard(state)
-        except (OSError, ValueError, sqlite3.Error) as error:
-            reason = str(error)
-    try:
-        for path in targets.values():
-            path.unlink()
-        manifest.unlink()
-        if args and reason is None:
-            for path in clean:
-                if path.name in ("staging", "directory-snapshots"):
-                    path.rmdir()
-                else:
-                    path.unlink()
-            if state.exists():
-                state.rmdir()
-    finally:
-        for fd in locks:
-            os.close(fd)
-    if reason:
-        raise ValueError(reason)
-    print("removed installed artifacts" + (" and clean state" if args else "; state and keyring preserved"))
+    stop_daemon(targets["daemon"], dest, home)
+    for path in targets.values():
+        path.unlink()
+    manifest.unlink()
+    print("removed installed artifacts; state and keyring preserved")
 
 
 if __name__ == "__main__":
@@ -332,6 +262,6 @@ if __name__ == "__main__":
         if len(sys.argv) < 2 or sys.argv[1] not in ("install", "uninstall"):
             raise ValueError("expected install or uninstall")
         (install if sys.argv[1] == "install" else uninstall)(sys.argv[2:])
-    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"cirrus packaging: {error}", file=sys.stderr)
         raise SystemExit(1)

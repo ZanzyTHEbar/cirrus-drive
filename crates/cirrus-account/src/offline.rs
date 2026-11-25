@@ -1,12 +1,12 @@
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use md5::Md5;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 #[cfg(target_os = "linux")]
 use rustix::fs::ResolveFlags;
 use rustix::{
@@ -17,6 +17,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::account_storage::StorageRoot;
+use crate::sqlite_open::{Database, OpenMode};
 use crate::{
     AccountError, DirectoryIdentity, Entry, FileVersion, JournalEntry, JournalPage, JournalState,
     JournalSummary, PinTree, ownership,
@@ -80,87 +81,10 @@ pub(crate) struct Pin {
 }
 
 pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError> {
-    let database = crate::sqlite_open::Database::State;
-    let _lock = database
-        .opening_gate()
-        .map_err(|_| AccountError::new("offline state is unavailable"))?;
-    let dir = root.directory();
-    #[cfg(target_os = "linux")]
-    let (stat, created) = match fs::openat2(
-        &dir,
-        "state.db",
-        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    ) {
-        Ok(fd) => (
-            fs::fstat(&fd).map_err(|_| AccountError::new("cannot inspect offline state"))?,
-            true,
-        ),
-        Err(rustix::io::Errno::EXIST) => (
-            fs::statat(&dir, "state.db", AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|_| AccountError::new("cannot inspect offline state"))?,
-            false,
-        ),
-        Err(_) => return Err(AccountError::new("cannot create offline state")),
-    };
-    #[cfg(target_os = "macos")]
-    let (stat, created) = database
-        .prepare_darwin(root, true)
-        .map_err(|_| AccountError::new("cannot admit offline state"))?
-        .ok_or_else(|| AccountError::new("offline state is unavailable"))?;
-    // Closing an extra descriptor for an existing SQLite file would release
-    // this process's POSIX locks, including locks held by other connections.
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_uid != process::geteuid().as_raw()
-        || stat.st_mode & 0o7777 != 0o600
-        || stat.st_nlink != 1
-    {
-        return Err(AccountError::new(
-            "offline state has unsafe ownership or permissions",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    let proc = fs::openat2(
-        fs::CWD,
-        "/proc",
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|_| AccountError::new("trusted procfs is required for offline state"))?;
-    #[cfg(target_os = "linux")]
-    if fs::fstatfs(&proc)
-        .map_err(|_| AccountError::new("cannot inspect procfs"))?
-        .f_type
-        != fs::PROC_SUPER_MAGIC
-    {
-        return Err(AccountError::new(
-            "trusted procfs is required for offline state",
-        ));
-    }
-    // SQLite resolves the held-directory procfs link before opening; NOFOLLOW would
-    // reject that link. The private directory and the final inode are checked here.
-    #[cfg(target_os = "linux")]
-    let path = format!("/proc/self/fd/{}/state.db", dir.as_raw_fd());
-    #[cfg(target_os = "linux")]
-    database
-        .check_auxiliaries(&dir)
-        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
-    #[cfg(target_os = "linux")]
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|_| AccountError::new("cannot open offline state"))?;
-    #[cfg(target_os = "macos")]
-    let conn = {
-        database
-            .check_darwin(root, &stat)
-            .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
-        database
-            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|_| AccountError::new("cannot open offline state"))?
-    };
-    crate::sqlite_open::check_unmoved(&conn)
-        .map_err(|_| AccountError::new("offline state changed"))?;
+    let opening = Database::State
+        .open(root, OpenMode::CreateOrOpen)?
+        .ok_or_else(|| Database::State.unavailable())?;
+    let conn = opening.connection();
     conn.busy_timeout(Duration::from_secs(15))
         .map_err(|_| AccountError::new("cannot configure offline state"))?;
     // EXTRA also syncs the containing directory after deleting a rollback journal.
@@ -169,7 +93,7 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
     let id: i64 = conn
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(|_| AccountError::new("cannot inspect offline state"))?;
-    if created {
+    if opening.created() {
         conn.execute_batch("BEGIN IMMEDIATE; PRAGMA application_id=1128550961; PRAGMA user_version=17;
             CREATE TABLE account_identities(instance TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL);
             CREATE TABLE snapshots(instance TEXT NOT NULL, space TEXT NOT NULL, path TEXT NOT NULL, entries TEXT NOT NULL, updated INTEGER NOT NULL, self_id TEXT, self_etag TEXT, local_operation INTEGER, issuer TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(instance,space,path), CHECK((self_id IS NOT NULL AND self_etag IS NOT NULL AND local_operation IS NULL) OR (self_id IS NULL AND self_etag IS NULL AND local_operation IS NOT NULL AND local_operation>0)));
@@ -197,7 +121,8 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
              CREATE TABLE dirty_preparations (version TEXT PRIMARY KEY, offset INTEGER NOT NULL);
             CREATE INDEX space_pending ON operation_journal(instance,space,state,op_type,id); COMMIT;")
             .map_err(|_| AccountError::new("cannot initialize offline state"))?;
-        fs::fsync(&dir).map_err(|_| AccountError::new("cannot persist offline state"))?;
+        fs::fsync(root.directory())
+            .map_err(|_| AccountError::new("cannot persist offline state"))?;
     } else if id != APP_ID {
         return Err(AccountError::new("unrecognized offline state"));
     }
@@ -208,13 +133,13 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
         let reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
             root,
             crate::storage::sql_reservation::Store::State,
-            Some(&conn),
+            Some(conn),
             0,
             64 * 1024,
             false,
         )?;
         if let Some(reservation) = &reservation {
-            reservation.bound_pages(&conn)?;
+            reservation.bound_pages(conn)?;
         }
         // Exact additive migration, shared by fresh product DDL and retained
         // developer databases. No row reset or unsupported-version adoption.
@@ -240,33 +165,15 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
                 .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
         }
         if let Some(reservation) = &reservation {
-            reservation.validate(&conn)?;
+            reservation.validate(conn)?;
         }
         conn.execute_batch("COMMIT")
             .map_err(|_| AccountError::new("cannot persist offline state upgrade"))?;
     } else if version != STATE_SCHEMA_VERSION {
         return Err(AccountError::new("unsupported offline state version"));
     }
-    let current = fs::statat(&dir, "state.db", AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|_| AccountError::new("offline state changed"))?;
-    if (stat.st_dev, stat.st_ino) != (current.st_dev, current.st_ino)
-        || current.st_nlink != 1
-        || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
-        || current.st_uid != process::geteuid().as_raw()
-        || current.st_mode & 0o7777 != 0o600
-    {
-        return Err(AccountError::new("offline state changed"));
-    }
-    #[cfg(target_os = "linux")]
-    database
-        .check_auxiliaries(&dir)
-        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
-    #[cfg(target_os = "macos")]
-    database
-        .check_darwin(root, &stat)
-        .map_err(|_| AccountError::new("offline state has unsafe ownership or permissions"))?;
-    crate::sqlite_open::check_unmoved(&conn)
-        .map_err(|_| AccountError::new("offline state changed"))?;
+    opening.check_named()?;
+    opening.check_sidecars_and_vfs()?;
     #[cfg(feature = "fault-injection")]
     if let Some(marker) = std::env::var_os("CIRRUS_TEST_SQLITE_OPEN_MARKER") {
         let marker = Path::new(&marker);
@@ -275,7 +182,7 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
                 .map_err(|_| AccountError::new("cannot mark database test window"))?;
         }
     }
-    Ok(conn)
+    Ok(opening.into_connection())
 }
 
 /// Bind offline state to the first verified identity for an instance.
@@ -335,7 +242,16 @@ pub(crate) fn verify_identity_in(
     issuer: &str,
     subject: &str,
 ) -> Result<(), AccountError> {
-    let existing: Option<(String, String)> = database_in(root)?
+    verify_identity(&database_in(root)?, instance, issuer, subject)
+}
+
+fn verify_identity(
+    conn: &Connection,
+    instance: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<(), AccountError> {
+    let existing: Option<(String, String)> = conn
         .query_row(
             "SELECT issuer,subject FROM account_identities WHERE instance=?1",
             [instance],
@@ -374,14 +290,98 @@ pub(crate) fn sqlite_storage_error(error: rusqlite::Error, fallback: &'static st
     }
 }
 
+pub(crate) enum ImportEvidence<'a> {
+    Online { issuer: &'a str, subject: &'a str },
+    Retained,
+}
+
+struct ImportTarget {
+    owner: (String, String),
+    parents: Vec<DirectoryIdentity>,
+    head: Option<FileVersion>,
+}
+
+fn import_target(
+    storage: &StorageRoot,
+    conn: &Connection,
+    (instance, space): (&str, &str),
+    path: &[String],
+    evidence: &ImportEvidence<'_>,
+) -> Result<ImportTarget, AccountError> {
+    let (name, parent) = path
+        .split_last()
+        .ok_or_else(|| AccountError::new("invalid offline file path"))?;
+    reject_fenced_ancestor(conn, instance, space, path)?;
+    let namespace: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND space=?2 AND path=?3 AND op_type!='write' AND state IN ('pending','conflict','uncertain'))",
+        params![instance, space, path_key(path)?],
+        |row| row.get(0),
+    ).map_err(|_| AccountError::new("cannot inspect pending operations"))?;
+    if namespace {
+        return Err(AccountError::new(
+            "path has unresolved namespace operations; local copies retained",
+        ));
+    }
+    let mut parents = Vec::with_capacity(parent.len());
+    let owner = match evidence {
+        ImportEvidence::Retained => retained_space_identity_in(conn, instance, space)?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "offline import requires matching retained account and verified Space activation",
+                )
+            })?,
+        ImportEvidence::Online { issuer, subject } => {
+            verify_identity(conn, instance, issuer, subject)?;
+            check_retained_identity(conn, instance, space)?;
+            ((*issuer).to_owned(), (*subject).to_owned())
+        }
+    };
+    let entries =
+        resolve_saved_directory_in(storage, conn, (instance, space), parent, Some(&mut parents))?;
+    // The projected leaf can be a staged head. Only a remote leaf supplies
+    // fresh PUT preconditions; publish_root reuses the original proof of an
+    // existing staged head or binds a successor to its verified receipt.
+    let head = match entries.get(name)? {
+        None => None,
+        Some(entry)
+            if !entry.is_directory()
+                && (entry.id().starts_with("cirrus-staged:")
+                    || crate::dav::valid_remote_id(entry.id())) =>
+        {
+            let etag = entry
+                .etag()
+                .filter(|etag| crate::dav::strong_etag(etag))
+                .ok_or_else(|| AccountError::new("import target lacks a strong ETag"))?;
+            Some(FileVersion {
+                instance: instance.to_owned(),
+                space: space.to_owned(),
+                path: path.to_vec(),
+                id: entry.id().to_owned(),
+                etag: etag.to_owned(),
+                size: entry
+                    .size()
+                    .ok_or_else(|| AccountError::new("import target size is unavailable"))?,
+                checksums: entry.checksums().to_vec(),
+            })
+        }
+        Some(_) => {
+            return Err(AccountError::new("import target is not a file"));
+        }
+    };
+    Ok(ImportTarget {
+        owner,
+        parents,
+        head,
+    })
+}
+
 pub(crate) fn stage_file(
     storage: &StorageRoot,
-    instance: &str,
-    space: &str,
+    location: (&str, &str),
     path: &[String],
     source: &Path,
-    base: Option<&Entry>,
-    parents: &[DirectoryIdentity],
+    evidence: ImportEvidence<'_>,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<crate::OperationHandle, AccountError> {
     if !source.is_absolute()
         || source
@@ -392,6 +392,24 @@ pub(crate) fn stage_file(
             "staging source must be an absolute safe path",
         ));
     }
+    let target = {
+        let mut conn = database_in(storage)?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| AccountError::new("cannot inspect import evidence"))?;
+        import_target(storage, &tx, location, path, &evidence)?
+    };
+    let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::Acquire);
+    let check_cancelled = || {
+        if is_cancelled() {
+            Err(AccountError::new(
+                "account operation cancelled by daemon shutdown",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     #[cfg(target_os = "linux")]
     let input = fs::openat2(
         fs::CWD,
@@ -415,7 +433,8 @@ pub(crate) fn stage_file(
             "staging source must be a regular file of at most 1 TiB",
         ));
     }
-    let root = overlay::Overlay::import_in(storage, &mut input, before.len())?;
+    let root =
+        overlay::Overlay::import_candidate_in(storage, &mut input, before.len(), &is_cancelled)?;
     let count = root.len();
     let after = input.metadata().map_err(|_| {
         AccountError::new("cannot inspect staging source; inspect staging directory")
@@ -433,140 +452,52 @@ pub(crate) fn stage_file(
             "staging source changed; inspect staging directory",
         ));
     }
-    let name = root.save()?;
-    // Immutable import objects/registration are independently durable and
-    // charged already. Refusal here retains them without publishing a head.
-    // Keep the State allowance through rollback/close; exact marker recovery
-    // below still opens its own uncapped connection.
-    let reservation;
-    let mut conn = database_in(storage)?;
-    let encoded = path_key(path)?;
-    let base = base.filter(|entry| !entry.is_directory() && entry.etag().is_some());
-    let planning_version: i64 = conn
-        .pragma_query_value(None, "data_version", |row| row.get(0))
-        .map_err(|_| AccountError::new("cannot inspect import publication plan"))?;
-    let planned = if crate::storage::limits::view_in(storage)?.limits.is_some() {
-        let operation = PendingWrite {
-            id: i64::MAX,
-            space: space.to_owned(),
-            path: path.to_vec(),
-            base_id: base.map(|entry| entry.id().to_owned()),
-            base_etag: base.and_then(Entry::etag).map(str::to_owned),
-            staged: name.clone(),
-            parents: parents.to_vec(),
-        };
-        // This transaction inserts one write/parent row and a marker, not a
-        // mounted-root CAS, successor dependency, retained copy or pin move.
-        // Local-directory dependencies are encoded in parents, not new rows.
-        let rows = serde_json::to_vec(&(
-            (
-                i64::MAX,
+    let validate = |conn: &Connection| {
+        check_cancelled()?;
+        let current = import_target(storage, conn, location, path, &evidence)?;
+        let (instance, space) = location;
+        if current.owner != target.owner
+            || !equivalent_parents(
+                conn,
                 instance,
                 space,
-                &encoded,
-                "write",
-                &operation.base_id,
-                &operation.base_etag,
-                &name,
-                "pending",
-                Option::<&str>::None,
-                i64::MAX,
-            ),
-            (
-                i64::MAX,
-                encode_parents(path, parents)?,
-                Option::<&str>::None,
-            ),
-        ))
-        .map_err(|_| AccountError::new("cannot size import publication rows"))?;
-        (rows.len() as u64)
-            .checked_add(publication::planned_fence_bytes(
-                &conn, instance, &operation, None, None,
-            )?)
-            .ok_or_else(|| AccountError::new("import publication estimate overflow"))?
-    } else {
-        0
-    };
-    #[cfg(feature = "fault-injection")]
-    crate::wait_test_window("CIRRUS_TEST_IMPORT_PUBLICATION_ADMISSION_WINDOW")?;
-    reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
-        storage,
-        crate::storage::sql_reservation::Store::State,
-        Some(&conn),
-        planned,
-        0,
-        false,
-    )?;
-    if let Some(reservation) = &reservation {
-        reservation.bound_pages(&conn)?;
-    }
-    #[cfg(feature = "fault-injection")]
-    crate::wait_test_window("CIRRUS_TEST_IMPORT_PUBLICATION_RESERVED_WINDOW")?;
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| sqlite_storage_error(error, "cannot begin staged file"))?;
-    if reservation.is_some() {
-        let current: i64 = tx
-            .pragma_query_value(None, "data_version", |row| row.get(0))
-            .map_err(|_| AccountError::new("cannot inspect import publication plan"))?;
-        if current != planning_version {
+                path,
+                &target.parents,
+                &current.parents,
+            )?
+        {
             return Err(AccountError::new(
-                "directory metadata changed concurrently; retry",
+                "import parent or account changed; local copies retained",
             ));
         }
-    }
-    reject_fenced_ancestor(&tx, instance, space, path)?;
-    let namespace: i64 = tx.query_row("SELECT count(*) FROM operation_journal WHERE instance=?1 AND space=?2 AND path=?3 AND op_type!='write' AND state IN ('pending','conflict','uncertain')", params![instance, space, path_key(path)?], |row| row.get(0))
-        .map_err(|_| AccountError::new("cannot inspect pending operations"))?;
-    if namespace != 0 {
-        return Err(AccountError::new(
-            "path has unresolved namespace operations; inspect staging directory",
-        ));
-    }
-    tx.execute("INSERT INTO operation_journal(instance,space,path,op_type,base_file_id,base_etag,staged_file,state,error_msg,updated_at) VALUES (?1,?2,?3,'write',?4,?5,?6,'pending',NULL,strftime('%s','now'))",
-        params![instance, space, encoded, base.map(Entry::id), base.and_then(Entry::etag), name]).map_err(|error| sqlite_storage_error(error, "cannot journal staged file; inspect staging directory"))?;
-    let id = tx.last_insert_rowid();
-    save_operation_parents(&tx, id, path, parents, None)?;
-    let publication = publication::fence(&tx, id)?;
-    let operation = crate::OperationHandle::capture(&tx, instance, space, id)?;
-    #[cfg(feature = "fault-injection")]
-    crate::wait_test_window("CIRRUS_TEST_IMPORT_PUBLICATION_COMMIT_WINDOW")?;
-    if let Some(reservation) = &reservation {
-        reservation.validate(&tx)?;
-    } else if crate::storage::limits::view_in(storage)?.limits.is_some() {
-        return Err(AccountError::new(crate::storage::limits::PRESSURE));
-    }
-    let committed = tx.commit();
-    #[cfg(feature = "fault-injection")]
-    let committed = if committed.is_ok()
-        && let Some(marker) = std::env::var_os("CIRRUS_TEST_IMPORT_COMMITTED_ERROR")
-        && std::fs::remove_file(marker).is_ok()
-    {
-        eprintln!("cirrus lab import committed-but-returned-error (not hardware I/O)");
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-            None,
-        ))
-    } else {
-        committed
+        if current.head != target.head {
+            // Sync can confirm the exact staged head during the file copy.
+            // The shared kernel still checks that no later intent intervened.
+            let confirmed = match (&target.head, &current.head) {
+                (Some(previous), Some(remote)) => confirmed_write_in(conn, previous)?
+                    .is_some_and(|(id, etag)| id == remote.id && etag == remote.etag),
+                _ => false,
+            };
+            if !confirmed {
+                return Err(AccountError::new(
+                    "import target changed; local copies retained",
+                ));
+            }
+        }
+        Ok(())
     };
-    conn.close().map_err(|_| {
-        AccountError::new("cannot close publication database; local copies retained")
-    })?;
-    if !publication::recover_in(
+    check_cancelled()?;
+    let name = root.save_checked(validate)?;
+    let (_, operation) = publish_root(
         storage,
-        instance,
-        space,
+        location,
         path,
-        id,
-        Some(&publication),
-        committed.is_err(),
-    )? {
-        committed.map_err(|error| sqlite_storage_error(error, "cannot commit staged file"))?;
-        return Err(AccountError::new(
-            "local publication head changed; local copies retained",
-        ));
-    }
+        name,
+        count,
+        target.head.as_ref(),
+        &target.parents,
+        validate,
+    )?;
     Ok(operation)
 }
 
@@ -5804,7 +5735,7 @@ pub(crate) fn stage_mutation_operation(
 ) -> Result<(FileVersion, crate::OperationHandle), AccountError> {
     let (instance, space) = (binding.instance.as_str(), binding.space.as_str());
     let root = mutate_root(&binding.root, base, mutation)?;
-    let name = root.save_checked(|conn| {
+    let validate = |conn: &Connection| {
         validate_offline_write(
             &binding.root,
             conn,
@@ -5814,7 +5745,8 @@ pub(crate) fn stage_mutation_operation(
             base,
             parents,
         )
-    })?;
+    };
+    let name = root.save_checked(validate)?;
     publish_root(
         &binding.root,
         (instance, space),
@@ -5823,7 +5755,7 @@ pub(crate) fn stage_mutation_operation(
         root.len(),
         base,
         parents,
-        None,
+        |_| Ok(()),
     )
 }
 
@@ -5843,7 +5775,7 @@ pub(crate) fn stage_offline_mutation_operation(
         .transpose()?
         .flatten();
     let root = mutate_root(&binding.root, original.as_ref().or(base), mutation)?;
-    let name = root.save_checked(|conn| {
+    let validate = |conn: &Connection| {
         validate_offline_write(
             &binding.root,
             conn,
@@ -5852,7 +5784,10 @@ pub(crate) fn stage_offline_mutation_operation(
             (&binding.issuer, &binding.subject),
             base,
             parents,
-        )?;
+        )
+    };
+    let name = root.save_checked(|conn| {
+        validate(conn)?;
         if let (Some(base), Some(original)) = (base, original.as_ref())
             && tree_content_base_in(&binding.root, conn, base, true)?.as_ref() != Some(original)
         {
@@ -5870,7 +5805,7 @@ pub(crate) fn stage_offline_mutation_operation(
         root.len(),
         base,
         parents,
-        Some((&binding.issuer, &binding.subject)),
+        validate,
     )
 }
 
@@ -6343,7 +6278,7 @@ fn publish_root(
     size: u64,
     base: Option<&FileVersion>,
     parents: &[DirectoryIdentity],
-    offline_owner: Option<(&str, &str)>,
+    check_target: impl Fn(&Connection) -> Result<(), AccountError>,
 ) -> Result<(FileVersion, crate::OperationHandle), AccountError> {
     let (instance, space) = location;
     // Candidate payload/manifest/dirty_roots registration are already durable
@@ -6383,9 +6318,7 @@ fn publish_root(
     // Both branch connections are this same owned connection; no recovery
     // path or immutable allocator acquires this State lease recursively.
     let check_plan = |conn: &Connection| -> Result<(), AccountError> {
-        if let Some(owner) = offline_owner {
-            validate_offline_write(storage, conn, (instance, space), path, owner, base, parents)?;
-        }
+        check_target(conn)?;
         if reservation.is_some() {
             let current: i64 = conn
                 .pragma_query_value(None, "data_version", |row| row.get(0))
@@ -6445,9 +6378,10 @@ fn publish_root(
                 save_operation_parents(&tx, successor, path, &recorded_parents, None)?;
                 successor
             } else {
-                // Preserve later edits while the prior upload is in flight or uncertain.
+                // Preserve later edits while the prior upload is in flight or
+                // needs attention, without modifying its root or receipts.
                 // The successor cannot be uploaded until the predecessor is verified.
-                let inserted = tx.execute("INSERT INTO operation_journal(instance,space,path,op_type,base_file_id,base_etag,staged_file,state,error_msg,updated_at) SELECT instance,space,path,'write',NULL,NULL,?1,'pending','waiting for prior upload outcome',strftime('%s','now') FROM operation_journal AS original WHERE id=?2 AND instance=?3 AND space=?4 AND path=?5 AND op_type='write' AND state='uncertain' AND staged_file=?6 AND NOT EXISTS(SELECT 1 FROM operation_journal AS other WHERE other.instance=original.instance AND other.space=original.space AND other.path=original.path AND other.id!=original.id AND other.state!='resolved' AND (other.id>original.id OR other.state IN ('pending','conflict','uncertain')))",
+                let inserted = tx.execute("INSERT INTO operation_journal(instance,space,path,op_type,base_file_id,base_etag,staged_file,state,error_msg,updated_at) SELECT instance,space,path,'write',NULL,NULL,?1,'pending','waiting for prior upload outcome',strftime('%s','now') FROM operation_journal AS original WHERE id=?2 AND instance=?3 AND space=?4 AND path=?5 AND op_type='write' AND state IN ('uncertain','conflict') AND staged_file=?6 AND NOT EXISTS(SELECT 1 FROM operation_journal AS other WHERE other.instance=original.instance AND other.space=original.space AND other.path=original.path AND other.id!=original.id AND other.state!='resolved' AND (other.id>original.id OR other.state IN ('pending','conflict','uncertain')))",
                     params![name,id,instance,space,encoded,old_name])
                     .map_err(|error| sqlite_storage_error(error, "cannot create waiting staged successor"))?;
                 if inserted != 1 {
@@ -6827,8 +6761,11 @@ pub(crate) fn set_write_state(
     to: &str,
     error: Option<&str>,
 ) -> Result<(), AccountError> {
+    // A definite rejection can normally retry the original pending intent.
+    // Once a newer head depends on this attempt, keep the immutable
+    // predecessor for attention instead of sending its obsolete bytes again.
     let count = database_in(storage)?.execute(
-        "UPDATE operation_journal SET state=?1,error_msg=?2,updated_at=strftime('%s','now') WHERE id=?3 AND instance=?4 AND space=?5 AND path=?6 AND op_type='write' AND state=?7 AND staged_file=?8 AND base_file_id IS ?9 AND base_etag IS ?10 AND EXISTS(SELECT 1 FROM operation_parents WHERE operation_id=?3 AND parents=?11 AND destination_parents IS NULL) AND NOT EXISTS(SELECT 1 FROM operation_journal AS fence WHERE fence.instance=?4 AND fence.space=?5 AND fence.error_msg GLOB 'local publication recovery:*') AND (?7!='pending' OR ?1!='uncertain' OR NOT EXISTS (SELECT 1 FROM operation_journal AS previous WHERE previous.instance=?4 AND previous.space=?5 AND previous.path=?6 AND previous.op_type='write' AND previous.id<?3 AND previous.state IN ('pending','conflict','uncertain')))",
+        "UPDATE operation_journal SET state=CASE WHEN ?7='uncertain' AND ?1='pending' AND EXISTS(SELECT 1 FROM write_dependencies WHERE predecessor_id=?3) THEN 'conflict' ELSE ?1 END,error_msg=?2,updated_at=strftime('%s','now') WHERE id=?3 AND instance=?4 AND space=?5 AND path=?6 AND op_type='write' AND state=?7 AND staged_file=?8 AND base_file_id IS ?9 AND base_etag IS ?10 AND EXISTS(SELECT 1 FROM operation_parents WHERE operation_id=?3 AND parents=?11 AND destination_parents IS NULL) AND NOT EXISTS(SELECT 1 FROM operation_journal AS fence WHERE fence.instance=?4 AND fence.space=?5 AND fence.error_msg GLOB 'local publication recovery:*') AND (?7!='pending' OR ?1!='uncertain' OR NOT EXISTS (SELECT 1 FROM operation_journal AS previous WHERE previous.instance=?4 AND previous.space=?5 AND previous.path=?6 AND previous.op_type='write' AND previous.id<?3 AND previous.state IN ('pending','conflict','uncertain')))",
         params![to,error,operation.id,instance,operation.space,path_key(&operation.path)?,from,operation.staged,operation.base_id,operation.base_etag,encode_parents(&operation.path,&operation.parents)?],
     ).map_err(|error| sqlite_storage_error(error, "cannot update staged write"))?;
     if count != 1 {
@@ -7089,6 +7026,13 @@ pub(crate) fn confirmed_write(
     storage: &StorageRoot,
     version: &FileVersion,
 ) -> Result<Option<(String, String)>, AccountError> {
+    confirmed_write_in(&database_in(storage)?, version)
+}
+
+fn confirmed_write_in(
+    conn: &Connection,
+    version: &FileVersion,
+) -> Result<Option<(String, String)>, AccountError> {
     let Some(id) = version
         .id
         .strip_prefix("cirrus-staged:")
@@ -7103,7 +7047,7 @@ pub(crate) fn confirmed_write(
     else {
         return Ok(None);
     };
-    database_in(storage)?.query_row(
+    conn.query_row(
         "SELECT confirmed_file_id,confirmed_etag FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state='synced' AND staged_file=?5 AND confirmed_file_id IS NOT NULL AND confirmed_etag IS NOT NULL AND NOT EXISTS (SELECT 1 FROM operation_journal AS newer WHERE newer.instance=?2 AND newer.space=?3 AND newer.path=?4 AND newer.id>?1 AND newer.state!='resolved')",
         params![id,version.instance,version.space,path_key(&version.path)?,staged],
         |row| Ok((row.get(0)?,row.get(1)?)),
@@ -7723,6 +7667,16 @@ pub(crate) fn offline_directory_in(
             "Space has no verified local activation; local data retained",
         ));
     }
+    resolve_saved_directory_in(storage_root, conn, (instance, space), path, None)
+}
+
+fn resolve_saved_directory_in(
+    storage_root: &StorageRoot,
+    conn: &Connection,
+    (instance, space): (&str, &str),
+    path: &[String],
+    mut parents: Option<&mut Vec<DirectoryIdentity>>,
+) -> Result<crate::DirectorySnapshot, AccountError> {
     // Resolve every ancestor from the same saved namespace and journal view.
     // No saved observation means unavailable, not an invented empty directory.
     let mut directory = Vec::new();
@@ -7734,6 +7688,9 @@ pub(crate) fn offline_directory_in(
             .get(component)?
             .filter(Entry::is_directory)
             .ok_or_else(|| AccountError::new("offline path is missing or not a directory"))?;
+        if let Some(parents) = &mut parents {
+            parents.push(DirectoryIdentity::from_resource_id(entry.id())?);
+        }
         let local = entry.id().starts_with("cirrus-dir:");
         directory.push(component.clone());
         entries = if local {
@@ -7999,29 +7956,6 @@ fn offline_tree_copy_in(
         return Err(AccountError::new("offline tree copied proof changed"));
     }
     Ok(Some(snapshot))
-}
-
-pub(crate) fn observed_parent_identities(
-    storage_root: &StorageRoot,
-    instance: &str,
-    space: &str,
-    path: &[String],
-) -> Result<Vec<DirectoryIdentity>, AccountError> {
-    let mut parents = Vec::with_capacity(path.len().saturating_sub(1));
-    for index in 0..path.len().saturating_sub(1) {
-        let parent = &path[..index];
-        let mut entries = match directory_snapshot_at(storage_root, instance, space, parent)? {
-            Some(entries) => entries,
-            None => crate::DirectorySnapshot::empty_in(storage_root)?,
-        };
-        apply_staged_entries(instance, space, parent, &mut entries)?;
-        let entry = entries
-            .get(&path[index])?
-            .filter(|entry| entry.is_directory())
-            .ok_or_else(|| AccountError::new("parent directory identity is unavailable"))?;
-        parents.push(DirectoryIdentity::from_resource_id(entry.id())?);
-    }
-    Ok(parents)
 }
 
 pub(crate) fn staged_version(
@@ -9449,9 +9383,20 @@ pub(crate) fn mount_identity_in(
     instance: &str,
     space: &str,
 ) -> Result<(String, String), AccountError> {
-    database_in(storage)?.query_row("SELECT a.issuer,a.subject FROM account_identities a JOIN sync_spaces s ON s.instance=a.instance AND s.issuer=a.issuer AND s.subject=a.subject WHERE a.instance=?1 AND s.space=?2 AND a.issuer<>'' AND a.subject<>''", params![instance,space], |row| Ok((row.get(0)?,row.get(1)?)))
-        .optional().map_err(|_| AccountError::new("cannot inspect offline mount identity"))?
-        .ok_or_else(|| AccountError::new("offline mount requires matching retained account and verified Space activation"))
+    retained_space_identity_in(&database_in(storage)?, instance, space)?.ok_or_else(|| {
+        AccountError::new(
+            "offline mount requires matching retained account and verified Space activation",
+        )
+    })
+}
+
+fn retained_space_identity_in(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+) -> Result<Option<(String, String)>, AccountError> {
+    conn.query_row("SELECT a.issuer,a.subject FROM account_identities a JOIN sync_spaces s ON s.instance=a.instance AND s.issuer=a.issuer AND s.subject=a.subject WHERE a.instance=?1 AND s.space=?2 AND a.issuer<>'' AND a.subject<>''", params![instance,space], |row| Ok((row.get(0)?,row.get(1)?)))
+        .optional().map_err(|_| AccountError::new("cannot inspect retained Space identity"))
 }
 
 pub(crate) fn check_retained_identity(
@@ -9459,27 +9404,65 @@ pub(crate) fn check_retained_identity(
     instance: &str,
     space: &str,
 ) -> Result<(), AccountError> {
-    let identity: Option<(String, String)> = conn
-        .query_row(
-            "SELECT issuer,subject FROM account_identities WHERE instance=?1",
-            [instance],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|_| AccountError::new("cannot inspect offline account identity"))?;
-    let (issuer, subject) = identity
-        .filter(|(issuer, subject)| !issuer.is_empty() && !subject.is_empty())
+    retained_account_for_space(conn, instance, space).map(|_| ())
+}
+
+pub(crate) fn cache_eviction_identity_in(
+    root: &StorageRoot,
+    instance: &str,
+    space: &str,
+) -> Result<(String, String, bool), AccountError> {
+    // A clean-cache operation must not create or migrate State for its proof.
+    let opening = Database::State
+        .open(root, OpenMode::Inspect)?
         .ok_or_else(|| {
             AccountError::new("offline account identity is missing; local data retained")
         })?;
-    let differs: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_spaces WHERE instance=?1 AND space=?2 AND (issuer<>?3 OR subject<>?4))", params![instance,space,issuer,subject], |row| row.get(0))
-        .map_err(|_| AccountError::new("cannot inspect retained Space identity"))?;
-    if differs {
+    let conn = opening.connection();
+    let unavailable = || Database::State.unavailable();
+    conn.busy_timeout(Duration::from_secs(1))
+        .map_err(|_| unavailable())?;
+    let id: i64 = conn
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|_| unavailable())?;
+    let schema: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| unavailable())?;
+    if id != APP_ID || !matches!(schema, 17 | 18 | STATE_SCHEMA_VERSION) {
+        return Err(unavailable());
+    }
+    opening.check_named()?;
+    opening.check_sidecars_and_vfs()?;
+    retained_account_for_space(&opening.into_connection(), instance, space)
+}
+
+fn retained_account_for_space(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+) -> Result<(String, String, bool), AccountError> {
+    let identity: Option<(String, String, Option<bool>)> = conn
+        .query_row(
+            "SELECT a.issuer,a.subject,s.issuer=a.issuer AND s.subject=a.subject
+             FROM account_identities a
+             LEFT JOIN sync_spaces s ON s.instance=a.instance AND s.space=?2
+             WHERE a.instance=?1",
+            params![instance, space],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| AccountError::new("cannot inspect offline account identity"))?;
+    let (issuer, subject, matches_activation) = identity
+        .filter(|(issuer, subject, _)| !issuer.is_empty() && !subject.is_empty())
+        .ok_or_else(|| {
+            AccountError::new("offline account identity is missing; local data retained")
+        })?;
+    if matches_activation == Some(false) {
         return Err(AccountError::new(
             "retained Space identity differs from offline account; local data retained",
         ));
     }
-    Ok(())
+    Ok((issuer, subject, matches_activation == Some(true)))
 }
 
 pub(crate) fn unpin(
@@ -10325,15 +10308,14 @@ pub(crate) fn version(
     space: &str,
     path: &[String],
     id: &str,
-    owner: Option<(&str, &str)>,
+    owner: (&str, &str),
 ) -> Result<Option<FileVersion>, AccountError> {
     let (name, parent) = path
         .split_last()
         .ok_or_else(|| AccountError::new("invalid pinned path"))?;
     let entries = match directory_snapshot_at(storage_root, instance, space, parent)? {
         Some(entries) => entries,
-        None if owner.is_some() => offline_directory(storage_root, instance, space, parent, owner)?,
-        None => return Ok(None),
+        None => offline_directory(storage_root, instance, space, parent, Some(owner))?,
     };
     let roots = pins(storage_root, instance, space, false)?
         .into_iter()

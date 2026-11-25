@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -122,7 +123,7 @@ def child(root):
         if bus_dir:
             env["CIRRUS_TEST_USER_BUS_DIR"] = str(bus_dir)
         with (root / (runtime + "-daemon.log")).open("w") as log:
-            process = subprocess.Popen([str(BINARY)], env=env, stdout=subprocess.DEVNULL, stderr=log)
+            process = subprocess.Popen([str(service_binary())], env=env, stdout=subprocess.DEVNULL, stderr=log)
         daemons[runtime] = process
         for _ in range(150):
             if cli(runtime, "--status").returncode == 0:
@@ -360,7 +361,7 @@ def child(root):
         url = f"https://localhost:{server.server_port}/"
         account = dict(instance=url, issuer=url + "issuer", client_id="lab", token_endpoint=url + "token",
                        subject="lab", ca_pem=(root / "ca.pem").read_text(), access_token="lab-access",
-                       refresh_token="lab-refresh", expires_at=0, refresh_in_progress=False, selected_space="space")
+                       refresh_token="lab-refresh", expires_at=0, refresh_in_progress=False)
         require(run(["secret-tool", "store", "--label=cirrus-lab", "application", "cirrus-drive",
                      "instance", url], input=json.dumps(account)), "saving disposable account")
         start_daemon("one")
@@ -459,26 +460,26 @@ def child(root):
                      "instance", url], input=json.dumps(saved_account)), "restoring disposable account")
         state["crash_refresh"] = False
         require(cli("one", "--spaces", url), "using restored disposable account")
-        rejected = cli("one", "--ls", url)
-        assert rejected.returncode and "reselect your Space" in rejected.stderr
-        require(cli("one", "--select-space", url, "space"), "reselecting user-scoped Space")
         print("PASS: independent buses and runtimes share ownership; dead-owner fence blocked stale token", flush=True)
 
-        listing = require(cli("one", "--ls", url), "browsing disposable DAV metadata")
+        listing = require(cli("one", "--ls-space", url, "space"), "browsing DAV metadata without selecting a Space")
         assert "folder" in listing.stdout and "item.txt" in listing.stdout
         state["space_visible"] = False
-        assert cli("one", "--ls", url).returncode == 0, "fixture must still allow DAV"
-        rejected = cli("one", "--mount", url, mountpoint)
-        assert rejected.returncode and "no longer in the signed-in user's listing" in rejected.stderr
+        propfinds_before = state["propfind_requests"]
+        rejected = cli("one", "--ls-space", url, "space")
+        assert rejected.returncode and "requested Space is not in the authenticated listing" in rejected.stderr
+        rejected = cli("one", "--mount-space", url, "space", mountpoint)
+        assert rejected.returncode and "requested Space is not in the authenticated listing" in rejected.stderr
+        assert state["propfind_requests"] == propfinds_before, "unlisted Space reached DAV"
         assert not mountpoint.is_mount()
         state["space_visible"] = True
         state["space_status"] = 403
-        rejected = cli("one", "--mount", url, mountpoint)
+        rejected = cli("one", "--mount-space", url, "space", mountpoint)
         assert rejected.returncode and "denied access to Spaces" in rejected.stderr
         assert not mountpoint.is_mount()
         state["space_status"] = 200
         state["space_partial"] = True
-        rejected = cli("one", "--mount", url, mountpoint)
+        rejected = cli("one", "--mount-space", url, "space", mountpoint)
         assert rejected.returncode and "listing was interrupted" in rejected.stderr
         assert not mountpoint.is_mount()
         state["space_partial"] = False
@@ -498,18 +499,25 @@ def child(root):
         unsafe = root / "nonempty"
         unsafe.mkdir(mode=0o700)
         (unsafe / "keep").write_text("unrelated")
-        assert cli("one", "--mount", url, unsafe).returncode != 0
+        assert cli("one", "--mount-space", url, "space", unsafe).returncode != 0
         assert (unsafe / "keep").read_text() == "unrelated"
-        assert cli("one", "--mount", url).returncode != 0
-        assert not (root / "cirrus").exists(), "CLI created an implicit mountpoint"
-        require(cli("one", "--mount", url, mountpoint), "mounting disposable metadata fixture")
-        assert "mounted:" in require(cli("one", "--mount-status"), "mount status").stdout
+        require(cli("one", "--mount-space", url, "space", mountpoint), "mounting disposable metadata fixture")
+        mounted_rows = [json.loads(line) for line in require(cli("one", "--mounts"), "mount status").stdout.splitlines()]
+        assert [(row["instance"], row["space_id"], row["path"], row["state"]) for row in mounted_rows] == [
+            (url, "space", str(mountpoint), "Mounted")]
+        # The bound mount still reaches DAV when Graph omits its ID, unlike a new explicit request.
+        state["space_visible"] = False
+        propfinds_before = state["propfind_requests"]
         assert set(os.listdir(mountpoint)) == {"folder", "item.txt"}
-        # A separate daemon can change shared account selection. The existing
-        # mount must keep routing both reads and mutations to its original Space.
+        assert state["propfind_requests"] > propfinds_before, "fixture must still allow DAV"
+        state["space_visible"] = True
+        # Explicitly browse B in the mounted daemon; A's reads and mutations must stay bound to A.
         state["second_space"] = True
-        require(cli("two", "--select-space", url, "other-space"), "selecting another disposable Space")
-        require(cli("one", "--spaces", url), "refreshing mounted daemon account state")
+        other_dav_before = state["other_dav_requests"]
+        listing = require(cli("one", "--ls-space", url, "other-space"), "browsing the second disposable Space")
+        assert [row.rsplit("\t", 1)[-1] for row in listing.stdout.splitlines()] == ["other.txt"], listing.stdout
+        assert state["other_dav_requests"] > other_dav_before, "explicit browse did not reach the second Space"
+        other_dav_before = state["other_dav_requests"]
         assert (mountpoint / "item.txt").read_bytes() == state["content"]
         os.mkdir(mountpoint / "still-original")
         assert (mountpoint / "still-original").is_dir()
@@ -519,7 +527,7 @@ def child(root):
         assert (mountpoint / "still-original" / "edit.txt").read_bytes() == b"retained in the original Space"
         os.unlink(mountpoint / "still-original" / "edit.txt")
         os.rmdir(mountpoint / "still-original")
-        assert state["other_dav_requests"] == 0, "mount contacted the newly selected Space"
+        assert state["other_dav_requests"] == other_dav_before, "first mount contacted the second Space"
         stored = require(run(["secret-tool", "lookup", "application", "cirrus-drive", "instance", url]),
                          "reading disposable account for identity-change check")
         saved = json.loads(stored.stdout)
@@ -531,10 +539,10 @@ def child(root):
         with sqlite3.connect(database) as db:
             db.execute("DELETE FROM account_identities WHERE instance=?", (url,))
         try:
-            rejected = cli("one", "--sync", url)
+            rejected = cli("one", "--sync-space", url, "space")
             assert rejected.returncode and "offline account identity is missing" in rejected.stderr, rejected.stderr
             require(cli("two", "--spaces", url), "refreshing the account with missing offline identity")
-            rejected = cli("two", "--ls", url)
+            rejected = cli("two", "--ls-space", url, "space")
             assert rejected.returncode and "offline account identity is missing" in rejected.stderr, rejected.stderr
         finally:
             with sqlite3.connect(database) as db:
@@ -548,10 +556,10 @@ def child(root):
             raise AssertionError("an open mount wrote using a stale account identity")
         except OSError as error:
             assert error.errno == errno.EIO, error
-        rejected = cli("one", "--sync", url)
+        rejected = cli("one", "--sync-space", url, "space")
         assert rejected.returncode and "offline state belongs to another account" in rejected.stderr, rejected.stderr
         require(cli("two", "--spaces", url), "refreshing replacement account in second daemon")
-        rejected = cli("two", "--ls", url)
+        rejected = cli("two", "--ls-space", url, "space")
         assert rejected.returncode and "offline state belongs to another account" in rejected.stderr, rejected.stderr
         require(run(["secret-tool", "store", "--label=cirrus-lab", "application", "cirrus-drive",
                      "instance", url], input=json.dumps(saved)), "restoring disposable account identity")
@@ -570,8 +578,6 @@ def child(root):
         require(run(["secret-tool", "store", "--label=cirrus-lab", "application", "cirrus-drive",
                      "instance", url], input=json.dumps(saved)), "restoring disposable account identity")
         require(cli("one", "--spaces", url), "refreshing restored account identity")
-        require(cli("two", "--select-space", url, "space"), "restoring disposable Space selection")
-        require(cli("one", "--spaces", url), "refreshing restored account state")
         assert set(os.listdir(mountpoint)) == {"folder", "item.txt"}
         second_mountpoint = root / "second-mount"
         second_mountpoint.mkdir(mode=0o700)
@@ -593,8 +599,8 @@ def child(root):
         assert (second_mountpoint / "both.txt").read_bytes() == b"second Space"
         require(cli("one", "--pin-space", url, "other-space", "/other.txt"), "pinning the second Space")
         pins = require(cli("one", "--pins-space", url, "other-space"), "listing second Space pins").stdout
-        assert "available offline\t/other.txt" in pins, pins
-        assert "/other.txt" not in require(cli("one", "--pins", url), "checking selected Space pins").stdout
+        assert "available offline (local state; remote not checked)\t/other.txt" in pins, pins
+        assert "/other.txt" not in require(cli("one", "--pins-space", url, "space"), "checking first Space pins").stdout
         require(cli("one", "--unpin-space", url, "other-space", "/other.txt"), "unpinning the second Space")
         source = root / "explicit-stage-source"
         source.write_bytes(b"explicit Space staging")
@@ -608,12 +614,37 @@ def child(root):
         os.unlink(mountpoint / "both.txt")
         os.unlink(second_mountpoint / "both.txt")
         assert cli("one", "--mount-space", url, "other-space", second_mountpoint).returncode != 0
-        assert cli("one", "--unmount-space", url, "missing-space").returncode != 0
+        rejected = cli("one", "--unmount-space", url, "missing-space")
+        assert rejected.returncode and "Space is not mounted" in rejected.stderr, rejected.stderr
         assert mountpoint.is_mount() and second_mountpoint.is_mount()
-        assert cli("one", "--unmount").returncode != 0, "ambiguous unmount succeeded"
+        after_refusal = require(cli("one", "--mounts"), "checking both mounts after wrong Space refusal")
+        assert [json.loads(line) for line in after_refusal.stdout.splitlines()] == mounted_rows
         require(cli("one", "--unmount-space", url, "other-space"), "unmounting only the second Space")
         assert not second_mountpoint.is_mount() and mountpoint.is_mount()
-        assert [json.loads(line)["space_id"] for line in require(cli("one", "--mounts"), "listing remaining mount").stdout.splitlines()] == ["space"]
+        remaining = require(cli("one", "--mounts"), "listing remaining mount").stdout
+        assert [json.loads(line)["space_id"] for line in remaining.splitlines()] == ["space"]
+        # The second Space was mounted online and its root retained. Only a
+        # custom path may resume it without a fresh Graph listing.
+        port = server.server_port
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        server = thread = None
+        with socket.socket() as probe:
+            probe.settimeout(2)
+            assert probe.connect_ex(("127.0.0.1", port)) == errno.ECONNREFUSED, "fixture socket did not refuse connection"
+        rejected = cli("one", "--mount-space", url, "other-space")
+        assert rejected.returncode and "Space request failed" in rejected.stderr, rejected.stderr
+        assert not (root / "Other").exists(), "offline pathless request created a default mountpoint"
+        assert require(cli("one", "--mounts"), "checking pathless refusal left mounts unchanged").stdout == remaining
+        require(cli("one", "--mount-space", url, "other-space", second_mountpoint), "resuming the retained Space at a custom path")
+        assert second_mountpoint.is_mount() and mountpoint.is_mount()
+        require(cli("one", "--unmount-space", url, "other-space"), "unmounting the resumed Space")
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        print("PASS: refused socket allows custom-path resume but not a pathless mount or default directory creation", flush=True)
         require(cli("one", "--mount-space", url, "other-space", second_mountpoint), "remounting second Space before crash")
         daemons["one"].kill()
         daemons["one"].wait(timeout=5)
@@ -639,8 +670,12 @@ def child(root):
         blocked = cli("one", "--mount-space", url, "space", mountpoint)
         assert blocked.returncode and "stale or ambiguous" in blocked.stderr, blocked.stderr
         require(cli("one", "--recover-mount", second_mountpoint), "recovering second crashed Space")
-        require(cli("one", "--mount", url, mountpoint), "remounting after two-Space crash recovery")
-        assert "folder" in require(cli("one", "--ls", url), "checking unchanged selection").stdout
+        require(cli("one", "--mount-space", url, "space", mountpoint), "remounting after two-Space crash recovery")
+        assert "folder" in require(cli("one", "--ls-space", url, "space"), "browsing the recovered first Space").stdout
+        stored = require(run(["secret-tool", "lookup", "application", "cirrus-drive", "instance", url]),
+                         "checking that explicit requests did not persist a selection")
+        persisted = json.loads(stored.stdout)
+        assert "selected_space" not in persisted and "selected_space_verified" not in persisted
         cache_events = [{"t": 1.0, "key": "nav-Offline"}, {"t": 2.0, "key": "cache-status"}]
         (root / "ui-cache-events.json").write_text(json.dumps(cache_events))
         require(run([str(UI), "--script", str(root / "ui-cache-events.json"),
@@ -707,7 +742,7 @@ def child(root):
                      "--tree", str(root / "ui-recover-space-tree.json"), "--size", "900x1600", "--at", "6"], env=ui_env),
                 "recovering a Space from Rune")
         assert not other_record_path.exists()
-        require(cli("one", "--mount", url, mountpoint), "remounting after independent recovery")
+        require(cli("one", "--mount-space", url, "space", mountpoint), "remounting after independent recovery")
         print("PASS: recovery removes only the matching mount owner record", flush=True)
         file_path = mountpoint / "item.txt"
         # Use a fresh representation so earlier mounts cannot satisfy the network-fault probes from disk.
@@ -954,9 +989,9 @@ def child(root):
             assert len(os.listdir(mountpoint)) == 1000
         state["bulk"] = None
         assert os.listdir(mountpoint) == ["renamed"]
-        require(cli("one", "--unmount"), "normal unmount")
+        require(cli("one", "--unmount-space", url, "space"), "normal unmount")
         assert not list((runtime_root / "one").glob("cirrus-drive.mount-*"))
-        require(cli("one", "--mount", url, mountpoint), "remounting disposable fixture")
+        require(cli("one", "--mount-space", url, "space", mountpoint), "remounting disposable fixture")
         daemons["one"].send_signal(signal.SIGKILL)
         daemons["one"].wait(timeout=5)
         start_daemon("one")
@@ -979,7 +1014,7 @@ def child(root):
             record_path.write_text(original_record)
         require(cli("one", "--recover-mount", mountpoint), "recovering crashed mount")
         assert not list((runtime_root / "one").glob("cirrus-drive.mount-*"))
-        require(cli("one", "--mount", url, mountpoint), "mounting after crash recovery")
+        require(cli("one", "--mount-space", url, "space", mountpoint), "mounting after crash recovery")
         daemons["one"].kill()
         daemons["one"].wait(timeout=5)
         start_daemon("one")
@@ -996,14 +1031,14 @@ def child(root):
                      "--size", "460x580", "--at", "5"], env=env), "Rune recovery flow")
         assert "Recorded stale mount recovered" in (root / "ui-tree.json").read_text()
         assert not list((runtime_root / "one").glob("cirrus-drive.mount-*"))
-        require(cli("one", "--mount", url, mountpoint), "mounting after Rune recovery")
+        require(cli("one", "--mount-space", url, "space", mountpoint), "mounting after Rune recovery")
         require(cli("one", "--stop"), "normal stop with mount")
         daemons["one"].wait(timeout=5)
         if os.environ.get("CIRRUS_LAB_FAULT") == "1":
             for stage, resume in (("prepared", True), ("prepared", False), ("mounted", False)):
                 start_daemon("one", fault=stage)
                 mount_client = subprocess.Popen(
-                    [str(BINARY), "--mount", url, str(mountpoint)],
+                    [str(BINARY), "--mount-space", url, "space", str(mountpoint)],
                     env=dict(os.environ, XDG_RUNTIME_DIR=str(runtime_root / "one"),
                              DBUS_SESSION_BUS_ADDRESS=session_buses["one"][1]),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1047,7 +1082,7 @@ def child(root):
                     if stage == "prepared":
                         assert (mountpoint / "keep").read_text() == "unchanged"
                         (mountpoint / "keep").unlink()
-                    require(cli("one", "--mount", url, mountpoint), "mounting after pre-identity recovery")
+                    require(cli("one", "--mount-space", url, "space", mountpoint), "mounting after pre-identity recovery")
                     require(cli("one", "--stop"), "stopping after pre-identity recovery")
                     daemons["one"].wait(timeout=5)
                 finally:
@@ -1064,18 +1099,18 @@ def child(root):
         require(cli("two", "--spaces", url), "reusing the refreshed account session")
         assert state["refreshes"] == refreshes_before + 1, "repeated token rotation after successful refresh"
         state["reject_second_access"] = True
-        require(cli("two", "--sync", url), "refreshing a rejected account session before sync")
+        require(cli("two", "--sync-space", url, "space"), "refreshing a rejected account session before sync")
         assert state["refreshes"] == refreshes_before + 2
         refreshed = require(run(["secret-tool", "lookup", "application", "cirrus-drive", "instance", url]),
                             "checking sync token persistence")
         assert json.loads(refreshed.stdout)["refresh_token"] == "lab-refresh-third"
         state["file_present"] = True
         state["reject_propfind_token"] = "lab-access-third"
-        listing = require(cli("two", "--ls", url), "refreshing rejected DAV directory credentials")
+        listing = require(cli("two", "--ls-space", url, "space"), "refreshing rejected DAV directory credentials")
         assert "item.txt" in listing.stdout
         assert state["refreshes"] == refreshes_before + 3
         state["etag"] = '"refresh-range-test"'  # Force actual range requests rather than cached hits.
-        require(cli("two", "--mount", url, mountpoint), "mounting for rejected range credentials")
+        require(cli("two", "--mount-space", url, "space", mountpoint), "mounting for rejected range credentials")
         try:
             with open(mountpoint / "item.txt", "rb", buffering=0) as file:
                 state["reject_range_token"] = "lab-access-fourth"
@@ -1100,11 +1135,11 @@ def child(root):
                 assert results == {offset: state["content"][offset:offset + 16] for offset in (31000, 41000)}, results
                 assert state["refreshes"] == refreshes_before + 5, "concurrent rejections rotated the token more than once"
         finally:
-            require(cli("two", "--unmount"), "unmounting after rejected range credentials")
+            require(cli("two", "--unmount-space", url, "space"), "unmounting after rejected range credentials")
         refreshed = require(run(["secret-tool", "lookup", "application", "cirrus-drive", "instance", url]),
                             "checking DAV token persistence")
         assert json.loads(refreshed.stdout)["refresh_token"] == "lab-refresh-sixth"
-        print("PASS: rejected selection, Retry-After, sync and concurrent DAV token refresh", flush=True)
+        print("PASS: rejected Space access, Retry-After, scoped sync and concurrent DAV token refresh", flush=True)
         require(cli("two", "--stop"), "stopping second daemon")
         daemons["two"].wait(timeout=5)
         print("PASS: mount safety, metadata snapshots, churn, errors, unmount and CLI/Rune crash recovery", flush=True)
@@ -1133,15 +1168,27 @@ def child(root):
         stop_process(keyring)
 
 
+def service_binary():
+    return BINARY.with_name("cirrus-drive-service")
+
+
+def check_lab_binaries(directory):
+    for name in ("cirrus-daemon", "cirrus-drive-service"):
+        binary = directory / name
+        if os.access(binary, os.X_OK):
+            capability = run([str(binary), "--lab-capabilities"])
+            if capability.returncode == 0 and capability.stdout.strip() == "cirrus-drive disposable account and mount lab v1":
+                continue
+        raise SystemExit("build the disposable lab binaries first: cargo build --locked -p cirrus-cli -p cirrus-daemon --features fault-injection")
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--child":
         child(Path(sys.argv[2]))
         return
-    if not BINARY.is_file() or not UI.is_file():
+    if not BINARY.is_file() or not service_binary().is_file() or not UI.is_file():
         raise SystemExit("build first: cargo build --workspace --locked")
-    capability = run([str(BINARY), "--lab-capabilities"])
-    if capability.returncode or capability.stdout.strip() != "cirrus-drive disposable account and mount lab v1":
-        raise SystemExit("build the disposable lab binary first: cargo build --locked -p cirrus-daemon --features fault-injection")
+    check_lab_binaries(BINARY.parent)
     if sys.argv[1:] not in ([], ["--fault-injection"]):
         raise SystemExit("usage: check-nonread-lab.py [--fault-injection]")
     # The runtime requires O_TMPFILE, which is unavailable on some project filesystems.
@@ -1168,10 +1215,9 @@ def main():
         env["CIRRUS_LAB_FAULT"] = "1"
     try:
         shutil.copy2(BINARY, root / "cirrus-daemon")
+        shutil.copy2(service_binary(), root / "cirrus-drive-service")
         shutil.copy2(UI, root / "cirrus-ui")
-        copied = run([str(root / "cirrus-daemon"), "--lab-capabilities"])
-        if copied.returncode or copied.stdout.strip() != "cirrus-drive disposable account and mount lab v1":
-            raise RuntimeError("copied daemon lacks disposable lab isolation")
+        check_lab_binaries(root)
         config = root / "user-bus.conf"
         config.write_text('<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN" '
                           '"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">'

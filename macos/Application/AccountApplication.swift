@@ -14,13 +14,6 @@ struct RestoredFinderDomains: Decodable, Sendable {
     let unavailable: Int
 }
 
-struct ApplicationBindingIdentity: Decodable, Sendable {
-    let instance: String
-    let space: String
-    let issuer: String
-    let subject: String
-}
-
 final class ApplicationAttempt: RetainedHandle {
     convenience init() throws {
         var pointer: UnsafeMutableRawPointer?
@@ -66,7 +59,7 @@ extension RetainedCore {
         guard let pointer else { throw RetainedError.internalFailure }
         return ApplicationSpaces(taking: pointer)
     }
-    func bindOnline(instance: String, space: String) throws -> RetainedBinding {
+    func bindOnline(instance: String, space: String) throws -> ApplicationMountBinding {
         onOwnerThread()
         var pointer: UnsafeMutableRawPointer?
         try withRetainedText(instance) { instance in
@@ -75,30 +68,14 @@ extension RetainedCore {
             }
         }
         guard let pointer else { throw RetainedError.internalFailure }
-        return RetainedBinding(taking: pointer)
+        return ApplicationMountBinding(taking: pointer)
     }
 }
 
-extension RetainedBinding {
+final class ApplicationMountBinding: RetainedHandle {
     func prepareFinderDomain() throws -> FinderDomainDescriptor {
         try readJSON { buffer, capacity, written in
             cirrus_application_domain_prepare(raw, buffer, capacity, written)
         }
-    }
-    func currentIdentity() throws -> ApplicationBindingIdentity {
-        try readJSON { buffer, capacity, written in
-            cirrus_application_binding(raw, buffer, capacity, written)
-        }
-    }
-    func observe(path: [String], parentID: String) throws -> RetainedListing {
-        onOwnerThread()
-        var pointer: UnsafeMutableRawPointer?
-        try withRetainedText(try encodedPath(path)) { path in
-            try withRetainedText(parentID) {
-                try checked(cirrus_application_list(raw, path, $0, &pointer))
-            }
-        }
-        guard let pointer else { throw RetainedError.internalFailure }
-        return RetainedListing(taking: pointer)
     }
 }

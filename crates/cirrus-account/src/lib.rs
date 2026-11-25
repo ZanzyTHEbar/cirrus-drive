@@ -26,8 +26,14 @@ mod native_bridge;
 #[cfg(all(test, target_os = "macos"))]
 mod native_storage_acceptance;
 
+#[cfg(all(test, target_os = "linux"))]
+mod mount_start_tests;
+
 #[cfg(all(test, target_os = "linux", feature = "fault-injection"))]
 mod provider_reconciliation_acceptance;
+
+#[cfg(all(test, target_os = "linux"))]
+mod retained_import_acceptance;
 
 #[cfg(test)]
 mod sign_in_acceptance;
@@ -157,111 +163,11 @@ pub struct Space {
     name: String,
 }
 
-/// Stored clean-range payload usage across all accounts and Spaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CleanCacheStatus {
-    /// Bytes in cached range bodies, excluding SQLite overhead and other local data.
-    pub bytes: u64,
-    /// Number of stored clean ranges.
-    pub ranges: u64,
-    /// Maximum total range-body bytes.
-    pub byte_limit: u64,
-    /// Maximum number of stored clean ranges.
-    pub range_limit: u64,
-}
-
-/// One locally recorded operation and its current observed state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JournalEntry {
-    /// Monotonic local journal ID.
-    pub id: i64,
-    /// Space-relative path as displayed to the user.
-    pub path: String,
-    /// Stable Space ID.
-    pub space: String,
-    /// Locally recorded operation type.
-    pub operation: String,
-    /// Staging filename or namespace operation token.
-    pub token: String,
-    /// Locally observed state, not a guarantee of current remote content.
-    pub state: JournalState,
-    /// Diagnostic recorded with this operation, if any.
-    pub detail: Option<String>,
-}
-
-/// Locally recorded operation state, optionally annotated with current upload activity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JournalState {
-    /// Waiting for synchronization.
-    Pending,
-    /// This daemon still considers the write active after reading the journal snapshot.
-    Uploading,
-    /// A conflict requires inspection.
-    Conflict,
-    /// An outcome is uncertain or an operation is still in progress.
-    UncertainOrInProgress,
-    /// Historically confirmed, without a guarantee about current remote state.
-    Synced,
-    /// Locally acknowledged or superseded.
-    Resolved,
-}
-
-impl JournalEntry {
-    /// Formats the local state, Space, token and diagnostic for display.
-    pub fn status(&self) -> String {
-        let state = match self.state {
-            JournalState::Pending => "pending",
-            JournalState::Uploading => "uploading",
-            JournalState::Conflict => "conflict",
-            JournalState::UncertainOrInProgress => "uncertain or operation in progress",
-            JournalState::Synced => "synced",
-            JournalState::Resolved => "resolved",
-        };
-        format!(
-            "{state} (Space {}, {} {}){}",
-            self.space,
-            if self.operation == "write" {
-                "staged file"
-            } else {
-                self.operation.as_str()
-            },
-            self.token,
-            self.detail
-                .as_ref()
-                .map_or_else(String::new, |value| format!(": {value}"))
-        )
-    }
-}
-
-/// A bounded page of journal entries in descending journal-ID order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JournalPage {
-    /// Counts for the requested account or Space at the same local database snapshot.
-    pub summary: JournalSummary,
-    /// Entries in this page.
-    pub entries: Vec<JournalEntry>,
-    /// Exclusive cursor for an older page, if one exists.
-    pub next_before: Option<i64>,
-}
-
-/// Journal counts for the requested scope; uncertain includes operations in progress.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JournalSummary {
-    /// Operations waiting to run.
-    pub pending: u64,
-    /// Operations requiring conflict inspection.
-    pub conflict: u64,
-    /// Uncertain outcomes or operations currently in progress.
-    pub uncertain_or_in_progress: u64,
-    /// Historically confirmed operations, not a current remote-state guarantee.
-    pub synced: u64,
-    /// Locally acknowledged or superseded operations.
-    pub resolved: u64,
-}
+pub use cirrus_api::{CleanCacheStatus, JournalEntry, JournalPage, JournalState, JournalSummary};
+use cirrus_api::{
+    PinAvailability, PinInfo, PinRemoteEvidence, RetainedPage, RetainedPin, RetainedPinCopy,
+    RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
+};
 
 /// A mount's account and Space binding, verified online or from retained activation.
 #[derive(Clone)]
@@ -274,6 +180,15 @@ pub struct MountBinding {
     subject: String,
     offline: bool,
     offline_writable: bool,
+}
+
+/// Startup work remaining for an explicit mount; both outcomes use a normal RW binding.
+#[derive(Clone, Copy, Debug)]
+pub enum MountStartup {
+    /// Preflight the live binding and activate synchronization after mounting.
+    Normal,
+    /// Retained root preflight is complete; leave the existing activation alone.
+    Resumed,
 }
 
 /// One complete cached-session observation and its exact local confirmations.
@@ -462,6 +377,37 @@ struct ReadSession {
     client: reqwest::blocking::Client,
 }
 
+#[derive(Clone, Copy)]
+enum SessionAccess<'a> {
+    Online,
+    BoundOnline(&'a MountBinding),
+    BoundSaved(&'a MountBinding),
+}
+
+impl<'a> SessionAccess<'a> {
+    fn for_space(binding: &'a MountBinding, allow_saved: bool) -> Self {
+        if allow_saved {
+            Self::BoundSaved(binding)
+        } else {
+            Self::BoundOnline(binding)
+        }
+    }
+
+    fn check(
+        self,
+        root: &account_storage::StorageRoot,
+        base: &Url,
+        account: &AccountData,
+    ) -> Result<(), AccountError> {
+        match self {
+            Self::Online => Ok(()),
+            Self::BoundOnline(binding) | Self::BoundSaved(binding) => {
+                check_bound_account(root, base, account, binding)
+            }
+        }
+    }
+}
+
 enum CredentialState {
     Idle,
     Active(HashMap<String, AccountData>),
@@ -471,41 +417,102 @@ enum CredentialState {
     },
 }
 
-fn verified_selection(account: &AccountData) -> Result<&str, AccountError> {
-    let selected = account
-        .selected_space
-        .as_deref()
-        .ok_or_else(|| AccountError::new("no Space is selected"))?;
-    if account.selected_space_verified.as_deref() != Some(selected) {
+fn check_bound_account(
+    root: &account_storage::StorageRoot,
+    base: &Url,
+    account: &AccountData,
+    binding: &MountBinding,
+) -> Result<(), AccountError> {
+    if binding.root.identity() != root.identity() {
+        return Err(AccountError::new("mount storage root changed"));
+    }
+    if binding.offline {
         return Err(AccountError::new(
-            "reselect your Space from the signed-in user's listing before accessing it",
+            "offline mount is read-only and cannot authenticate",
         ));
     }
-    Ok(selected)
+    if binding.instance != base.as_str()
+        || binding.issuer != account.issuer
+        || binding.subject != account.subject
+    {
+        return Err(AccountError::new("mounted account identity changed"));
+    }
+    Ok(())
 }
 
 fn bound_space<'a>(
-    session: &'a ReadSession,
-    binding: Option<&'a MountBinding>,
+    session: &ReadSession,
+    binding: &'a MountBinding,
 ) -> Result<&'a str, AccountError> {
-    if let Some(binding) = binding {
-        if binding.root.identity() != session.root.identity() {
-            return Err(AccountError::new("mount storage root changed"));
-        }
-        if binding.offline {
-            return Err(AccountError::new(
-                "offline mount is read-only and cannot authenticate",
-            ));
-        }
-        if binding.instance != session.base.as_str()
-            || binding.issuer != session.account.issuer
-            || binding.subject != session.account.subject
-        {
-            return Err(AccountError::new("mounted account identity changed"));
-        }
-        return Ok(&binding.space);
+    check_bound_account(&session.root, &session.base, &session.account, binding)?;
+    Ok(&binding.space)
+}
+
+enum DirectorySnapshotPublication {
+    Cli,
+    Mount,
+    NonTurnSync,
+}
+
+enum DirectoryAccess<'a> {
+    Cli(&'a MountBinding),
+    Mount(&'a MountBinding, &'a str),
+}
+
+fn check_stage_file_path(path: &[String]) -> Result<(), AccountError> {
+    if path.is_empty()
+        || path.len() > 128
+        || path.iter().any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.contains('/')
+                || part.chars().any(char::is_control)
+        })
+    {
+        return Err(AccountError::new("invalid Space path"));
     }
-    verified_selection(&session.account)
+    Ok(())
+}
+
+fn accept_directory_snapshot_save(
+    saved: Result<bool, AccountError>,
+    publication: DirectorySnapshotPublication,
+    session: &ReadSession,
+    space: &str,
+    path: &[String],
+    entries: &DirectorySnapshot,
+) -> Result<(), AccountError> {
+    use DirectorySnapshotPublication::{Mount, NonTurnSync};
+
+    const STALE: &str = "directory metadata changed concurrently; retry";
+    let rejection = match (&publication, saved) {
+        (_, Ok(true)) => return Ok(()),
+        (NonTurnSync, Ok(false)) => AccountError::retryable_read(STALE),
+        (_, Ok(false)) => AccountError::new(STALE),
+        (Mount | NonTurnSync, Err(error)) if error.storage_busy => error,
+        (_, Err(error)) => return Err(error),
+    };
+    // A stale observation or an optional copy blocked by a peer can keep the
+    // validated online result only if durable metadata proves it is compatible.
+    if !offline::directory_copy_compatible(
+        session.base.as_str(),
+        space,
+        path,
+        entries,
+        &session.account.issuer,
+        &session.account.subject,
+    )? {
+        return Err(rejection);
+    }
+    #[cfg(feature = "fault-injection")]
+    if rejection.storage_busy
+        && matches!(publication, NonTurnSync)
+        && std::env::var_os("CIRRUS_TEST_NAMESPACE_TRACE").is_some()
+    {
+        eprintln!("cirrus lab manual snapshot cache skipped: State lease busy path={path:?}");
+    }
+    Ok(())
 }
 
 struct ReadPermit<'a>(&'a Accounts);
@@ -1131,10 +1138,11 @@ impl Accounts {
         self.read_ahead_active.store(false, Ordering::Release);
     }
 
-    /// Evicts clean ranges under a Space path without touching pins or staged edits.
+    /// Evicts clean ranges under an explicit retained Space path without credentials or network.
+    /// Leaves pins and staged edits intact; does not assert current remote authorization.
     ///
     /// # Errors
-    /// Returns an error if the account, path or cache cannot be validated.
+    /// Refuses missing or mismatched retained identity, an unproven Space, or an unsafe cache.
     pub fn evict_space(
         &self,
         instance: &str,
@@ -1155,12 +1163,14 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid Space path"));
         }
-        let session = self.read_session(instance)?;
+        let instance = Self::canonical_instance(instance)?;
+        let root = self.storage_root()?;
+        self.check_cancelled()?;
         let _guard = self
             .clean_cache_update
             .lock()
             .map_err(|_| AccountError::new("cache is unavailable"))?;
-        cache::evict(&session, space, path)?;
+        cache::evict_in(&root, &instance, space, path)?;
         self.clean_cache_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -1328,12 +1338,6 @@ impl Accounts {
             refresh_token: refresh.secret().to_owned(),
             expires_at: expiry,
             refresh_in_progress: false,
-            selected_space: existing
-                .as_ref()
-                .and_then(|account| account.selected_space.clone()),
-            selected_space_verified: existing
-                .as_ref()
-                .and_then(|account| account.selected_space_verified.clone()),
         };
         offline::bind_identity_in(
             _guard.storage_root()?,
@@ -1361,80 +1365,14 @@ impl Accounts {
         self.account_spaces(&base, &mut account, &store, &client)
     }
 
-    /// Selects a Space only after it appears in a fresh authenticated listing.
-    ///
-    /// # Errors
-    /// Returns an error if the account, listing or requested Space cannot be verified.
-    pub fn select_space(&self, instance: &str, id: &str) -> Result<(), AccountError> {
-        let _guard = self.begin_operation()?;
-        self.clear_read_session()?;
-        let store = Store::open(_guard.credential_context()?)?;
-        let (base, _) = http::instance_and_ca(instance, None)?;
-        _guard.persist_pending(&store, base.as_str())?;
-        let mut account = store.load(base.as_str())?;
-        let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
-        self.refresh_if_needed(&mut account, &store, &client)?;
-        let spaces = self.account_spaces(&base, &mut account, &store, &client)?;
-        if !spaces.iter().any(|space| space.id == id) {
-            return Err(AccountError::new(
-                "selected Space is not in the authenticated listing",
-            ));
-        }
-        self.check_cancelled()?;
-        account.selected_space = Some(id.to_owned());
-        account.selected_space_verified = Some(id.to_owned());
-        store.save(&account)?;
-        Ok(())
-    }
-
-    /// Checks the selected Space against the current user-scoped listing before mounting.
-    ///
-    /// A previously verified selection remains usable offline when the server cannot be
-    /// reached. Protocol, authentication and permission failures are never treated as offline.
-    ///
-    /// # Errors
-    /// Returns an error for an unverified selection or a failed online access check.
-    pub fn check_mount_access(&self, instance: &str) -> Result<MountBinding, AccountError> {
-        let session = self.read_session(instance)?;
-        let selected = bound_space(&session, None)?;
-        let (listing, offline_allowed) = match list_spaces(
-            &session.base,
-            &session.account.access_token,
-            &session.client,
-            &self.cancelled,
-        ) {
-            Err(error) if error.unauthorized => (self.spaces(instance), false),
-            result => (result, true),
-        };
-        match listing {
-            Ok(spaces) if spaces.iter().any(|space| space.id == selected) => {}
-            Ok(_) => {
-                return Err(AccountError::new(
-                    "selected Space is no longer in the signed-in user's listing; select an accessible Space",
-                ));
-            }
-            Err(error) if offline_allowed && error.network => {}
-            Err(error) => return Err(error),
-        };
-        Ok(MountBinding {
-            root: session.root.clone(),
-            instance: session.base.to_string(),
-            space: selected.to_owned(),
-            name: None,
-            issuer: session.account.issuer.clone(),
-            subject: session.account.subject.clone(),
-            offline: false,
-            offline_writable: false,
-        })
-    }
-
-    /// Verifies and binds an explicitly requested Space without changing selection.
+    /// Verifies and binds an explicitly requested Space.
     ///
     /// # Errors
     /// Returns an error unless a fresh authenticated listing contains the Space.
     pub fn bind_space(&self, instance: &str, id: &str) -> Result<MountBinding, AccountError> {
-        let session = self.read_session(instance)?;
-        let spaces = self.read_with_refresh(&session, |current| {
+        let session =
+            self.read_session_in(&self.storage_root()?, instance, SessionAccess::Online)?;
+        let spaces = self.read_with_refresh(&session, SessionAccess::Online, |current| {
             list_spaces(
                 &current.base,
                 &current.account.access_token,
@@ -1442,33 +1380,147 @@ impl Accounts {
                 &self.cancelled,
             )
         })?;
-        let found = spaces.iter().find(|space| space.id == id).ok_or_else(|| {
-            AccountError::new("requested Space is not in the authenticated listing")
-        })?;
-        let name = (spaces
-            .iter()
-            .filter(|space| space.name == found.name)
-            .count()
-            == 1)
-            .then(|| found.name.clone());
-        Ok(MountBinding {
-            root: session.root.clone(),
-            instance: session.base.to_string(),
-            space: id.to_owned(),
-            name,
-            issuer: session.account.issuer.clone(),
-            subject: session.account.subject.clone(),
-            offline: false,
-            offline_writable: false,
-        })
+        Ok(explicit_space_binding(
+            &session,
+            id,
+            unique_space_name(&spaces, id)?,
+        ))
     }
 
-    /// Lists one directory in the selected Space without hydrating file contents.
+    /// Prepares an explicit-path mount, allowing resume only on initial Graph transport loss.
     ///
     /// # Errors
-    /// Returns an error when the account, selected Space or complete DAV listing is invalid.
-    pub fn directory(&self, instance: &str, path: &[String]) -> Result<Vec<Entry>, AccountError> {
-        self.directory_inner(instance, None, path, None)?.collect()
+    /// Refuses unavailable credentials, unverified live membership or incompatible retained state.
+    pub fn bind_mount_space(
+        &self,
+        instance: &str,
+        id: &str,
+    ) -> Result<(MountBinding, MountStartup), AccountError> {
+        // Reload the configured principal under ownership before trying Graph.
+        // A cached read session alone is not authority to resume an activation.
+        let guard = self.begin_operation()?;
+        self.clear_read_session()?;
+        let (base, _) = http::instance_and_ca(instance, None)?;
+        let store = Store::open(guard.credential_context()?)?;
+        guard.persist_pending(&store, base.as_str())?;
+        let account = store.load(base.as_str())?;
+        let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
+        let mut session = ReadSession {
+            root: guard.storage_root()?.clone(),
+            base,
+            account,
+            client,
+        };
+        let binding = self.mount_start(&mut session, id, |session| {
+            self.refresh_if_needed(&mut session.account, &store, &session.client)
+        });
+        if binding.as_ref().is_err_and(|error| !error.network) {
+            self.invalidate_mount_metadata();
+        }
+        let binding = binding?;
+        self.check_cancelled()?;
+        self.publish_read_session(&guard, Arc::new(session))?;
+        Ok(binding)
+    }
+
+    fn mount_start(
+        &self,
+        session: &mut ReadSession,
+        id: &str,
+        refresh: impl FnOnce(&mut ReadSession) -> Result<(), AccountError>,
+    ) -> Result<(MountBinding, MountStartup), AccountError> {
+        let account = &session.account;
+        if account.refresh_in_progress {
+            return Err(AccountError::new(
+                "previous token refresh was interrupted; reconnect the account",
+            ));
+        }
+        if account.access_token.is_empty() || account.refresh_token.is_empty() {
+            return Err(AccountError::new("account credentials are incomplete"));
+        }
+        if id.is_empty() || id.chars().any(char::is_control) {
+            return Err(AccountError::new("invalid Space ID"));
+        }
+        let near_expiry = account.expires_at
+            <= SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| AccountError::new("system clock is invalid"))?
+                .as_secs()
+                .saturating_add(30);
+        let initial = graph_listing(
+            &session.base,
+            &account.access_token,
+            &session.client,
+            &self.cancelled,
+        );
+        let (name, rejected) = match initial {
+            Ok(spaces) => (unique_space_name(&spaces, id)?, false),
+            Err(GraphListingError::InitialTransport(_)) => {
+                self.storage.validate(&session.root)?;
+                offline::offline_directory(
+                    &session.root,
+                    session.base.as_str(),
+                    id,
+                    &[],
+                    Some((&account.issuer, &account.subject)),
+                )?;
+                return Ok((
+                    explicit_space_binding(session, id, None),
+                    MountStartup::Resumed,
+                ));
+            }
+            Err(GraphListingError::Other(error)) if error.unauthorized => (None, true),
+            Err(error) => return Err(error.into_account_error()),
+        };
+        offline::bind_identity_in(
+            &session.root,
+            session.base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
+        let name = if near_expiry || rejected {
+            // The first probe already reached Graph. A refresh or subsequent
+            // listing cannot grant retained startup, even on a transport error.
+            if rejected {
+                session.account.expires_at = 0;
+            }
+            self.check_cancelled()?;
+            let spaces = refresh(session)
+                .and_then(|()| {
+                    list_spaces(
+                        &session.base,
+                        &session.account.access_token,
+                        &session.client,
+                        &self.cancelled,
+                    )
+                })
+                .map_err(|mut error| {
+                    error.network = false;
+                    error
+                })?;
+            unique_space_name(&spaces, id)?
+        } else {
+            name
+        };
+        Ok((
+            explicit_space_binding(session, id, name),
+            MountStartup::Normal,
+        ))
+    }
+
+    /// Lists a directory in a freshly verified Space without hydrating file contents.
+    ///
+    /// # Errors
+    /// Refuses an unlisted Space, changed account or invalid directory observation.
+    pub fn directory_space(
+        &self,
+        instance: &str,
+        space: &str,
+        path: &[String],
+    ) -> Result<Vec<Entry>, AccountError> {
+        let binding = self.bind_space(instance, space)?;
+        self.directory_inner(instance, DirectoryAccess::Cli(&binding), path)?
+            .collect()
     }
 
     /// Inspects saved metadata and local entries in a previously mounted Space.
@@ -1589,7 +1641,7 @@ impl Accounts {
                 Some((&space.issuer, &space.subject)),
             );
         }
-        self.directory_inner(instance, Some(space), path, Some(parent_id))
+        self.directory_inner(instance, DirectoryAccess::Mount(space, parent_id), path)
     }
 
     /// Observes one mounted directory without keyring access, token refresh or retries.
@@ -1640,7 +1692,7 @@ impl Accounts {
             return Ok(None);
         };
         self.storage.validate(&session.root)?;
-        let space = bound_space(&session, Some(binding))?;
+        let space = bound_space(&session, binding)?;
         offline::verify_identity_in(
             &session.root,
             session.base.as_str(),
@@ -1726,7 +1778,11 @@ impl Accounts {
             self.verify_offline_mount(binding)?;
             return self.confirmed_mount_versions_local(binding, versions, entries);
         }
-        let session = self.read_session_in(&binding.root, binding.instance())?;
+        let session = self.read_session_in(
+            &binding.root,
+            binding.instance(),
+            SessionAccess::BoundSaved(binding),
+        )?;
         self.confirmed_mount_versions_in(&session, binding, versions, entries)
     }
 
@@ -1737,7 +1793,7 @@ impl Accounts {
         versions: &[FileVersion],
         entries: &DirectorySnapshot,
     ) -> Result<Vec<(FileVersion, FileVersion)>, AccountError> {
-        bound_space(session, Some(binding))?;
+        bound_space(session, binding)?;
         self.confirmed_mount_versions_local(binding, versions, entries)
     }
 
@@ -1805,7 +1861,11 @@ impl Accounts {
             self.verify_offline_mount(binding)?;
             return self.confirmed_mount_directories_local(binding, directories, entries);
         }
-        let session = self.read_session_in(&binding.root, binding.instance())?;
+        let session = self.read_session_in(
+            &binding.root,
+            binding.instance(),
+            SessionAccess::BoundSaved(binding),
+        )?;
         self.confirmed_mount_directories_in(&session, binding, directories, entries)
     }
 
@@ -1816,7 +1876,7 @@ impl Accounts {
         directories: &[(Vec<String>, String)],
         entries: &DirectorySnapshot,
     ) -> Result<Vec<(Vec<String>, String, Entry)>, AccountError> {
-        bound_space(session, Some(binding))?;
+        bound_space(session, binding)?;
         self.confirmed_mount_directories_local(binding, directories, entries)
     }
 
@@ -1859,13 +1919,22 @@ impl Accounts {
     fn directory_inner(
         &self,
         instance: &str,
-        expected_space: Option<&MountBinding>,
+        access: DirectoryAccess<'_>,
         path: &[String],
-        parent_id: Option<&str>,
     ) -> Result<DirectorySnapshot, AccountError> {
+        let (binding, parent_id, publication) = match access {
+            DirectoryAccess::Cli(binding) => (binding, None, DirectorySnapshotPublication::Cli),
+            DirectoryAccess::Mount(binding, parent_id) => (
+                binding,
+                Some(parent_id),
+                DirectorySnapshotPublication::Mount,
+            ),
+        };
+        let cli = matches!(publication, DirectorySnapshotPublication::Cli);
         let _permit = self.read_permit()?;
-        let session = self.read_session_bound(instance, expected_space)?;
-        let space = bound_space(&session, expected_space)?;
+        let session_access = SessionAccess::BoundSaved(binding);
+        let session = self.read_session_in(&binding.root, instance, session_access)?;
+        let space = bound_space(&session, binding)?;
         let observation = offline::begin_snapshot_in(&session.root)?;
         let (remote_path, move_fenced) =
             offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
@@ -1880,7 +1949,7 @@ impl Accounts {
             offline::directory_snapshot_at(&session.root, session.base.as_str(), space, path)?
                 .ok_or_else(|| AccountError::new("directory rename requires attention"))?
         } else {
-            match self.read_with_refresh(&session, |current| {
+            match self.read_with_refresh(&session, session_access, |current| {
                 dav::directory_snapshot_in(
                     &current.root,
                     &current.base,
@@ -1901,7 +1970,7 @@ impl Accounts {
                     // CLI publication is required rather than best-effort.
                     // Queue behind local readers only after DAV, before SQL
                     // planning; retain the original observation's CAS fence.
-                    let _state_turn = if expected_space.is_none() {
+                    let _state_turn = if cli {
                         Some(ownership::local_state_turn_in(
                             &session.root,
                             Arc::clone(&self.cancelled),
@@ -1922,46 +1991,21 @@ impl Accounts {
                         &entries,
                     );
                     #[cfg(feature = "fault-injection")]
-                    if expected_space.is_none()
+                    if cli
                         && saved.as_ref().is_err_and(|error| error.storage_busy)
                         && let Some(marker) =
                             std::env::var_os("CIRRUS_TEST_CLI_SNAPSHOT_BLOCKED_MARKER")
                     {
                         let _ = std::fs::write(marker, b"refused");
                     }
-                    // Mounted readers may race each other for optional
-                    // offline-copy publication. Keep the complete online
-                    // result, with parent identity checked above; staging's
-                    // own State admission/CAS still decides any local write.
-                    // Explicit CLI publication still refuses peer ownership.
-                    if matches!(saved, Ok(false))
-                        && !offline::directory_copy_compatible(
-                            session.base.as_str(),
-                            space,
-                            path,
-                            &entries,
-                            &session.account.issuer,
-                            &session.account.subject,
-                        )?
-                    {
-                        return Err(AccountError::new(
-                            "directory metadata changed concurrently; retry",
-                        ));
-                    }
-                    if let Err(error) = saved
-                        && !(expected_space.is_some()
-                            && error.storage_busy
-                            && offline::directory_copy_compatible(
-                                session.base.as_str(),
-                                space,
-                                path,
-                                &entries,
-                                &session.account.issuer,
-                                &session.account.subject,
-                            )?)
-                    {
-                        return Err(error);
-                    }
+                    accept_directory_snapshot_save(
+                        saved,
+                        publication,
+                        &session,
+                        space,
+                        path,
+                        &entries,
+                    )?;
                     entries
                 }
                 Err(error) if error.network => {
@@ -1980,7 +2024,7 @@ impl Accounts {
                     }
                     if let Some(saved) = saved {
                         saved
-                    } else if expected_space.is_some() {
+                    } else if !cli {
                         // A queued MOVE's destination exists in the projected
                         // ancestor view, not the raw remote parent. Reuse its
                         // exact identity/copy proof, never an orphan fallback.
@@ -2000,19 +2044,6 @@ impl Accounts {
         };
         offline::apply_staged_entries(session.base.as_str(), space, path, &mut entries)?;
         Ok(entries)
-    }
-
-    /// Captures a fresh identity and strong ETag for an experimental read-only open.
-    ///
-    /// # Errors
-    /// Returns an error if the file, account, identity or strong validator cannot be verified.
-    pub fn open_file(
-        &self,
-        instance: &str,
-        path: &[String],
-        id: &str,
-    ) -> Result<FileVersion, AccountError> {
-        self.open_file_inner(&self.storage_root()?, instance, None, path, id, true)
     }
 
     /// Opens a file within the Space bound to a mount.
@@ -2050,14 +2081,13 @@ impl Accounts {
                 checksums: entry.checksums().to_vec(),
             });
         }
-        self.open_file_inner(&space.root, instance, Some(space), path, id, true)
+        self.open_file_inner(instance, space, path, id, true)
     }
 
     fn open_file_inner(
         &self,
-        storage: &account_storage::StorageRoot,
         instance: &str,
-        expected_space: Option<&MountBinding>,
+        binding: &MountBinding,
         path: &[String],
         id: &str,
         allow_offline: bool,
@@ -2066,8 +2096,13 @@ impl Accounts {
             .split_last()
             .ok_or_else(|| AccountError::new("invalid file path"))?;
         let _permit = self.read_permit()?;
-        let session = self.read_session_in(storage, instance)?;
-        let space = bound_space(&session, expected_space)?;
+        let access = SessionAccess::for_space(binding, allow_offline);
+        let session = self.read_session_in(&binding.root, instance, access)?;
+        let space = bound_space(&session, binding)?;
+        let principal = (
+            session.account.issuer.as_str(),
+            session.account.subject.as_str(),
+        );
         if id.starts_with("cirrus-staged:") {
             if !offline::publication::spaces_in(&session.root, session.base.as_str(), Some(space))?
                 .is_empty()
@@ -2100,19 +2135,14 @@ impl Accounts {
                 space,
                 path,
                 id,
-                expected_space.map(|_| {
-                    (
-                        session.account.issuer.as_str(),
-                        session.account.subject.as_str(),
-                    )
-                }),
+                principal,
             )?
             .ok_or_else(|| AccountError::new("directory rename requires attention"));
         }
         let (_, remote_parent) = remote_path
             .split_last()
             .ok_or_else(|| AccountError::new("invalid file path"))?;
-        let entries = match self.read_with_refresh(&session, |current| {
+        let entries = match self.read_with_refresh(&session, access, |current| {
             dav::directory_snapshot_in(
                 &current.root,
                 &current.base,
@@ -2130,12 +2160,7 @@ impl Accounts {
                     space,
                     path,
                     id,
-                    expected_space.map(|_| {
-                        (
-                            session.account.issuer.as_str(),
-                            session.account.subject.as_str(),
-                        )
-                    }),
+                    principal,
                 )? {
                     return Ok(version);
                 }
@@ -2148,7 +2173,7 @@ impl Accounts {
                     space,
                     parent,
                 )?;
-                let saved = if saved.is_none() && expected_space.is_some() {
+                let saved = if saved.is_none() {
                     Some(offline::offline_directory(
                         &session.root,
                         session.base.as_str(),
@@ -2220,13 +2245,14 @@ impl Accounts {
         &self,
         storage: &account_storage::StorageRoot,
         instance: &str,
-        binding: Option<&MountBinding>,
+        binding: &MountBinding,
         path: &[String],
         save: bool,
         pin_root: &[String],
     ) -> Result<DirectorySnapshot, AccountError> {
         let _permit = self.read_permit()?;
-        let session = self.read_session_in(storage, instance)?;
+        let access = SessionAccess::BoundOnline(binding);
+        let session = self.read_session_in(storage, instance, access)?;
         let space = bound_space(&session, binding)?;
         let snapshot = if save {
             Some(offline::begin_pin_snapshot_in(
@@ -2238,7 +2264,7 @@ impl Accounts {
         } else {
             None
         };
-        let entries = self.read_with_refresh(&session, |current| {
+        let entries = self.read_with_refresh(&session, access, |current| {
             dav::directory_snapshot_in(
                 &current.root,
                 &current.base,
@@ -2261,15 +2287,7 @@ impl Accounts {
         Ok(entries)
     }
 
-    /// Pins one file or a bounded directory tree for experimental offline use.
-    ///
-    /// # Errors
-    /// Returns an error if traversal, validation, checksum verification or durable storage fails.
-    pub fn pin(&self, instance: &str, root: &[String]) -> Result<(), AccountError> {
-        self.pin_inner(instance, None, root)
-    }
-
-    /// Pins a path in an explicitly verified Space without changing selection.
+    /// Pins a path in an explicitly verified Space.
     ///
     /// # Errors
     /// Refuses active staging, unavailable retained originals, or an unverifiable Space or pin.
@@ -2280,15 +2298,6 @@ impl Accounts {
         root: &[String],
     ) -> Result<(), AccountError> {
         let binding = self.bind_space(instance, space)?;
-        self.pin_inner(instance, Some(&binding), root)
-    }
-
-    fn pin_inner(
-        &self,
-        instance: &str,
-        binding: Option<&MountBinding>,
-        root: &[String],
-    ) -> Result<(), AccountError> {
         if root.len() > 128
             || root.iter().any(|part| {
                 part.is_empty()
@@ -2300,31 +2309,31 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid Space path"));
         }
-        let session = self.read_session_bound(instance, binding)?;
-        let space = bound_space(&session, binding)?.to_owned();
+        let access = SessionAccess::BoundOnline(&binding);
+        let session = self.read_session_in(&binding.root, instance, access)?;
+        let space = bound_space(&session, &binding)?;
         let instance = session.base.to_string();
-        offline::check_pin_path(&session.root, &instance, &space, root)?;
+        offline::check_pin_path(&session.root, &instance, space, root)?;
         let local_state = offline::current_pin_local_state(&session.root)?;
         let mut retries = 0;
         loop {
             let result = self
-                .collect_pin_files(&session.root, &instance, binding, root, true)
+                .collect_pin_files(&session.root, &instance, &binding, root, true)
                 .and_then(|tree| {
                     offline::replace_pin(
                         &session.root,
-                        (&self.runtime, &self.cancelled, &instance, &space),
+                        (&self.runtime, &self.cancelled, &instance, space),
                         root,
                         &tree,
                         (retries != 0).then_some(&local_state),
                         |version, offset, length| {
-                            self.read_range_online(&session.root, version, binding, offset, length)
+                            self.read_range_online(&binding, version, offset, length, false)
                                 .map(|(bytes, _metadata)| bytes)
                         },
                         |version| {
                             if self.open_file_inner(
-                                &session.root,
                                 &version.instance,
-                                binding,
+                                &binding,
                                 &version.path,
                                 &version.id,
                                 false,
@@ -2338,7 +2347,7 @@ impl Accounts {
                             if self.collect_pin_files(
                                 &session.root,
                                 &instance,
-                                binding,
+                                &binding,
                                 root,
                                 false,
                             )? != tree
@@ -2367,7 +2376,7 @@ impl Accounts {
         &self,
         storage: &account_storage::StorageRoot,
         instance: &str,
-        binding: Option<&MountBinding>,
+        binding: &MountBinding,
         root: &[String],
         save: bool,
     ) -> Result<PinTree, AccountError> {
@@ -2398,14 +2407,7 @@ impl Accounts {
                 directories.push(root.to_vec());
             } else {
                 is_dir = false;
-                files.push(self.open_file_inner(
-                    storage,
-                    instance,
-                    binding,
-                    root,
-                    entry.id(),
-                    false,
-                )?);
+                files.push(self.open_file_inner(instance, binding, root, entry.id(), false)?);
             }
         } else {
             is_dir = true;
@@ -2438,7 +2440,6 @@ impl Accounts {
                         directories.push(child);
                     } else {
                         files.push(self.open_file_inner(
-                            storage,
                             instance,
                             binding,
                             &child,
@@ -2456,14 +2457,6 @@ impl Accounts {
             directories: directory_versions,
             files,
         })
-    }
-
-    /// Protects retained original bytes locally before removing a pin.
-    ///
-    /// # Errors
-    /// Refuses active staging, unavailable originals or insufficient durable storage.
-    pub fn unpin(&self, instance: &str, root: &[String]) -> Result<(), AccountError> {
-        self.unpin_inner(instance, None, root)
     }
 
     /// Removes only the named local pin, without credentials or network access.
@@ -2485,39 +2478,7 @@ impl Accounts {
         offline::unpin(&storage_root, base.as_str(), space, root, &self.cancelled)
     }
 
-    fn unpin_inner(
-        &self,
-        instance: &str,
-        binding: Option<&MountBinding>,
-        root: &[String],
-    ) -> Result<(), AccountError> {
-        let session = self.read_session_bound(instance, binding)?;
-        let space = bound_space(&session, binding)?;
-        let _owner = ownership::acquire_offline_exclusive_in(&session.root, &self.runtime)?;
-        offline::unpin(
-            &session.root,
-            session.base.as_str(),
-            space,
-            root,
-            &self.cancelled,
-        )
-    }
-
-    /// Durably stages a local file and records an observed base version when available.
-    ///
-    /// # Errors
-    /// Returns an error if the path, source, account or durable state is unsafe.
-    pub fn stage_file(
-        &self,
-        instance: &str,
-        path: &[String],
-        source: &std::path::Path,
-    ) -> Result<(), AccountError> {
-        self.stage_file_inner(instance, None, path, source)
-            .map(|_| ())
-    }
-
-    /// Stages a local file in an explicitly verified Space without changing selection.
+    /// Stages a local file in an explicitly verified Space.
     ///
     /// # Errors
     /// Returns an error if the Space, source or durable state cannot be verified.
@@ -2528,81 +2489,67 @@ impl Accounts {
         path: &[String],
         source: &std::path::Path,
     ) -> Result<(), AccountError> {
+        check_stage_file_path(path)?;
+        let _priority = self.request_foreground();
         let binding = self.bind_space(instance, space)?;
-        self.stage_file_inner(instance, Some(&binding), path, source)
+        let session =
+            self.read_session_in(&binding.root, instance, SessionAccess::BoundSaved(&binding))?;
+        self.stage_observed_file(&session, &binding, path, source)
             .map(|_| ())
     }
 
-    /// Streams a file into durable staging and returns its exact journal correlation.
+    /// Imports an entire local file using retained account, Space and parent evidence.
+    /// Does not access credentials, contact the server or activate a Space.
     ///
     /// # Errors
-    /// Refuses unsafe source paths, changed principal/Space or failed publication.
-    /// This uses the normal engine source import; it is not remote completion.
-    pub fn stage_file_operation(
+    /// Refuses missing or changed retained evidence, competing ownership or unsafe imports.
+    pub fn stage_file_offline_space(
         &self,
         instance: &str,
         space: &str,
         path: &[String],
         source: &std::path::Path,
-    ) -> Result<OperationHandle, AccountError> {
-        let binding = self.bind_space(instance, space)?;
-        self.stage_file_inner(instance, Some(&binding), path, source)
+    ) -> Result<(), AccountError> {
+        check_stage_file_path(path)?;
+        let (base, _) = http::instance_and_ca(instance, None)?;
+        if space.is_empty() || space.chars().any(char::is_control) {
+            return Err(AccountError::new("invalid offline Space"));
+        }
+        let root = self.storage_root()?;
+        // Share mounted staging ownership without loading credentials. Changes
+        // of principal still require EX; the journal arbitrates sync races.
+        let _priority = self.request_foreground();
+        let _owner = ownership::acquire_offline_in(&root, &self.runtime)?;
+        self.check_cancelled()?;
+        let _state_turn = ownership::local_state_turn_in(&root, Arc::clone(&self.cancelled))?;
+        offline::stage_file(
+            &root,
+            (base.as_str(), space),
+            path,
+            source,
+            offline::ImportEvidence::Retained,
+            &self.cancelled,
+        )
+        .map(|_| ())
     }
 
-    fn stage_file_inner(
+    fn stage_observed_file(
         &self,
-        instance: &str,
-        binding: Option<&MountBinding>,
+        session: &ReadSession,
+        binding: &MountBinding,
         path: &[String],
         source: &std::path::Path,
     ) -> Result<OperationHandle, AccountError> {
-        if path.is_empty()
-            || path.len() > 128
-            || path.iter().any(|part| {
-                part.is_empty()
-                    || part == "."
-                    || part == ".."
-                    || part.contains('/')
-                    || part.chars().any(char::is_control)
-            })
-        {
-            return Err(AccountError::new("invalid Space path"));
-        }
-        let (base, _) = http::instance_and_ca(instance, None)?;
-        let root = if let Some(binding) = binding {
-            self.storage.validate(&binding.root)?;
-            binding.root.clone()
-        } else {
-            self.storage_root()?
-        };
-        let guard = self.begin_operation_in(&root)?;
-        let store = Store::open(guard.credential_context()?)?;
-        guard.persist_pending(&store, base.as_str())?;
-        let account = store.load(base.as_str())?;
-        offline::bind_identity_in(
-            guard.storage_root()?,
-            base.as_str(),
-            &account.issuer,
-            &account.subject,
-        )?;
-        let space = if let Some(binding) = binding {
-            if binding.root.identity() != guard.storage_root()?.identity()
-                || binding.instance != base.as_str()
-                || binding.issuer != account.issuer
-                || binding.subject != account.subject
-            {
-                return Err(AccountError::new("account identity changed"));
-            }
-            binding.space.as_str()
-        } else {
-            verified_selection(&account)?
-        };
-        let observation = offline::begin_snapshot_in(guard.storage_root()?).ok();
-        let (remote_path, uncertain) =
-            offline::tree_remote_path(guard.storage_root()?, base.as_str(), space, path)?;
-        if uncertain {
-            return Err(AccountError::new("directory rename requires attention"));
-        }
+        let ReadSession {
+            root,
+            base,
+            account,
+            ..
+        } = session;
+        check_bound_account(root, base, account, binding)?;
+        let space = binding.space.as_str();
+        let _owner = self.begin_local_operation(session, true)?;
+        let _state_turn = ownership::local_state_turn_in(root, Arc::clone(&self.cancelled))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -2611,30 +2558,28 @@ impl Accounts {
             && now.is_some_and(|now| account.expires_at > now.saturating_add(30))
             && let Ok(client) = http::client(account.ca_pem.as_deref().map(str::as_bytes))
         {
-            for depth in 0..path.len().saturating_sub(1) {
+            for depth in 0..path.len() {
+                self.check_cancelled()?;
                 let logical = &path[..depth];
-                if offline::local_directory(guard.storage_root()?, base.as_str(), space, logical)? {
+                if offline::local_directory(root, base.as_str(), space, logical)? {
                     continue;
                 }
-                let (remote, fenced) = offline::tree_remote_path(
-                    guard.storage_root()?,
-                    base.as_str(),
-                    space,
-                    logical,
-                )?;
+                let (remote, fenced) =
+                    offline::tree_remote_path(root, base.as_str(), space, logical)?;
                 if fenced {
                     return Err(AccountError::new("directory rename requires attention"));
                 }
-                let observation = offline::begin_snapshot_in(guard.storage_root()?)?;
+                let observation = offline::begin_snapshot_in(root)?;
                 if let Ok(entries) = dav::directory_snapshot_in(
-                    guard.storage_root()?,
-                    &base,
+                    root,
+                    base,
                     space,
                     &remote,
                     &account.access_token,
                     &client,
                 ) {
-                    let _ = offline::save_directory_snapshot(
+                    let _state_phase = ownership::admit_local_state_turn_in(root)?;
+                    offline::save_directory_snapshot(
                         observation,
                         base.as_str(),
                         space,
@@ -2644,42 +2589,16 @@ impl Accounts {
                 }
             }
         }
-        let parents =
-            offline::observed_parent_identities(guard.storage_root()?, base.as_str(), space, path)?;
-        let entries = if !account.refresh_in_progress
-            && now.is_some_and(|now| account.expires_at > now.saturating_add(30))
-            && let Ok(client) = http::client(account.ca_pem.as_deref().map(str::as_bytes))
-            && let Some((name, parent)) = remote_path.split_last()
-            && let Ok(entries) = dav::directory_snapshot_in(
-                guard.storage_root()?,
-                &base,
-                space,
-                parent,
-                &account.access_token,
-                &client,
-            ) {
-            if let (Some(observation), Some((_, logical_parent))) = (observation, path.split_last())
-            {
-                let _ = offline::save_directory_snapshot(
-                    observation,
-                    base.as_str(),
-                    space,
-                    logical_parent,
-                    &entries,
-                );
-            }
-            entries.get(name)?
-        } else {
-            None
-        };
         offline::stage_file(
-            guard.storage_root()?,
-            base.as_str(),
-            space,
+            root,
+            (base.as_str(), space),
             path,
             source,
-            entries.as_ref(),
-            &parents,
+            offline::ImportEvidence::Online {
+                issuer: &account.issuer,
+                subject: &account.subject,
+            },
+            &self.cancelled,
         )
     }
 
@@ -2762,8 +2681,12 @@ impl Accounts {
                 parents,
             );
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         if base.is_some_and(|version| {
             version.instance != session.base.as_str()
                 || version.space != space
@@ -2869,7 +2792,11 @@ impl Accounts {
                 local_observation: None,
             });
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("CIRRUS_TEST_FILE_RENAME_ADMISSION_TRACE").is_some() {
             eprintln!(
@@ -2878,7 +2805,7 @@ impl Accounts {
                 std::thread::current().id()
             );
         }
-        let space = bound_space(&session, Some(expected_space))?;
+        let space = bound_space(&session, expected_space)?;
         if source.instance != session.base.as_str() || source.space != space {
             return Err(AccountError::new(
                 "file version does not match mounted Space",
@@ -3110,8 +3037,12 @@ impl Accounts {
             )?;
             return Ok(relocated);
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         #[cfg(feature = "fault-injection")]
         wait_test_window("CIRRUS_TEST_LOCAL_TREE_SESSION_WINDOW")?;
         let _guard = self.begin_owned_local_operation(&session)?;
@@ -3275,8 +3206,12 @@ impl Accounts {
                 relocated,
             });
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         let guard = self.begin_owned_local_operation(&session)?;
         // As for empty-directory preparation, keep exclusive cross-process
         // ownership but allow this daemon's local staging during DAV work.
@@ -3456,8 +3391,12 @@ impl Accounts {
         {
             return Err(AccountError::new("invalid Space path"));
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         let guard = self.begin_owned_local_operation(&session)?;
         // Keep the same cross-process credential/namespace ownership as before,
         // but admit this daemon's identity-checked local staging while DAV is
@@ -3549,8 +3488,12 @@ impl Accounts {
         expected_space: &MountBinding,
         path: &[String],
     ) -> Result<bool, AccountError> {
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         offline::any_unresolved_beneath(&session.root, session.base.as_str(), space, path)
     }
 
@@ -3627,8 +3570,12 @@ impl Accounts {
                 Some(expected_space),
             );
         }
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         let _guard = self.begin_local_operation(&session, false)?;
         let (_, uncertain) =
             offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
@@ -3660,8 +3607,12 @@ impl Accounts {
         detached: bool,
         parents: &[DirectoryIdentity],
     ) -> Result<(), AccountError> {
-        let session = self.read_session_in(&expected_space.root, instance)?;
-        let space = bound_space(&session, Some(expected_space))?;
+        let session = self.read_session_in(
+            &expected_space.root,
+            instance,
+            SessionAccess::BoundSaved(expected_space),
+        )?;
+        let space = bound_space(&session, expected_space)?;
         let _guard = self.begin_local_operation(&session, false)?;
         offline::remove_staged(
             &session.root,
@@ -3744,8 +3695,12 @@ impl Accounts {
                 Some(binding),
             );
         }
-        let session = self.read_session_in(&binding.root, &version.instance)?;
-        if bound_space(&session, Some(binding))? != version.space {
+        let session = self.read_session_in(
+            &binding.root,
+            &version.instance,
+            SessionAccess::BoundSaved(binding),
+        )?;
+        if bound_space(&session, binding)? != version.space {
             return Err(AccountError::new(
                 "file version does not match mounted Space",
             ));
@@ -3797,10 +3752,10 @@ impl Accounts {
         &self,
         instance: &str,
         offset: u32,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    ) -> Result<RetainedPage<RetainedPin>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let storage = self.storage_root()?;
-        recovery::list(&storage, base.as_str(), None, offset)
+        recovery::pins(&storage, base.as_str(), offset)
     }
 
     /// Lists immutable displaced pin copies by independent local ID.
@@ -3811,7 +3766,7 @@ impl Accounts {
         &self,
         instance: &str,
         offset: u32,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    ) -> Result<RetainedPage<RetainedPinCopy>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let storage = self.storage_root()?;
         recovery::pin_copies(&storage, base.as_str(), offset)
@@ -3827,7 +3782,7 @@ impl Accounts {
         space: &str,
         id: i64,
         offset: u32,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    ) -> Result<RetainedPage<RetainedPinCopyEntry>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let storage = self.storage_root()?;
         recovery::pin_copy_entries(&storage, base.as_str(), space, id, offset)
@@ -3882,7 +3837,7 @@ impl Accounts {
         &self,
         instance: &str,
         offset: u32,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    ) -> Result<RetainedPage<RetainedStaged>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let storage = self.storage_root()?;
         recovery::staged_list(&storage, base.as_str(), offset)
@@ -3904,8 +3859,7 @@ impl Accounts {
         recovery::staged_export(&storage, base.as_str(), id, selector, destination)
     }
 
-    /// Lists retained file metadata for one pin. Each value is a selector,
-    /// newline, and the stored version JSON; the selector is not validation.
+    /// Lists retained file metadata for one pin. The selector is not validation.
     ///
     /// # Errors
     /// Returns an error if the instance, path or local database is invalid.
@@ -3915,10 +3869,10 @@ impl Accounts {
         space: &str,
         root: &[String],
         offset: u32,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    ) -> Result<RetainedPage<RetainedPinFile>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         let storage = self.storage_root()?;
-        recovery::list(&storage, base.as_str(), Some((space, root)), offset)
+        recovery::files(&storage, base.as_str(), space, root, offset)
     }
 
     /// Exports a retained, possibly stale, version to a new local file.
@@ -3967,18 +3921,16 @@ impl Accounts {
             .map(|_| ())
     }
 
-    /// Runs one write-transfer turn in a freshly authenticated, explicitly named Space.
+    /// Runs one explicit upload step for the Linux fault-injection lab.
     ///
-    /// Admits at most one pending PUT or one durable GET-only continuation. Read-back
-    /// uses at most eight HTTP requests (at most 1 MiB) with five-second admission
-    /// and a 15-second request timeout, not a hard five-second wall-clock deadline.
-    /// Authentication, listing and journal/parent preflight are not time-bounded.
-    /// Namespace work and conflict-copy creation require ordinary explicit sync.
-    /// Ownership is released on every return. This does not enable a scheduler.
+    /// Stops at the first bounded PUT/verification boundary so the lab can
+    /// inspect durable state before manual sync or a restart.
     ///
     /// # Errors
     /// Returns an error for invalid input, account ownership, authentication or storage.
-    pub fn write_turn(
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn lab_upload_step(
         &self,
         instance: &str,
         space: &str,
@@ -3986,7 +3938,7 @@ impl Accounts {
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
         }
-        match self.sync_pending_in(instance, Some(space), executor::Mode::Write) {
+        match self.sync_pending_in(instance, Some(space), executor::Mode::LabUploadStep) {
             Err(error) if error.network => Ok(WriteTurnOutcome::Retry),
             result => result,
         }
@@ -4010,7 +3962,11 @@ impl Accounts {
         mode: executor::Mode,
     ) -> Result<WriteTurnOutcome, AccountError> {
         let _sync_guard = ownership::acquire_sync_in(root, &self.runtime)?;
-        let mut session = self.read_session_in(root, instance)?.as_ref().clone();
+        let access = SessionAccess::Online;
+        let mut session = self
+            .read_session_in(root, instance, access)?
+            .as_ref()
+            .clone();
         let result = self.sync_pending_once(&mut session, requested_space, mode);
         if mode != executor::Mode::Automatic
             || !result
@@ -4029,7 +3985,10 @@ impl Accounts {
         executor::preflight_checkpoint()?;
         offline::database_in(&session.root)?.execute("DELETE FROM sync_reads WHERE operation_id IN (SELECT id FROM operation_journal WHERE instance=?1 AND (?2 IS NULL OR space=?2))", rusqlite::params![session.base.as_str(),requested_space])
             .map_err(|_| AccountError::new("cannot invalidate rejected sync preflight"))?;
-        session = self.refresh_rejected_session(&session)?.as_ref().clone();
+        session = self
+            .refresh_rejected_session(&session, access)?
+            .as_ref()
+            .clone();
         self.check_cancelled()?;
         executor::preflight_checkpoint()?;
         // One renewed turn only. A second 401 is Attention, not an endless
@@ -4044,12 +4003,17 @@ impl Accounts {
         requested_space: Option<&str>,
         mode: executor::Mode,
     ) -> Result<WriteTurnOutcome, AccountError> {
-        let bounded = mode != executor::Mode::Manual;
         let mut guard = self.begin_operation_in(&session.root)?;
         self.clear_read_session()?;
         let store = Store::open(guard.credential_context()?)?;
         guard.persist_pending(&store, session.base.as_str())?;
-        session.account = store.load(session.base.as_str())?;
+        let account = store.load(session.base.as_str())?;
+        if account.issuer != session.account.issuer || account.subject != session.account.subject {
+            return Err(AccountError::new(
+                "account changed while starting sync; retry",
+            ));
+        }
+        session.account = account;
         if mode == executor::Mode::Automatic {
             offline::verify_identity_in(
                 &session.root,
@@ -4079,14 +4043,6 @@ impl Accounts {
                 error.retryable_read = true;
                 error
             })?;
-        }
-        if mode != executor::Mode::Automatic
-            && session.account.selected_space.is_some()
-            && session.account.selected_space != session.account.selected_space_verified
-        {
-            return Err(AccountError::new(
-                "reselect your Space from the signed-in user's listing before accessing it",
-            ));
         }
         if mode == executor::Mode::Manual
             && let Some(space) = requested_space
@@ -4153,6 +4109,10 @@ impl Accounts {
         if mode == executor::Mode::Manual {
             self.resume_mutations(session, requested_space)?;
         }
+        #[cfg(feature = "fault-injection")]
+        let bounded = mode == executor::Mode::LabUploadStep;
+        #[cfg(not(feature = "fault-injection"))]
+        let bounded = false;
         let allowed = |id: &str| spaces.iter().any(|space| space.id == id);
         let in_scope = |id: &str| requested_space.is_none_or(|requested| requested == id);
         let check = |id: &str| {
@@ -4561,6 +4521,15 @@ impl Accounts {
                         "pending",
                         Some("remote rejected the precondition; local copy retained"),
                     )?;
+                    if offline::write_needs_attention(
+                        &session.root,
+                        session.base.as_str(),
+                        &operation,
+                    )? {
+                        blocked.insert(operation.space.clone());
+                        rejected_upload = true;
+                        continue;
+                    }
                     if bounded {
                         return Ok(WriteTurnOutcome::Dependencies);
                     }
@@ -4737,7 +4706,7 @@ impl Accounts {
         }
         if rejected_upload {
             return Err(AccountError::new(
-                "server rejected an upload; its Space remains pending; other eligible operations may have synced",
+                "server rejected an upload; local copies retained; other eligible operations may have synced",
             ));
         }
         if !blocked.is_empty() {
@@ -5567,44 +5536,14 @@ impl Accounts {
                         path,
                         &entries,
                     );
-                    if matches!(saved, Ok(false))
-                        && !offline::directory_copy_compatible(
-                            session.base.as_str(),
-                            space,
-                            path,
-                            &entries,
-                            &session.account.issuer,
-                            &session.account.subject,
-                        )?
-                    {
-                        return Err(AccountError::retryable_read(
-                            "directory metadata changed concurrently; retry",
-                        ));
-                    }
-                    if let Err(error) = saved {
-                        // This complete online snapshot already passed DAV
-                        // validation. A competing State lease may skip its
-                        // optional offline copy (as a stale observation can),
-                        // never its parent/ETag checks or a sync_reads gate.
-                        if !error.storage_busy
-                            || !offline::directory_copy_compatible(
-                                session.base.as_str(),
-                                space,
-                                path,
-                                &entries,
-                                &session.account.issuer,
-                                &session.account.subject,
-                            )?
-                        {
-                            return Err(error);
-                        }
-                        #[cfg(feature = "fault-injection")]
-                        if std::env::var_os("CIRRUS_TEST_NAMESPACE_TRACE").is_some() {
-                            eprintln!(
-                                "cirrus lab manual snapshot cache skipped: State lease busy path={path:?}"
-                            );
-                        }
-                    }
+                    accept_directory_snapshot_save(
+                        saved,
+                        DirectorySnapshotPublication::NonTurnSync,
+                        session,
+                        space,
+                        path,
+                        &entries,
+                    )?;
                     return Ok(entries);
                 }
                 Err(error) => return Err(error),
@@ -5851,23 +5790,11 @@ impl Accounts {
         Ok(version)
     }
 
-    /// Lists the selected Space's pinned paths.
-    ///
-    /// # Errors
-    /// Returns an error if account selection or durable storage is unavailable.
-    pub fn pins(&self, instance: &str) -> Result<Vec<(String, String)>, AccountError> {
-        self.pins_inner(instance, None)
-    }
-
     /// Inspects one Space's locally retained pins, without credentials or network access.
     ///
     /// # Errors
     /// Returns an error for invalid input, missing local identity or durable storage failure.
-    pub fn pins_space(
-        &self,
-        instance: &str,
-        space: &str,
-    ) -> Result<Vec<(String, String)>, AccountError> {
+    pub fn pins_space(&self, instance: &str, space: &str) -> Result<Vec<PinInfo>, AccountError> {
         let (base, _) = http::instance_and_ca(instance, None)?;
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
@@ -5875,27 +5802,36 @@ impl Accounts {
         Ok(
             offline::pins(&self.storage_root()?, base.as_str(), space, true)?
                 .into_iter()
-                .map(|pin| {
-                    let status = if !pin.complete {
-                        "incomplete (local state; remote not checked)"
-                    } else if !pin.metadata_matches {
-                        "stale (local metadata; remote not checked)"
-                    } else {
-                        "available offline (local state; remote not checked)"
-                    };
-                    (format!("/{}", pin.path.join("/")), status.to_owned())
+                .map(|pin| PinInfo {
+                    path: format!("/{}", pin.path.join("/")),
+                    availability: pin_availability(pin.complete, pin.metadata_matches),
+                    remote: PinRemoteEvidence::NotChecked,
                 })
                 .collect(),
         )
     }
 
-    fn pins_inner(
+    /// Compares retained pins with DAV in a freshly verified Space.
+    ///
+    /// # Errors
+    /// Returns an error if the Space cannot be verified in the authenticated listing
+    /// (including transport failure before verification) or retained state is unavailable.
+    pub fn pins_space_check_remote(
         &self,
         instance: &str,
-        binding: Option<&MountBinding>,
-    ) -> Result<Vec<(String, String)>, AccountError> {
-        let session = self.read_session_bound(instance, binding)?;
-        let space = bound_space(&session, binding)?;
+        space: &str,
+    ) -> Result<Vec<PinInfo>, AccountError> {
+        let (base, _) = http::instance_and_ca(instance, None)?;
+        if space.is_empty() || space.chars().any(char::is_control) {
+            return Err(AccountError::new("invalid Space ID"));
+        }
+        let binding = self.bind_space(base.as_str(), space)?;
+        let session = self.read_session_in(
+            &binding.root,
+            base.as_str(),
+            SessionAccess::BoundOnline(&binding),
+        )?;
+        let space = bound_space(&session, &binding)?;
         let mut output = Vec::new();
         for offline::Pin {
             path,
@@ -5904,32 +5840,35 @@ impl Accounts {
             metadata_matches,
         } in offline::pins(&session.root, session.base.as_str(), space, true)?
         {
-            let status = if !complete {
-                "incomplete"
-            } else if !metadata_matches {
-                "stale"
-            } else {
+            let availability = pin_availability(complete, metadata_matches);
+            let remote = if matches!(availability, PinAvailability::Available) {
                 match self.collect_pin_files(
                     &session.root,
                     session.base.as_str(),
-                    binding,
+                    &binding,
                     &path,
                     true,
                 ) {
-                    Ok(current) if current == tree => "available offline",
-                    Ok(_) => "stale",
-                    Err(error) if error.network => "available offline",
+                    Ok(current) if current == tree => PinRemoteEvidence::Matches,
+                    Ok(_) => PinRemoteEvidence::Changed,
+                    Err(error) if error.network => PinRemoteEvidence::Unavailable,
                     Err(error)
                         if error
                             .message
                             .starts_with("offline metadata changed during pinning") =>
                     {
-                        "unknown"
+                        PinRemoteEvidence::Inconclusive
                     }
-                    Err(_) => "stale",
+                    Err(_) => PinRemoteEvidence::CouldNotVerify,
                 }
+            } else {
+                PinRemoteEvidence::NotChecked
             };
-            output.push((format!("/{}", path.join("/")), status.to_owned()));
+            output.push(PinInfo {
+                path: format!("/{}", path.join("/")),
+                availability,
+                remote,
+            });
         }
         Ok(output)
     }
@@ -6055,7 +5994,8 @@ impl Accounts {
                 self.read_range_in(root, binding, base, offset, length)
             });
         }
-        let session = self.read_session_in(root, &version.instance);
+        let access = SessionAccess::BoundSaved(binding);
+        let session = self.read_session_in(root, &version.instance, access);
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
             && let Err(error) = &session
@@ -6068,7 +6008,7 @@ impl Accounts {
             );
         }
         let session = session?;
-        if bound_space(&session, Some(binding))? != version.space {
+        if bound_space(&session, binding)? != version.space {
             return Err(AccountError::new(
                 "file version does not match mounted Space",
             ));
@@ -6097,7 +6037,7 @@ impl Accounts {
             self.verify_file(binding, version)?;
             return Ok(bytes);
         }
-        match self.read_range_online(&session.root, version, Some(binding), offset, length) {
+        match self.read_range_online(binding, version, offset, length, true) {
             Ok((bytes, _validated_metadata)) => {
                 // Clean caching is an optimization: failures never invalidate a verified read.
                 // Keep its actual validation scratch owner/allowance alive
@@ -6282,11 +6222,11 @@ impl Accounts {
 
     fn read_range_online(
         &self,
-        storage: &account_storage::StorageRoot,
+        binding: &MountBinding,
         version: &FileVersion,
-        binding: Option<&MountBinding>,
         offset: u64,
         length: u32,
+        allow_saved: bool,
     ) -> Result<(Vec<u8>, DirectorySnapshot), AccountError> {
         if length == 0 || length > 131_072 || offset >= version.size {
             return Err(AccountError::new("invalid file range"));
@@ -6296,11 +6236,12 @@ impl Accounts {
             .filter(|end| *end < version.size)
             .ok_or_else(|| AccountError::new("invalid file range"))?;
         let _permit = self.read_permit()?;
-        let session = self.read_session_in(storage, &version.instance)?;
+        let access = SessionAccess::for_space(binding, allow_saved);
+        let session = self.read_session_in(&binding.root, &version.instance, access)?;
         if bound_space(&session, binding)? != version.space {
             return Err(AccountError::new("file version does not match Space"));
         }
-        self.read_with_refresh(&session, |current| {
+        self.read_with_refresh(&session, access, |current| {
             let (remote_path, move_fenced) = offline::tree_remote_path(
                 &current.root,
                 current.base.as_str(),
@@ -6358,17 +6299,18 @@ impl Accounts {
     fn read_with_refresh<T>(
         &self,
         session: &ReadSession,
+        access: SessionAccess<'_>,
         mut read: impl FnMut(&ReadSession) -> Result<T, AccountError>,
     ) -> Result<T, AccountError> {
         let result = match read(session) {
-            Err(error) if error.unauthorized => {
-                let renewed = self.refresh_rejected_session(session)?;
-                read(&renewed).map_err(|mut error| {
-                    // A confirmed 401 must not become an offline-cache fallback.
+            Err(error) if error.unauthorized => self
+                .refresh_rejected_session(session, access)
+                .and_then(|renewed| read(&renewed))
+                .map_err(|mut error| {
+                    // Neither a failed refresh nor its retry converts a confirmed 401 to offline.
                     error.network = false;
                     error
-                })
-            }
+                }),
             result => result,
         };
         if result.as_ref().is_err_and(|error| !error.network) {
@@ -6380,6 +6322,7 @@ impl Accounts {
     fn refresh_rejected_session(
         &self,
         rejected: &ReadSession,
+        access: SessionAccess<'_>,
     ) -> Result<Arc<ReadSession>, AccountError> {
         let guard = if executor::is_automatic() {
             // Yield/back off instead of waiting behind a foreground account
@@ -6400,15 +6343,17 @@ impl Accounts {
         let store = Store::open(guard.credential_context()?)?;
         guard.persist_pending(&store, rejected.base.as_str())?;
         let mut account = store.load(rejected.base.as_str())?;
-        if account.issuer != rejected.account.issuer
-            || account.subject != rejected.account.subject
-            || account.selected_space != rejected.account.selected_space
-            || account.selected_space != account.selected_space_verified
+        if account.issuer != rejected.account.issuer || account.subject != rejected.account.subject
         {
-            return Err(AccountError::new(
-                "account or selected Space changed; retry the operation",
-            ));
+            return Err(AccountError::new("account changed; retry the operation"));
         }
+        access.check(&rejected.root, &rejected.base, &account)?;
+        offline::verify_identity_in(
+            &rejected.root,
+            rejected.base.as_str(),
+            &account.issuer,
+            &account.subject,
+        )?;
         let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
         if account.access_token == rejected.account.access_token {
             account.expires_at = 0;
@@ -6748,26 +6693,11 @@ impl Accounts {
         Ok(ReadPermit(self))
     }
 
-    fn read_session(&self, instance: &str) -> Result<Arc<ReadSession>, AccountError> {
-        let root = self.storage_root()?;
-        self.read_session_in(&root, instance)
-    }
-
-    fn read_session_bound(
-        &self,
-        instance: &str,
-        binding: Option<&MountBinding>,
-    ) -> Result<Arc<ReadSession>, AccountError> {
-        match binding {
-            Some(binding) => self.read_session_in(&binding.root, instance),
-            None => self.read_session(instance),
-        }
-    }
-
     fn read_session_in(
         &self,
         root: &account_storage::StorageRoot,
         instance: &str,
+        access: SessionAccess<'_>,
     ) -> Result<Arc<ReadSession>, AccountError> {
         self.storage.validate(root)?;
         self.check_cancelled()?;
@@ -6804,6 +6734,7 @@ impl Accounts {
                 }
                 let session = session.clone();
                 drop(cached);
+                access.check(root, &base, &session.account)?;
                 offline::verify_identity_in(
                     &root,
                     session.base.as_str(),
@@ -6859,6 +6790,7 @@ impl Accounts {
             .filter(|session| usable(session))
             .cloned();
         if let Some(session) = cached {
+            access.check(root, &base, &session.account)?;
             offline::verify_identity_in(
                 &root,
                 session.base.as_str(),
@@ -6870,6 +6802,7 @@ impl Accounts {
         let store = Store::open(guard.credential_context()?)?;
         guard.persist_pending(&store, base.as_str())?;
         let mut account = store.load(base.as_str())?;
+        access.check(root, &base, &account)?;
         if executor::is_automatic() {
             offline::verify_identity_in(&root, base.as_str(), &account.issuer, &account.subject)
                 .map_err(|mut error| {
@@ -6879,13 +6812,6 @@ impl Accounts {
         } else {
             offline::bind_identity_in(&root, base.as_str(), &account.issuer, &account.subject)?;
         }
-        if account.selected_space.is_some()
-            && account.selected_space != account.selected_space_verified
-        {
-            return Err(AccountError::new(
-                "reselect your Space from the signed-in user's listing before accessing it",
-            ));
-        }
         let client = http::client(account.ca_pem.as_deref().map(str::as_bytes))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6893,12 +6819,30 @@ impl Accounts {
             .as_secs();
         // Probe before fencing a rotating refresh token, so an offline read
         // does not leave an otherwise valid account fenced after a lost refresh.
-        let offline = !account.refresh_in_progress
+        let offline = if !account.refresh_in_progress
             && account.expires_at <= now.saturating_add(30)
-            && account.selected_space.as_deref().is_some_and(|space| {
+        {
+            let probe = |space| {
                 dav::directory_snapshot_in(root, &base, space, &[], &account.access_token, &client)
-                    .is_err_and(|error| error.network)
-            });
+            };
+            match access {
+                SessionAccess::BoundSaved(binding) => match probe(&binding.space) {
+                    Ok(_) => false,
+                    Err(error) if error.network => true,
+                    Err(error) if error.unauthorized => false,
+                    Err(error) => return Err(error),
+                },
+                SessionAccess::Online | SessionAccess::BoundOnline(_) => {
+                    // Automatic refresh already performs this check under its own turn.
+                    if !executor::is_automatic() {
+                        self.probe_refresh_listing(&base, &account, &client)?;
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if !offline {
             self.refresh_if_needed(&mut account, &store, &client)?;
         }
@@ -6999,6 +6943,19 @@ fn expiry(duration: Option<Duration>) -> Result<u64, AccountError> {
 }
 
 impl Accounts {
+    fn probe_refresh_listing(
+        &self,
+        base: &Url,
+        account: &AccountData,
+        client: &reqwest::blocking::Client,
+    ) -> Result<(), AccountError> {
+        match list_spaces(base, &account.access_token, client, &self.cancelled) {
+            Ok(_) => Ok(()),
+            Err(error) if error.unauthorized => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn account_spaces(
         &self,
         base: &Url,
@@ -7040,11 +6997,7 @@ impl Accounts {
             // failed read must yield before any refresh-token request/marker.
             let base = Url::parse(&account.instance)
                 .map_err(|_| AccountError::new("stored instance is invalid"))?;
-            match list_spaces(&base, &account.access_token, client, &self.cancelled) {
-                Ok(_) => {}
-                Err(error) if error.unauthorized => {}
-                Err(error) => return Err(error),
-            }
+            self.probe_refresh_listing(&base, account, client)?;
         }
         let issuer = Url::parse(&account.issuer)
             .map_err(|_| AccountError::new("stored issuer is invalid"))?;
@@ -7118,12 +7071,67 @@ struct SpaceRoot {
     deleted: Option<serde::de::IgnoredAny>,
 }
 
+fn unique_space_name(spaces: &[Space], id: &str) -> Result<Option<String>, AccountError> {
+    let found = spaces
+        .iter()
+        .find(|space| space.id == id)
+        .ok_or_else(|| AccountError::new("requested Space is not in the authenticated listing"))?;
+    Ok((spaces
+        .iter()
+        .filter(|space| space.name == found.name)
+        .count()
+        == 1)
+        .then(|| found.name.clone()))
+}
+
+fn explicit_space_binding(session: &ReadSession, id: &str, name: Option<String>) -> MountBinding {
+    MountBinding {
+        root: session.root.clone(),
+        instance: session.base.to_string(),
+        space: id.to_owned(),
+        name,
+        issuer: session.account.issuer.clone(),
+        subject: session.account.subject.clone(),
+        offline: false,
+        offline_writable: false,
+    }
+}
+
+pub(crate) enum GraphListingError {
+    InitialTransport(AccountError),
+    Other(AccountError),
+}
+
+impl From<AccountError> for GraphListingError {
+    fn from(error: AccountError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl GraphListingError {
+    fn into_account_error(self) -> AccountError {
+        match self {
+            Self::InitialTransport(error) | Self::Other(error) => error,
+        }
+    }
+}
+
 fn list_spaces(
     base: &Url,
     access_token: &str,
     client: &reqwest::blocking::Client,
     cancelled: &AtomicBool,
 ) -> Result<Vec<Space>, AccountError> {
+    graph_listing(base, access_token, client, cancelled)
+        .map_err(GraphListingError::into_account_error)
+}
+
+fn graph_listing(
+    base: &Url,
+    access_token: &str,
+    client: &reqwest::blocking::Client,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Space>, GraphListingError> {
     let mut url = base
         .join("/graph/v1.0/me/drives")
         .map_err(|_| AccountError::new("invalid OpenCloud instance"))?;
@@ -7131,9 +7139,7 @@ fn list_spaces(
     for page in 0..32 {
         executor::preflight_checkpoint()?;
         if cancelled.load(Ordering::Acquire) {
-            return Err(AccountError::new(
-                "account operation cancelled by daemon shutdown",
-            ));
+            return Err(AccountError::new("account operation cancelled by daemon shutdown").into());
         }
         let response = http::space_page(client, &url, access_token, page, cancelled)?;
         let page: SpacePage = http::json(response)?;
@@ -7149,14 +7155,14 @@ fn list_spaces(
                 || row.name.chars().any(char::is_control)
                 || spaces.iter().any(|space| space.id == row.id)
             {
-                return Err(AccountError::new("Space listing contains invalid fields"));
+                return Err(AccountError::new("Space listing contains invalid fields").into());
             }
             spaces.push(Space {
                 id: row.id,
                 name: row.name,
             });
             if spaces.len() > 1024 {
-                return Err(AccountError::new("Space listing exceeds the limit"));
+                return Err(AccountError::new("Space listing exceeds the limit").into());
             }
         }
         let Some(next) = page.next else {
@@ -7172,10 +7178,10 @@ fn list_spaces(
             || url.password().is_some()
             || url.fragment().is_some()
         {
-            return Err(AccountError::new("untrusted Space pagination link"));
+            return Err(AccountError::new("untrusted Space pagination link").into());
         }
     }
-    Err(AccountError::new("Space listing exceeds the page limit"))
+    Err(AccountError::new("Space listing exceeds the page limit").into())
 }
 
 /// A safe-to-display account failure; token values and response bodies are omitted.
@@ -7336,3 +7342,13 @@ impl fmt::Display for AccountError {
     }
 }
 impl Error for AccountError {}
+
+fn pin_availability(complete: bool, metadata_matches: bool) -> PinAvailability {
+    if !complete {
+        PinAvailability::Incomplete
+    } else if !metadata_matches {
+        PinAvailability::StaleLocalMetadata
+    } else {
+        PinAvailability::Available
+    }
+}

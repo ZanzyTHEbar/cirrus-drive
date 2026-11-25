@@ -1,23 +1,24 @@
 //! Observational storage measurements, not a quota or global reservation ledger.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
-#[cfg(target_os = "linux")]
-use rustix::fs::ResolveFlags;
+use rusqlite::Connection;
 use rustix::{
     fs::{self, AtFlags, Dir, FileType, Mode, OFlags},
     process,
 };
-use serde::{Deserialize, Serialize};
 
-use crate::{AccountError, account_storage::StorageRoot, offline};
+use crate::{
+    AccountError,
+    account_storage::StorageRoot,
+    offline,
+    sqlite_open::{Database, OpenMode},
+};
 
 pub(crate) mod limits;
 pub(crate) mod namespace;
@@ -105,79 +106,7 @@ pub(crate) fn bind_namespace(
     Ok(())
 }
 
-/// Unique observed filesystem inodes, not logical overlay EOF or SQL payload bytes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageUsage {
-    /// Number of unique observed inodes in this category.
-    pub objects: u64,
-    /// Sum of st_size; sparse holes are included, shared references are not added.
-    pub logical_bytes: u64,
-    /// Sum of st_blocks * 512, including fallocated blocks; not added to logical bytes.
-    pub allocated_bytes: u64,
-}
-
-/// Local account-owner-wide measurement across all configured accounts/Spaces.
-/// Categories are disjoint filesystem inode measurements; SQL counts below are
-/// informational subsets of database contents, never extra physical usage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StorageStatus {
-    pub namespace_reservations: Vec<NamespaceStorageReservation>,
-    /// Lifetime ceilings less only known local materialization. Other-process
-    /// or inactive allocation is unknown, so its entire ceiling remains here.
-    pub namespace_outstanding_reserved_bytes: u64,
-    /// Durable per-store ceilings, including inactive crash leftovers.
-    pub sql_reservations: Vec<SqlStorageReservation>,
-    /// Sum of max(ceiling - observed DB/WAL/SHM/journal allocation, 0).
-    pub sql_outstanding_reserved_bytes: u64,
-    pub storage_limits: Option<StorageLimitsView>,
-    pub storage_limits_error: Option<String>,
-    /// Shared admission charge, including SQL outstanding allowances. The name
-    /// is retained from the original immutable-only admission view.
-    pub immutable_admission_charge_bytes: u64,
-    pub filesystem_fragment_bytes: u64,
-    pub scope: String,
-    pub observational_not_atomic: bool,
-    pub scan_entry_limit: u64,
-    pub vanished_entries: u64,
-    pub staging: StorageUsage,
-    /// Directory names, including aliases; unlike staging.objects this is not inode-deduplicated.
-    pub staging_named_entries: u64,
-    pub state_sqlite: StorageUsage,
-    pub cache_sqlite: StorageUsage,
-    pub named_namespace_scratch: StorageUsage,
-    pub named_pin_scratch: StorageUsage,
-    pub other_named_files: StorageUsage,
-    pub directories: StorageUsage,
-    pub daemon_directory_scratch: StorageUsage,
-    pub daemon_pin_scratch: StorageUsage,
-    pub named_total: StorageUsage,
-    pub known_total: StorageUsage,
-    /// Other processes and SQLite/internal anonymous temp files are not measured.
-    pub anonymous_storage_globally_complete: bool,
-    /// False if this process's bounded scratch tracker ever omitted a file.
-    /// Constructors and SQLite's internal temp files are outside that tracker.
-    pub daemon_scratch_tracking_complete: bool,
-    /// Rounded outstanding requests in this daemon, overlapping named allocation.
-    pub daemon_staging_reserved_bytes: u64,
-    /// Only the unmatched remainder; do not add reserved_bytes to named totals.
-    pub daemon_staging_unmaterialized_reserved_bytes: u64,
-    /// Deduplicated visibility estimate: max(st_size, allocated) per inode plus
-    /// unmatched daemon reservations. The locked allocator remains authoritative
-    /// and conservatively charges every name if unexpected hard links exist.
-    pub observed_staging_charge_bytes: u64,
-    pub staging_byte_limit: u64,
-    pub staging_file_limit: u64,
-    pub registered_dirty_roots: u64,
-    /// Stored chunk-row body bytes in state.db, not a per-Space unique footprint.
-    pub pin_payload_bytes: u64,
-    pub pin_chunks: u64,
-    pub pins: u64,
-    /// Stored range bodies in cache.db, already included in its filesystem usage.
-    pub clean_payload_bytes: u64,
-    pub clean_ranges: u64,
-    /// f_bavail * f_frsize for the stores' filesystem; not guaranteed/reserved.
-    pub filesystem_available_bytes: u64,
-}
+pub use cirrus_api::{StorageStatus, StorageUsage};
 
 fn unavailable() -> AccountError {
     AccountError::new("cannot safely measure local storage")
@@ -186,7 +115,12 @@ fn add(left: u64, right: u64) -> Result<u64, AccountError> {
     left.checked_add(right).ok_or_else(unavailable)
 }
 
-impl StorageUsage {
+trait UsageAccounting {
+    fn record(&mut self, stat: &fs::Stat) -> Result<(), AccountError>;
+    fn include(&mut self, other: &Self) -> Result<(), AccountError>;
+}
+
+impl UsageAccounting for StorageUsage {
     fn record(&mut self, stat: &fs::Stat) -> Result<(), AccountError> {
         self.objects = add(self.objects, 1)?;
         self.logical_bytes = add(
@@ -210,70 +144,19 @@ impl StorageUsage {
     }
 }
 
-// SQLite owns its descriptors: never open/close an extra fd for an existing
-// database, which would release process-wide POSIX locks. Reuse the project's
-// held-directory procfs path and before/after inode/ownership validation.
 fn database(
     root: &StorageRoot,
-    database: crate::sqlite_open::Database,
+    database: Database,
     app: i64,
     version: i64,
 ) -> Result<Option<Connection>, AccountError> {
-    let _gate = database.opening_gate().map_err(|_| unavailable())?;
-    let dir = root.directory();
-    let name = database.basename();
-    #[cfg(target_os = "linux")]
-    let before = match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(_) => return Err(unavailable()),
-    };
-    #[cfg(target_os = "macos")]
-    let before = match database
-        .prepare_darwin(root, false)
+    let Some(opening) = database
+        .open(root, OpenMode::Inspect)
         .map_err(|_| unavailable())?
-    {
-        Some((stat, _)) => stat,
-        None => return Ok(None),
+    else {
+        return Ok(None);
     };
-    if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
-        || before.st_uid != process::geteuid().as_raw()
-        || before.st_mode & 0o7777 != 0o600
-        || before.st_nlink != 1
-    {
-        return Err(unavailable());
-    }
-    #[cfg(target_os = "linux")]
-    let proc = fs::openat2(
-        fs::CWD,
-        "/proc",
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|_| unavailable())?;
-    #[cfg(target_os = "linux")]
-    if fs::fstatfs(&proc).map_err(|_| unavailable())?.f_type != fs::PROC_SUPER_MAGIC {
-        return Err(unavailable());
-    }
-    #[cfg(target_os = "linux")]
-    database.check_auxiliaries(dir).map_err(|_| unavailable())?;
-    #[cfg(target_os = "linux")]
-    let conn = Connection::open_with_flags(
-        format!("/proc/self/fd/{}/{name}", dir.as_fd().as_raw_fd()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|_| unavailable())?;
-    #[cfg(target_os = "macos")]
-    let conn = {
-        database
-            .check_darwin(root, &before)
-            .map_err(|_| unavailable())?;
-        database
-            .open_darwin(root, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| unavailable())?
-    };
-    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
+    let conn = opening.connection();
     conn.busy_timeout(Duration::from_secs(1))
         .map_err(|_| unavailable())?;
     let identity: i64 = conn
@@ -282,39 +165,22 @@ fn database(
     let schema: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| unavailable())?;
-    let after = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| unavailable())?;
+    opening.check_named().map_err(|_| unavailable())?;
     if identity != app
         || (schema != version
             // Read-only accounting can inspect the supported pre-migration
             // schema without upgrading or opening a second writer. Its payload
             // tables are unchanged by the additive catalog migration.
-            && !(matches!(database, crate::sqlite_open::Database::State)
+            && !(matches!(database, Database::State)
                 && matches!(schema, 17 | 18)
                 && version == offline::STATE_SCHEMA_VERSION))
-        || (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_uid,
-            before.st_nlink,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_uid,
-            after.st_nlink,
-        )
     {
         return Err(unavailable());
     }
-    #[cfg(target_os = "linux")]
-    database.check_auxiliaries(dir).map_err(|_| unavailable())?;
-    #[cfg(target_os = "macos")]
-    database
-        .check_darwin(root, &before)
+    opening
+        .check_sidecars_and_vfs()
         .map_err(|_| unavailable())?;
-    crate::sqlite_open::check_unmoved(&conn).map_err(|_| unavailable())?;
-    Ok(Some(conn))
+    Ok(Some(opening.into_connection()))
 }
 
 pub(crate) fn status_in(root: &StorageRoot) -> Result<StorageStatus, AccountError> {
@@ -382,7 +248,7 @@ fn observe(
     if payload_counts
         && let Some(conn) = database(
             root,
-            crate::sqlite_open::Database::State,
+            Database::State,
             0x4344_5231,
             offline::STATE_SCHEMA_VERSION,
         )?
@@ -405,9 +271,7 @@ fn observe(
             .query_row("SELECT count(*) FROM dirty_roots", [], |row| row.get(0))
             .map_err(|_| unavailable())?;
     }
-    if payload_counts
-        && let Some(conn) = database(root, crate::sqlite_open::Database::Cache, 0x4344_4331, 2)?
-    {
+    if payload_counts && let Some(conn) = database(root, Database::Cache, 0x4344_4331, 2)? {
         (result.clean_payload_bytes, result.clean_ranges) = conn
             .query_row(
                 "SELECT coalesce(sum(length(body)),0),count(*) FROM ranges",
@@ -633,4 +497,100 @@ fn observe(
         .checked_mul(stat.f_frsize)
         .ok_or_else(unavailable)?;
     Ok(result)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn sqlite_inspection_does_not_migrate_or_unlock() {
+        const PEER_CONTAINER: &str = "CIRRUS_SQLITE_ADMISSION_PEER_CONTAINER";
+        if let Some(path) = std::env::var_os(PEER_CONTAINER) {
+            let peer = Connection::open_with_flags(
+                Path::new(&path).join("cirrus-drive/state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap();
+            peer.busy_timeout(Duration::ZERO).unwrap();
+            let error = peer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            return;
+        }
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "cirrus-sqlite-{}",
+            offline::namespace_token().unwrap()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let fixture = Fixture(path);
+        let root = StorageRoot::open_container(&fixture.0).unwrap();
+        assert_eq!(status_in(&root).unwrap().state_sqlite.objects, 0);
+        assert_eq!(crate::cache::status_in(&root).unwrap().ranges, 0);
+        assert_eq!(status_in(&root).unwrap().cache_sqlite.objects, 0);
+
+        let conn = offline::database_in(&root).unwrap();
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; DROP TABLE fp_requests; DROP TABLE fp_deletions;
+             PRAGMA user_version=18; COMMIT;",
+        )
+        .unwrap();
+        assert!(status_in(&root).unwrap().state_sqlite.objects > 0);
+        let version = |conn: &Connection| -> i64 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            version(&conn),
+            18,
+            "storage accounting migrated the database"
+        );
+        drop(conn);
+
+        limits::set_in(
+            &root,
+            Some(StorageLimits {
+                budget_bytes: 16 * 1024 * 1024,
+                free_space_reserve_bytes: 0,
+            }),
+        )
+        .unwrap();
+        let writer = offline::database_in(&root).unwrap();
+        assert_eq!(version(&writer), offline::STATE_SCHEMA_VERSION);
+        assert!(status_in(&root).unwrap().sql_reservations.is_empty());
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        drop(offline::database_in(&root).unwrap());
+        status_in(&root).unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::sqlite_inspection_does_not_migrate_or_unlock",
+            ])
+            .env(PEER_CONTAINER, &fixture.0)
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && report.contains("1 passed"),
+            "peer writer check failed: {report}"
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
 }

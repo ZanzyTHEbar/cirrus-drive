@@ -2,6 +2,10 @@
 use std::io::Write;
 use std::path::{Component, Path};
 
+use cirrus_api::{
+    RetainedPage, RetainedPin, RetainedPinCopy, RetainedPinCopyEntry, RetainedPinFile,
+    RetainedStaged,
+};
 use md5::Md5;
 use rusqlite::{Connection, OptionalExtension, params};
 #[cfg(target_os = "linux")]
@@ -58,26 +62,30 @@ fn key(path: &[String]) -> Result<String, AccountError> {
     serde_json::to_string(path).map_err(|_| invalid())
 }
 
-pub(crate) fn list(
+pub(crate) fn files(
     storage: &StorageRoot,
     instance: &str,
-    space_root: Option<(&str, &[String])>,
+    space: &str,
+    root: &[String],
     offset: u32,
-) -> Result<Vec<(String, String)>, AccountError> {
+) -> Result<RetainedPage<RetainedPinFile>, AccountError> {
     let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
-    let mut result = Vec::new();
-    if let Some((space, root)) = space_root {
-        let root = key(root)?;
+    let root = key(root)?;
+    let mut page = Page::new(offset);
+    {
         let mut stmt = tx.prepare("SELECT CASE WHEN length(path)<=24000 THEN path END,CASE WHEN length(version)<=24000 THEN version END FROM files WHERE instance=?1 AND space=?2 AND root=?3 ORDER BY path LIMIT ?4 OFFSET ?5").map_err(|_| invalid())?;
         let rows = stmt
-            .query_map(params![instance, space, root, PAGE, offset], |row| {
+            .query_map(params![instance, space, root, PAGE + 1, offset], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|_| invalid())?;
         for row in rows {
+            if page.full()? {
+                break;
+            }
             let (path, version) = row.map_err(|_| invalid())?;
-            let fingerprint = selector(
+            let selector = selector(
                 &tx,
                 PinTables::Active,
                 instance,
@@ -86,27 +94,48 @@ pub(crate) fn list(
                 &path,
                 &version,
             )?;
-            let item = (path, format!("{fingerprint}\n{version}"));
-            if !push_page(&mut result, item)? {
-                break;
-            }
-        }
-    } else {
-        let mut stmt = tx.prepare("SELECT CASE WHEN length(space)<=24000 THEN space END,CASE WHEN length(root)<=24000 THEN root END FROM pins WHERE instance=?1 ORDER BY space,root LIMIT ?2 OFFSET ?3").map_err(|_| invalid())?;
-        let rows = stmt
-            .query_map(params![instance, PAGE, offset], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|_| invalid())?;
-        for row in rows {
-            let item = row.map_err(|_| invalid())?;
-            if !push_page(&mut result, item)? {
+            let path = serde_json::from_str(&path).map_err(|_| invalid())?;
+            let version =
+                serde_json::from_str(&version).unwrap_or(serde_json::Value::String(version));
+            let size = version.get("size").and_then(serde_json::Value::as_u64);
+            if !page.push(RetainedPinFile {
+                path,
+                selector,
+                size,
+                version,
+            })? {
                 break;
             }
         }
     }
     tx.commit().map_err(|_| invalid())?;
-    Ok(result)
+    Ok(page.result)
+}
+
+pub(crate) fn pins(
+    storage: &StorageRoot,
+    instance: &str,
+    offset: u32,
+) -> Result<RetainedPage<RetainedPin>, AccountError> {
+    let conn = offline::database_in(storage)?;
+    let mut stmt = conn.prepare("SELECT CASE WHEN length(space)<=24000 THEN space END,CASE WHEN length(root)<=24000 THEN root END FROM pins WHERE instance=?1 ORDER BY space,root LIMIT ?2 OFFSET ?3").map_err(|_| invalid())?;
+    let rows = stmt
+        .query_map(params![instance, PAGE + 1, offset], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| invalid())?;
+    let mut page = Page::new(offset);
+    for row in rows {
+        if page.full()? {
+            break;
+        }
+        let (space, root) = row.map_err(|_| invalid())?;
+        let root = serde_json::from_str(&root).map_err(|_| invalid())?;
+        if !page.push(RetainedPin { space, root })? {
+            break;
+        }
+    }
+    Ok(page.result)
 }
 
 // The selector binds the exact stored metadata and ordered chunk digests. It is
@@ -142,19 +171,57 @@ fn selector(
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn push_page(
-    page: &mut Vec<(String, String)>,
-    item: (String, String),
-) -> Result<bool, AccountError> {
-    let size = item.0.len().saturating_add(item.1.len());
-    if size > 24_000 {
-        return Err(AccountError::new("retained pin entry exceeds IPC limit"));
+// Lookahead is from the same ordered query/snapshot. Both row and byte
+// limits can end a page; an exactly full last page has no continuation.
+struct Page<T> {
+    offset: u32,
+    bytes: usize,
+    result: RetainedPage<T>,
+}
+
+impl<T: serde::Serialize> Page<T> {
+    fn new(offset: u32) -> Self {
+        Self {
+            offset,
+            bytes: 0,
+            result: RetainedPage {
+                entries: Vec::new(),
+                next_offset: None,
+            },
+        }
     }
-    if page.iter().map(|(a, b)| a.len() + b.len()).sum::<usize>() + size > 24_000 {
-        return Ok(false);
+
+    fn more(&mut self) -> Result<(), AccountError> {
+        self.result.next_offset = Some(
+            self.offset
+                .checked_add(self.result.entries.len() as u32)
+                .ok_or_else(invalid)?,
+        );
+        Ok(())
     }
-    page.push(item);
-    Ok(true)
+
+    fn full(&mut self) -> Result<bool, AccountError> {
+        if self.result.entries.len() == PAGE as usize {
+            self.more()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn push(&mut self, item: T) -> Result<bool, AccountError> {
+        const BYTE_LIMIT: usize = 24_000;
+        let size = serde_json::to_vec(&item).map_err(|_| invalid())?.len();
+        if size > BYTE_LIMIT {
+            return Err(AccountError::new("retained pin entry exceeds IPC limit"));
+        }
+        if self.bytes + size > BYTE_LIMIT {
+            self.more()?;
+            return Ok(false);
+        }
+        self.bytes += size;
+        self.result.entries.push(item);
+        Ok(true)
+    }
 }
 
 // Reads only a single bounded SQLite chunk at a time. Checks both chunk digests
@@ -404,24 +471,37 @@ pub(crate) fn pin_copies(
     storage: &StorageRoot,
     instance: &str,
     offset: u32,
-) -> Result<Vec<(String, String)>, AccountError> {
+) -> Result<RetainedPage<RetainedPinCopy>, AccountError> {
     let conn = offline::database_in(storage)?;
     let mut stmt=conn.prepare("SELECT id,space,root,is_dir,displaced_path,target_id,target_etag FROM pin_copies WHERE instance=?1 ORDER BY id LIMIT ?2 OFFSET ?3").map_err(|_|invalid())?;
     let mut rows = stmt
-        .query(params![instance, PAGE, offset])
+        .query(params![instance, PAGE + 1, offset])
         .map_err(|_| invalid())?;
-    let mut result = Vec::new();
+    let mut page = Page::new(offset);
     while let Some(row) = rows.next().map_err(|_| invalid())? {
+        if page.full()? {
+            break;
+        }
         let id: i64 = row.get(0).map_err(|_| invalid())?;
         let space: String = row.get(1).map_err(|_| invalid())?;
         let root = check_copy(&conn, instance, &space, id)?;
         let displaced: String = row.get(4).map_err(|_| invalid())?;
-        let info = serde_json::json!({"id":id,"space":space,"root":root,"is_directory":row.get::<_,bool>(3).map_err(|_|invalid())?,"displaced_path":serde_json::from_str::<Vec<String>>(&displaced).map_err(|_|invalid())?,"target_id":row.get::<_,String>(5).map_err(|_|invalid())?,"target_etag":row.get::<_,String>(6).map_err(|_|invalid())?,"status":"immutable retained pin copy; not a live namespace; remove only by copy ID"});
-        if !push_page(&mut result, (id.to_string(), info.to_string()))? {
+        let info = RetainedPinCopy {
+            id,
+            space,
+            root,
+            is_directory: row.get(3).map_err(|_| invalid())?,
+            displaced_path: serde_json::from_str(&displaced).map_err(|_| invalid())?,
+            target_id: row.get(5).map_err(|_| invalid())?,
+            target_etag: row.get(6).map_err(|_| invalid())?,
+            status: "immutable retained pin copy; not a live namespace; remove only by copy ID"
+                .into(),
+        };
+        if !page.push(info)? {
             break;
         }
     }
-    Ok(result)
+    Ok(page.result)
 }
 
 pub(crate) fn pin_copy_entries(
@@ -430,7 +510,7 @@ pub(crate) fn pin_copy_entries(
     space: &str,
     id: i64,
     offset: u32,
-) -> Result<Vec<(String, String)>, AccountError> {
+) -> Result<RetainedPage<RetainedPinCopyEntry>, AccountError> {
     let mut conn = offline::database_in(storage)?;
     let tx = conn.transaction().map_err(|_| invalid())?;
     let captured_root = check_copy(&tx, instance, space, id)?;
@@ -456,7 +536,25 @@ pub(crate) fn pin_copy_entries(
         {
             return Err(invalid());
         }
-        entries.push((key(&path)?,serde_json::json!({"kind":"directory","path":path,"id":if space_root {None}else{Some(resource)},"status":if space_root {"captured Space root; resource ID not recorded; no file payload"}else{"captured directory identity; no file payload"}}).to_string()));
+        entries.push((
+            key(&path)?,
+            RetainedPinCopyEntry {
+                kind: "directory".into(),
+                path,
+                id: (!space_root).then_some(resource),
+                selector: None,
+                size: None,
+                version: None,
+                status: Some(
+                    if space_root {
+                        "captured Space root; resource ID not recorded; no file payload"
+                    } else {
+                        "captured directory identity; no file payload"
+                    }
+                    .into(),
+                ),
+            },
+        ));
     }
     let root = id.to_string();
     let mut stmt=tx.prepare("SELECT CASE WHEN length(path)<=24000 THEN path END,CASE WHEN length(version)<=24000 THEN version END FROM pin_copy_files WHERE instance=?1 AND space=?2 AND root=?3 ORDER BY path LIMIT 4098").map_err(|_|invalid())?;
@@ -487,26 +585,30 @@ pub(crate) fn pin_copy_entries(
             &path,
             &version,
         )?;
+        let version = serde_json::to_value(&file).map_err(|_| invalid())?;
         entries.push((
             path,
-            serde_json::json!({"kind":"file","path":file.path,"size":file.size,"version":file,"selector":selector})
-                .to_string(),
+            RetainedPinCopyEntry {
+                kind: "file".into(),
+                path: file.path,
+                size: Some(file.size),
+                version: Some(version),
+                selector: Some(selector),
+                id: None,
+                status: None,
+            },
         ));
     }
     drop(stmt);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut result = Vec::new();
-    for entry in entries
-        .into_iter()
-        .skip(offset as usize)
-        .take(PAGE as usize)
-    {
-        if !push_page(&mut result, entry)? {
+    let mut page = Page::new(offset);
+    for (_, entry) in entries.into_iter().skip(offset as usize) {
+        if page.full()? || !page.push(entry)? {
             break;
         }
     }
     tx.commit().map_err(|_| invalid())?;
-    Ok(result)
+    Ok(page.result)
 }
 
 pub(crate) fn export_pin_copy(
@@ -746,15 +848,15 @@ pub(crate) fn staged_list(
     storage: &StorageRoot,
     instance: &str,
     offset: u32,
-) -> Result<Vec<(String, String)>, AccountError> {
+) -> Result<RetainedPage<RetainedStaged>, AccountError> {
     let conn = offline::database_in(storage)?;
-    let mut result = Vec::new();
+    let mut page = Page::new(offset);
     // Listing selects immutable roots without hashing logical file contents.
     // Otherwise even listing a retained sparse TiB file would scan a TiB.
     let rows = {
         let mut stmt = conn.prepare("SELECT id,CASE WHEN length(space)<=24000 THEN space END,CASE WHEN length(path)<=24000 THEN path END,CASE WHEN length(state)<=64 THEN state END,CASE WHEN length(staged_file)<=64 THEN staged_file END FROM operation_journal WHERE instance=?1 AND op_type='write' ORDER BY id LIMIT ?2 OFFSET ?3").map_err(|_| AccountError::new("cannot list retained staged files"))?;
         let rows = stmt
-            .query_map(params![instance, PAGE, offset], |row| {
+            .query_map(params![instance, PAGE + 1, offset], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -764,10 +866,14 @@ pub(crate) fn staged_list(
                 ))
             })
             .map_err(|_| AccountError::new("cannot list retained staged files"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| AccountError::new("cannot list retained staged files"))?
+        rows.collect::<Vec<_>>()
     };
-    for (id, space, path, state, name) in rows {
+    for row in rows {
+        if page.full()? {
+            break;
+        }
+        let (id, space, path, state, name) =
+            row.map_err(|_| AccountError::new("cannot list retained staged files"))?;
         let parts: Vec<String> =
             serde_json::from_str(&path).map_err(|_| AccountError::new("invalid journal path"))?;
         key(&parts)?;
@@ -777,12 +883,17 @@ pub(crate) fn staged_list(
         let selected = info
             .as_ref()
             .map(|(size, digest)| staged_selector(id, &space, &path, &name, *size, digest));
-        let value = serde_json::json!({"id":id,"space":space,"path":parts,"state":state,"staged_file":name,"size":info.as_ref().map(|v| v.0),"sha256":null,"selector":selected,"integrity":"immutable manifest verified; payload blocks and full-stream SHA-256 checked during export; exact original base may be unavailable","status":"retained local snapshot; may require original content; remote outcome not asserted"}).to_string();
-        if !push_page(&mut result, (id.to_string(), value))? {
+        let value = RetainedStaged {
+            id, space, path: parts, state, staged_file: name, size: info.map(|v| v.0),
+            sha256: None, selector: selected,
+            integrity: "immutable manifest verified; payload blocks and full-stream SHA-256 checked during export; exact original base may be unavailable".into(),
+            status: "retained local snapshot; may require original content; remote outcome not asserted".into(),
+        };
+        if !page.push(value)? {
             break;
         }
     }
-    Ok(result)
+    Ok(page.result)
 }
 
 pub(crate) fn staged_export(
@@ -821,4 +932,63 @@ pub(crate) fn staged_export(
         }
         Ok(())
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn retained_pin_pages_only_advertise_continuations_that_exist() {
+    use std::fs::{self, DirBuilder};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("cirrus-page-{}-{nonce}", std::process::id()));
+    DirBuilder::new().mode(0o700).create(&directory).unwrap();
+    let fixture = Fixture(directory);
+    let root = StorageRoot::open_container(&fixture.0).unwrap();
+    let runtime = cirrus_runtime::RuntimeDir::open(&fixture.0).unwrap();
+    let accounts = crate::Accounts::with_storage(runtime, root.clone());
+    let db = offline::database_in(&root).unwrap();
+    let seed = |instance: &str, part: &str| {
+        db.execute(
+            "INSERT INTO pins(instance,space,root,is_dir,directories,manifest) VALUES (?1,'space',?2,1,'[]','[]')",
+            params![instance, serde_json::to_string(&[part]).unwrap()],
+        ).unwrap();
+    };
+
+    let instance = "https://rows.invalid/";
+    for index in 0..16 {
+        seed(instance, &format!("item-{index:02}"));
+    }
+    let page = accounts.retained_pins(instance, 0).unwrap();
+    assert_eq!(page.entries.len(), 16);
+    assert_eq!(page.next_offset, None);
+
+    seed(instance, "item-16");
+    let page = accounts.retained_pins(instance, 0).unwrap();
+    assert_eq!(page.next_offset, Some(16));
+    let last = accounts.retained_pins(instance, 16).unwrap();
+    assert_eq!(last.entries[0].root, ["item-16"]);
+    assert_eq!(last.next_offset, None);
+
+    let instance = "https://bytes.invalid/";
+    seed(instance, &"a".repeat(13_000));
+    seed(instance, &"b".repeat(13_000));
+    let page = accounts.retained_pins(instance, 0).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.next_offset, Some(1));
+    let last = accounts.retained_pins(instance, 1).unwrap();
+    assert_eq!(last.entries[0].root, ["b".repeat(13_000)]);
+    assert_eq!(last.next_offset, None);
 }

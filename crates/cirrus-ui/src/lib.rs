@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cirrus_daemon::{
-    CleanCacheStatus, Daemon, JournalPage, JournalSummary, MountInfo, MountState, RetainedPin,
-    RetainedPinCopy, RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
+    CleanCacheStatus, Daemon, JournalPage, JournalSummary, MountInfo, MountState, RetainedPage,
+    RetainedPin, RetainedPinCopy, RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
 };
 use cirrus_runtime::RuntimeDir;
 use rune::tok::{self, type_};
@@ -160,19 +160,31 @@ enum RecoveryRow {
 
 #[derive(Clone)]
 enum RecoveryPage {
-    Copies(u32),
+    Copies(Option<u32>),
     CopyEntries {
         space: String,
         id: i64,
-        offset: u32,
+        offset: Option<u32>,
     },
-    Roots(u32),
+    Roots(Option<u32>),
     Files {
         space: String,
         root: Vec<String>,
-        offset: u32,
+        offset: Option<u32>,
     },
-    Staged(u32),
+    Staged(Option<u32>),
+}
+
+impl RecoveryPage {
+    fn has_more(&self) -> bool {
+        match self {
+            Self::Copies(next)
+            | Self::Roots(next)
+            | Self::Staged(next)
+            | Self::CopyEntries { offset: next, .. }
+            | Self::Files { offset: next, .. } => next.is_some(),
+        }
+    }
 }
 
 enum ResultValue {
@@ -197,12 +209,12 @@ enum ResultValue {
     SyncStatus(cirrus_daemon::SyncStatus),
     Synced,
     Acknowledged,
-    RecoveryRoots(String, u32, Vec<RetainedPin>),
-    RecoveryFiles(String, String, Vec<String>, u32, Vec<RetainedPinFile>),
-    RecoveryStaged(String, u32, Vec<RetainedStaged>),
+    RecoveryRoots(String, RetainedPage<RetainedPin>),
+    RecoveryFiles(String, String, Vec<String>, RetainedPage<RetainedPinFile>),
+    RecoveryStaged(String, RetainedPage<RetainedStaged>),
     RecoveryExported,
-    RecoveryCopies(String, u32, Vec<RetainedPinCopy>),
-    RecoveryCopyEntries(String, String, i64, u32, Vec<RetainedPinCopyEntry>),
+    RecoveryCopies(String, RetainedPage<RetainedPinCopy>),
+    RecoveryCopyEntries(String, String, i64, RetainedPage<RetainedPinCopyEntry>),
     PinCopyRemoved,
 }
 
@@ -741,7 +753,7 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
         }
         Action::RecoveryCopies { instance, offset } => daemon
             .recovery_pin_copies(&runtime, &instance, offset)
-            .map(|rows| ResultValue::RecoveryCopies(instance, offset, rows)),
+            .map(|rows| ResultValue::RecoveryCopies(instance, rows)),
         Action::RecoveryCopyEntries {
             instance,
             space,
@@ -749,7 +761,7 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
             offset,
         } => daemon
             .recovery_pin_copy_entries(&runtime, &instance, &space, id, offset)
-            .map(|rows| ResultValue::RecoveryCopyEntries(instance, space, id, offset, rows)),
+            .map(|rows| ResultValue::RecoveryCopyEntries(instance, space, id, rows)),
         Action::RemovePinCopy {
             instance,
             space,
@@ -759,7 +771,7 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
             .map(|()| ResultValue::PinCopyRemoved),
         Action::RecoveryRoots { instance, offset } => daemon
             .recovery_pins(&runtime, &instance, offset)
-            .map(|rows| ResultValue::RecoveryRoots(instance, offset, rows)),
+            .map(|rows| ResultValue::RecoveryRoots(instance, rows)),
         Action::RecoveryFiles {
             instance,
             space,
@@ -767,10 +779,10 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
             offset,
         } => daemon
             .recovery_files(&runtime, &instance, &space, root.clone(), offset)
-            .map(|rows| ResultValue::RecoveryFiles(instance, space, root, offset, rows)),
+            .map(|rows| ResultValue::RecoveryFiles(instance, space, root, rows)),
         Action::RecoveryStaged { instance, offset } => daemon
             .retained_staged(&runtime, &instance, offset)
-            .map(|rows| ResultValue::RecoveryStaged(instance, offset, rows)),
+            .map(|rows| ResultValue::RecoveryStaged(instance, rows)),
         Action::RecoveryExport {
             instance,
             selection,
@@ -1119,33 +1131,33 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
             state.message =
                 "Acknowledged locally; remote outcome not asserted. Any staged copies are retained.".into();
         }
-        Ok(ResultValue::RecoveryCopies(instance,offset,rows))=>{
-            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::Copies(offset));state.recovery_rows=Arc::new(rows.into_iter().map(RecoveryRow::Copy).collect());state.recovery_selection=None;state.pin_copy_remove=None;
+        Ok(ResultValue::RecoveryCopies(instance, rows))=>{
+            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::Copies(rows.next_offset));state.recovery_rows=Arc::new(rows.entries.into_iter().map(RecoveryRow::Copy).collect());state.recovery_selection=None;state.pin_copy_remove=None;
             state.message="Immutable displaced pin captures. Open an ID to inspect directories or export a selected file.".into();
         }
-        Ok(ResultValue::RecoveryCopyEntries(instance,space,id,offset,rows))=>{
-            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::CopyEntries{space:space.clone(),id,offset});state.recovery_rows=Arc::new(rows.into_iter().map(|entry|RecoveryRow::CopyEntry{space:space.clone(),id,entry}).collect());state.recovery_selection=None;state.pin_copy_remove=None;
+        Ok(ResultValue::RecoveryCopyEntries(instance,space,id, rows))=>{
+            state.recovery_instance=Some(instance);state.recovery_page=Some(RecoveryPage::CopyEntries{space:space.clone(),id,offset:rows.next_offset});state.recovery_rows=Arc::new(rows.entries.into_iter().map(|entry|RecoveryRow::CopyEntry{space:space.clone(),id,entry}).collect());state.recovery_selection=None;state.pin_copy_remove=None;
             state.message="Captured directory IDs are metadata, not file payloads. Select a file version to export.".into();
         }
         Ok(ResultValue::PinCopyRemoved)=>{
             state.recovery_rows=Arc::new(Vec::new());state.recovery_selection=None;state.pin_copy_remove=None;state.recovery_page=None;
             state.message="Removed only the named immutable pin capture. Active pins, other captures and dirty roots were not removed. Reload retained captures.".into();
         }
-        Ok(ResultValue::RecoveryRoots(instance, offset, rows)) => {
+        Ok(ResultValue::RecoveryRoots(instance, rows)) => {
             state.recovery_instance = Some(instance);
-            state.recovery_page = Some(RecoveryPage::Roots(offset));
-            state.recovery_rows = Arc::new(rows.into_iter().map(RecoveryRow::Root).collect());
+            state.recovery_page = Some(RecoveryPage::Roots(rows.next_offset));
+            state.recovery_rows = Arc::new(rows.entries.into_iter().map(RecoveryRow::Root).collect());
             state.recovery_selection = None;
             state.message = "Retained pins may be stale; choose a pin root.".into();
         }
-        Ok(ResultValue::RecoveryFiles(instance, space, root, offset, rows)) => {
+        Ok(ResultValue::RecoveryFiles(instance, space, root, rows)) => {
             state.recovery_instance = Some(instance);
             state.recovery_page = Some(RecoveryPage::Files {
                 space: space.clone(),
                 root: root.clone(),
-                offset,
+                offset: rows.next_offset,
             });
-            state.recovery_rows = Arc::new(rows
+            state.recovery_rows = Arc::new(rows.entries
                 .into_iter()
                 .map(|file| RecoveryRow::File {
                     space: space.clone(),
@@ -1156,10 +1168,10 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
             state.recovery_selection = None;
             state.message = "Retained versions may be stale; choose a file to export.".into();
         }
-        Ok(ResultValue::RecoveryStaged(instance, offset, rows)) => {
+        Ok(ResultValue::RecoveryStaged(instance, rows)) => {
             state.recovery_instance = Some(instance);
-            state.recovery_page = Some(RecoveryPage::Staged(offset));
-            state.recovery_rows = Arc::new(rows.into_iter().map(RecoveryRow::Staged).collect());
+            state.recovery_page = Some(RecoveryPage::Staged(rows.next_offset));
+            state.recovery_rows = Arc::new(rows.entries.into_iter().map(RecoveryRow::Staged).collect());
             state.recovery_selection = None;
             state.message = "Staged copies are local; their original hash was not recorded.".into();
         }
@@ -2209,18 +2221,17 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(row().gap(8.0)
             .child(button(paint, "Retained pins", "recovery-pins".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryRoots { instance: s.instance.text.clone(), offset: 0 })))
             .child(button(paint, "Staged copies", "recovery-staged".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryStaged { instance: s.instance.text.clone(), offset: 0 })))
-            .child(button(paint, "More", "recovery-more".into(), can_work && current_recovery && !state.recovery_rows.is_empty(), move |s| {
+            .child(button(paint, "More", "recovery-more".into(), can_work && current_recovery && state.recovery_page.as_ref().is_some_and(RecoveryPage::has_more), move |s| {
                 if s.busy() || s.instance.text != more_instance
                     || s.recovery_instance.as_deref() != Some(more_instance.as_str())
                     || !Arc::ptr_eq(&s.recovery_rows, &more_rows) { return; }
-                let next = s.recovery_rows.len() as u32;
                 match s.recovery_page.clone() {
-                    Some(RecoveryPage::Copies(offset))=>s.start(Action::RecoveryCopies{instance:s.instance.text.clone(),offset:offset.saturating_add(next)}),
-                    Some(RecoveryPage::CopyEntries{space,id,offset})=>s.start(Action::RecoveryCopyEntries{instance:s.instance.text.clone(),space,id,offset:offset.saturating_add(next)}),
-                    Some(RecoveryPage::Roots(offset)) => s.start(Action::RecoveryRoots { instance: s.instance.text.clone(), offset: offset.saturating_add(next) }),
-                    Some(RecoveryPage::Staged(offset)) => s.start(Action::RecoveryStaged { instance: s.instance.text.clone(), offset: offset.saturating_add(next) }),
-                    Some(RecoveryPage::Files { space, root, offset }) => s.start(Action::RecoveryFiles { instance: s.instance.text.clone(), space, root, offset: offset.saturating_add(next) }),
-                    None => {}
+                    Some(RecoveryPage::Copies(Some(offset)))=>s.start(Action::RecoveryCopies{instance:s.instance.text.clone(),offset}),
+                    Some(RecoveryPage::CopyEntries{space,id,offset:Some(offset)})=>s.start(Action::RecoveryCopyEntries{instance:s.instance.text.clone(),space,id,offset}),
+                    Some(RecoveryPage::Roots(Some(offset))) => s.start(Action::RecoveryRoots { instance: s.instance.text.clone(), offset }),
+                    Some(RecoveryPage::Staged(Some(offset))) => s.start(Action::RecoveryStaged { instance: s.instance.text.clone(), offset }),
+                    Some(RecoveryPage::Files { space, root, offset: Some(offset) }) => s.start(Action::RecoveryFiles { instance: s.instance.text.clone(), space, root, offset }),
+                    _ => {}
                 }
             })))
         .child(row().child(button(paint, "Displaced pin captures", "recovery-pin-copies".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryCopies { instance: s.instance.text.clone(), offset: 0 }))))

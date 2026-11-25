@@ -173,9 +173,7 @@ mod acceptance {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    #[test]
-    #[ignore = "requires an explicitly guarded disposable Secret Service"]
-    fn refuses_corrupt_secret_without_overwriting() {
+    fn with_private_accounts(test: impl FnOnce(&crate::Accounts, crate::Operation<'_>)) {
         assert!(
             cfg!(feature = "fault-injection"),
             "credential acceptance requires fault-injection routing"
@@ -296,36 +294,199 @@ mod acceptance {
             process_start(keyring_pid),
             pinned("CIRRUS_TEST_KEYRING_START")
         );
+        drop(bus);
         eprintln!("ACTUAL_CONTEXT_PRIVATE_BUS_VERIFIED_BEFORE_STORE");
-        let store = Store::open(guard.credential_context().unwrap()).unwrap();
-        let mut account = AccountData {
-            instance: "https://credential-acceptance.invalid/".into(),
-            issuer: "https://identity-acceptance.invalid/".into(),
-            client_id: "fixture".into(),
-            token_endpoint: "https://identity-acceptance.invalid/token".into(),
-            subject: "fixture".into(),
-            ca_pem: None,
-            access_token: "disposable-access".into(),
-            refresh_token: "disposable-refresh".into(),
-            expires_at: 0,
-            refresh_in_progress: false,
-            selected_space: None,
-            selected_space_verified: None,
-        };
-        store.save(&account).unwrap();
-        account.access_token = "rotated-disposable-access".into();
-        store.save(&account).unwrap();
-        assert!(store.load(&account.instance).unwrap() == account);
-        let collection = store.service.get_default_collection().unwrap();
-        let mut items = collection
-            .search_items(attributes(&account.instance))
-            .unwrap();
-        assert_eq!(items.len(), 1);
-        let item = items.pop().unwrap();
-        item.set_secret(b"damaged credential", "application/json")
-            .unwrap();
+        test(&accounts, guard);
+    }
 
-        assert!(store.save(&account).is_err());
-        assert_eq!(item.get_secret().unwrap(), b"damaged credential");
+    #[test]
+    #[ignore = "requires an explicitly guarded disposable Secret Service"]
+    fn refuses_corrupt_secret_without_overwriting() {
+        with_private_accounts(|_accounts, guard| {
+            let store = Store::open(guard.credential_context().unwrap()).unwrap();
+            let mut account = AccountData {
+                instance: "https://credential-acceptance.invalid/".into(),
+                issuer: "https://identity-acceptance.invalid/".into(),
+                client_id: "fixture".into(),
+                token_endpoint: "https://identity-acceptance.invalid/token".into(),
+                subject: "fixture".into(),
+                ca_pem: None,
+                access_token: "disposable-access".into(),
+                refresh_token: "disposable-refresh".into(),
+                expires_at: 0,
+                refresh_in_progress: false,
+            };
+            store.save(&account).unwrap();
+            account.access_token = "rotated-disposable-access".into();
+            store.save(&account).unwrap();
+            assert!(store.load(&account.instance).unwrap() == account);
+            let collection = store.service.get_default_collection().unwrap();
+            let mut items = collection
+                .search_items(attributes(&account.instance))
+                .unwrap();
+            assert_eq!(items.len(), 1);
+            let item = items.pop().unwrap();
+            item.set_secret(b"damaged credential", "application/json")
+                .unwrap();
+
+            assert!(store.save(&account).is_err());
+            assert_eq!(item.get_secret().unwrap(), b"damaged credential");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly guarded disposable Secret Service"]
+    fn explicit_space_sessions_preserve_saved_access_and_refresh_fences() {
+        use crate::{MountBinding, SessionAccess, offline};
+        use rustix::net::{self, AddressFamily, SocketAddrV4, SocketType};
+
+        with_private_accounts(|accounts, guard| {
+            // Reserve a loopback port without listening, so all requests get
+            // a real connection refusal and cannot leave the private fixture.
+            let socket = net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+            net::bind(
+                &socket,
+                &SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+            )
+            .unwrap();
+            let address: SocketAddrV4 = net::getsockname(&socket).unwrap().try_into().unwrap();
+            let instance = format!("https://{address}/");
+            let mut account = AccountData {
+                instance: instance.clone(),
+                issuer: instance.clone(),
+                client_id: "fixture".into(),
+                token_endpoint: format!("{instance}token"),
+                subject: "fixture".into(),
+                ca_pem: None,
+                access_token: "disposable-expired-access".into(),
+                refresh_token: "disposable-refresh".into(),
+                expires_at: 0,
+                refresh_in_progress: false,
+            };
+            let root = guard.storage_root().unwrap().clone();
+            let store = Store::open(guard.credential_context().unwrap()).unwrap();
+            store.save(&account).unwrap();
+            drop(store);
+            drop(guard);
+            let binding = MountBinding {
+                root: root.clone(),
+                instance: instance.clone(),
+                space: "requested-space".into(),
+                name: None,
+                issuer: account.issuer.clone(),
+                subject: account.subject.clone(),
+                offline: false,
+                offline_writable: false,
+            };
+            let saved = SessionAccess::BoundSaved(&binding);
+            let rejected = accounts.read_session_in(&root, &instance, saved).unwrap();
+            assert_eq!(rejected.account.expires_at, 0, "no rotation while offline");
+            let mut snapshot = crate::DirectorySnapshot::empty_in(&root).unwrap();
+            snapshot
+                .set_remote_parent("saved-root", "\"fixture\"")
+                .unwrap();
+            assert!(
+                offline::save_directory_snapshot(
+                    offline::begin_snapshot_in(&root).unwrap(),
+                    &instance,
+                    &binding.space,
+                    &[],
+                    &snapshot,
+                )
+                .unwrap()
+            );
+            assert!(
+                accounts
+                    .mount_directory(&instance, &binding, &[], "saved-root")
+                    .unwrap()
+                    .matches_parent("saved-root")
+                    .unwrap()
+            );
+            assert!(
+                accounts
+                    .bind_space(&instance, &binding.space)
+                    .is_err_and(|error| error.network)
+            );
+            assert!(
+                accounts
+                    .read_session_in(&root, &instance, SessionAccess::BoundOnline(&binding))
+                    .is_err_and(|error| error.network)
+            );
+
+            let guard = accounts.begin_operation().unwrap();
+            let store = Store::open(guard.credential_context().unwrap()).unwrap();
+            assert!(!store.load(&instance).unwrap().refresh_in_progress);
+            drop(store);
+            drop(guard);
+            // An invalid bound DAV target fails before refresh.
+            let mut invalid = binding.clone();
+            invalid.space = "invalid/target".into();
+            assert!(
+                accounts
+                    .read_session_in(&root, &instance, SessionAccess::BoundSaved(&invalid))
+                    .is_err_and(|error| !error.network && error.message == "invalid Space path")
+            );
+
+            let guard = accounts.begin_operation().unwrap();
+            let store = Store::open(guard.credential_context().unwrap()).unwrap();
+            assert!(!store.load(&instance).unwrap().refresh_in_progress);
+            account.access_token = "superseding-disposable-access".into();
+            account.expires_at = u64::MAX;
+            store.save(&account).unwrap();
+            drop(store);
+            drop(guard);
+
+            let renewed = accounts.refresh_rejected_session(&rejected, saved).unwrap();
+            assert!(
+                renewed.account == account,
+                "reuse the already renewed credential"
+            );
+            assert!(
+                accounts
+                    .sync_space(&instance, &binding.space)
+                    .unwrap_err()
+                    .network
+            );
+            assert!(accounts.sync_pending(&instance).unwrap_err().network);
+
+            let mut wrong_principal = binding.clone();
+            wrong_principal.subject = "not-the-owner".into();
+            assert!(
+                accounts
+                    .read_session_in(
+                        &root,
+                        &instance,
+                        SessionAccess::BoundSaved(&wrong_principal)
+                    )
+                    .is_err_and(|error| error.message == "mounted account identity changed")
+            );
+            offline::verify_identity_in(&root, &instance, &account.issuer, &account.subject)
+                .unwrap();
+
+            let guard = accounts.begin_operation().unwrap();
+            let store = Store::open(guard.credential_context().unwrap()).unwrap();
+            account.subject = "replacement-principal".into();
+            // Simulate an out-of-band replacement in this private keyring.
+            {
+                let collection = store.service.get_default_collection().unwrap();
+                let mut items = collection.search_items(attributes(&instance)).unwrap();
+                assert_eq!(items.len(), 1);
+                let data = Zeroizing::new(serde_json::to_vec(&account).unwrap());
+                items
+                    .pop()
+                    .unwrap()
+                    .set_secret(&data, "application/json")
+                    .unwrap();
+            }
+            drop(store);
+            drop(guard);
+            for access in [SessionAccess::Online, saved] {
+                assert!(
+                    accounts
+                        .refresh_rejected_session(&rejected, access)
+                        .is_err_and(|error| error.message == "account changed; retry the operation")
+                );
+            }
+        });
     }
 }

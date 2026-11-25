@@ -11,9 +11,9 @@ the matching release binaries' build/linkage provenance and verify real package
 contents before distributing. Disposable packaging fixtures do not qualify a
 release, and the notice inventory is not a legal compatibility guarantee.
 
-Build `cirrus-daemon` and `cirrus-ui` in release mode with `--locked` and
+Build `cirrus-daemon`, `cirrus-drive-service`, and `cirrus-ui` in release mode with `--locked` and
 without fault-injection features. In a new private build directory, copy this
-`PKGBUILD`, those two executables, and the project's `cirrus-drive.service`
+`PKGBUILD`, those executables, and the project's `cirrus-drive.service`
 and `cirrus-drive.desktop` templates. From the matching reviewed source checkout,
 create the notice source (the output must not already exist):
 
@@ -25,17 +25,18 @@ Copy `cirrus-notices.tar.gz` into the build directory too. It contains the
 public notice bundle, not private gate reports. Verify the binaries on the destination
 with `ldd -r` and `--version` before packaging. Record checksums from the
 trusted build, then run `makepkg` with these variables set to the corresponding
-SHA-256 hex digests: `CIRRUS_DAEMON_SHA256`, `CIRRUS_UI_SHA256`,
+SHA-256 hex digests: `CIRRUS_DAEMON_SHA256`, `CIRRUS_SERVICE_BINARY_SHA256`, `CIRRUS_UI_SHA256`,
 `CIRRUS_SERVICE_SHA256`, `CIRRUS_DESKTOP_SHA256`, and `CIRRUS_NOTICES_SHA256`
 (the notice archive digest reported by the command). The recipe verifies all
-five sources, checks the bundle's internal file digests, installs notices under
+six sources, checks the bundle's internal file digests, installs notices under
 `/usr/share/licenses/cirrus-drive/`, and rejects a fault-injection daemon.
 Set `CIRRUS_GLIBC_MIN` to
-the highest `GLIBC_` version required by either binary, as shown by
+the highest `GLIBC_` version required by any binary, as shown by
 `readelf --version-info`; this becomes the package's minimum glibc dependency.
 
 Inspect the package contents and dependencies before installing with
-`sudo pacman -U /path/to/cirrus-drive-0.1.0-3-x86_64.pkg.tar.zst`.
+`sudo pacman -U /path/to/cirrus-drive-0.1.0-4-x86_64.pkg.tar.zst`.
+Before upgrading, unmount and stop the old service using its matching client.
 Pacman cannot manage a previous per-user install. In particular,
 `~/.local/bin/cirrus-*`, a user unit in `~/.config/systemd/user`, and a desktop
 file in `~/.local/share/applications` take precedence over the packaged files.
