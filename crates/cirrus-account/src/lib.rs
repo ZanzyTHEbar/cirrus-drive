@@ -71,7 +71,7 @@ pub use browser::{Browser, PortalBrowser};
 pub use dav::Entry;
 mod directory;
 pub use directory::DirectorySnapshot;
-use secrets::{AccountData, Store};
+use secrets::{AccountData, Store, StoredAccount};
 
 #[cfg(target_os = "macos")]
 impl From<secrets::CredentialError> for AccountError {
@@ -1194,10 +1194,10 @@ impl Accounts {
         let store = Store::open(_guard.credential_context()?)?;
         let (base, ca) = http::instance_and_ca(instance, ca_pem)?;
         _guard.persist_pending(&store, base.as_str())?;
-        // Check the destination before opening a browser; never replace ambiguous items.
-        // Refuse to overwrite a matching item unless its contents are ours.
-        let mut existing = store.load_existing_account(base.as_str())?;
-        if let Some(account) = &existing {
+        // A recognized legacy item supplies identity, not usable tokens.
+        // Ambiguous items and credential-store failures still abort before OAuth.
+        let mut existing = store.load_for_sign_in(base.as_str())?;
+        if let Some(StoredAccount::Current(account)) = &existing {
             offline::bind_identity_in(
                 _guard.storage_root()?,
                 base.as_str(),
@@ -1270,7 +1270,7 @@ impl Accounts {
         )?;
         self.check_cancelled()?;
         attempt.begin_exchange()?;
-        if let Some(account) = existing.as_mut() {
+        if let Some(StoredAccount::Current(account)) = existing.as_mut() {
             let was_in_progress = account.refresh_in_progress;
             account.refresh_in_progress = true;
             if store.save(account).is_err() {
@@ -1320,12 +1320,9 @@ impl Accounts {
             .refresh_token()
             .ok_or_else(|| AccountError::new("provider did not return a refresh token"))?;
         let expiry = expiry(token.expires_in())?;
-        if let Some(account) = &existing
-            && (account.issuer != config.issuer() || account.subject != claims.subject().as_str())
-        {
-            return Err(AccountError::new(
-                "connected identity differs from the saved account; existing account was preserved",
-            ));
+        if let Some(old) = &existing {
+            old.verify_identity(config.issuer(), claims.subject().as_str())
+                .map_err(AccountError::new)?;
         }
         let account = AccountData {
             instance: base.to_string(),
@@ -1345,7 +1342,13 @@ impl Accounts {
             &account.issuer,
             &account.subject,
         )?;
-        self.save_refresh(&store, &account)?;
+        if let Some(StoredAccount::Legacy(previous)) = existing {
+            // No old usable token was rotated. Leave the item intact on failure;
+            // a later explicit sign-in must recheck it rather than queue a write.
+            store.replace_legacy(&account, &previous)?;
+        } else {
+            self.save_refresh(&store, &account)?;
+        }
         Ok(())
     }
 

@@ -15,7 +15,7 @@ use security_framework_sys::{
 };
 use zeroize::Zeroizing;
 
-use super::{AccountData, CredentialError};
+use super::{AccountData, CredentialError, LegacyAccount, StoredAccount};
 use crate::ownership::credentials::Context;
 
 const SERVICE: &str = "org.cirrusdrive.account.v1";
@@ -57,7 +57,7 @@ pub(crate) struct Store {
 
 struct Existing {
     reference: CFData,
-    account: AccountData,
+    account: StoredAccount,
 }
 
 impl Store {
@@ -184,38 +184,44 @@ impl Store {
         // Check framework CFData length before bytes()/allocation/copy. Rust
         // serialization/copies are zeroized; framework-owned memory is not.
         let secret = Zeroizing::new(data.bytes().to_vec());
-        let account: AccountData = serde_json::from_slice(&secret)
-            .map_err(|_| CredentialError::invalid("account secret is invalid"))?;
-        if account.instance != instance {
-            return Err(CredentialError::invalid(
-                "account secret does not match instance",
-            ));
-        }
+        let account = StoredAccount::decode(&secret, instance).map_err(CredentialError::invalid)?;
         Ok(Some(Existing { reference, account }))
     }
 
     pub(crate) fn load(&self, instance: &str) -> Result<AccountData> {
-        self.load_existing_account(instance)?
-            .ok_or_else(|| CredentialError::invalid("account is not connected"))
+        self.load_for_sign_in(instance)?
+            .ok_or_else(|| CredentialError::invalid("account is not connected"))?
+            .current()
+            .map_err(CredentialError::invalid)
     }
 
-    pub(crate) fn load_existing_account(&self, instance: &str) -> Result<Option<AccountData>> {
+    pub(crate) fn load_for_sign_in(&self, instance: &str) -> Result<Option<StoredAccount>> {
         self.existing(instance)
             .map(|item| item.map(|item| item.account))
     }
 
     pub(crate) fn save(&self, account: &AccountData) -> Result<()> {
+        self.save_checked(account, None)
+    }
+
+    pub(crate) fn replace_legacy(
+        &self,
+        account: &AccountData,
+        previous: &LegacyAccount,
+    ) -> Result<()> {
+        self.save_checked(account, Some(previous))
+    }
+
+    fn save_checked(&self, account: &AccountData, replace: Option<&LegacyAccount>) -> Result<()> {
         self.context.require_writer()?;
         // Validate the existing payload while the SAME writer fence is held.
-        // An unparseable/foreign item is not permission to recreate or replace.
         let existing = self.existing(&account.instance)?;
-        if existing.as_ref().is_some_and(|item| {
-            item.account.issuer != account.issuer || item.account.subject != account.subject
-        }) {
-            return Err(CredentialError::invalid(
-                "connected identity differs from the saved account; existing account was preserved",
-            ));
-        }
+        StoredAccount::check_save(
+            existing.as_ref().map(|item| &item.account),
+            account,
+            replace,
+        )
+        .map_err(CredentialError::invalid)?;
         let encoded = Zeroizing::new(
             serde_json::to_vec(account)
                 .map_err(|_| CredentialError::invalid("cannot encode account secret"))?,

@@ -5,7 +5,7 @@ use secret_service::{
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
-use super::AccountData;
+use super::{AccountData, LegacyAccount, StoredAccount};
 use crate::AccountError;
 use crate::ownership::credentials::Context;
 
@@ -23,7 +23,7 @@ pub(crate) struct Store {
 
 struct Existing<'a> {
     item: Item<'a>,
-    account: AccountData,
+    account: StoredAccount,
 }
 
 impl Store {
@@ -49,14 +49,13 @@ impl Store {
     }
 
     pub fn load(&self, instance: &str) -> Result<AccountData, AccountError> {
-        self.load_existing_account(instance)?
-            .ok_or_else(|| unavailable("account is not connected"))
+        self.load_for_sign_in(instance)?
+            .ok_or_else(|| unavailable("account is not connected"))?
+            .current()
+            .map_err(AccountError::new)
     }
 
-    pub fn load_existing_account(
-        &self,
-        instance: &str,
-    ) -> Result<Option<AccountData>, AccountError> {
+    pub fn load_for_sign_in(&self, instance: &str) -> Result<Option<StoredAccount>, AccountError> {
         let collection = self
             .service
             .get_default_collection()
@@ -65,18 +64,33 @@ impl Store {
     }
 
     pub fn save(&self, account: &AccountData) -> Result<(), AccountError> {
+        self.save_checked(account, None)
+    }
+
+    pub fn replace_legacy(
+        &self,
+        account: &AccountData,
+        previous: &LegacyAccount,
+    ) -> Result<(), AccountError> {
+        self.save_checked(account, Some(previous))
+    }
+
+    fn save_checked(
+        &self,
+        account: &AccountData,
+        replace: Option<&LegacyAccount>,
+    ) -> Result<(), AccountError> {
         let collection = self
             .service
             .get_default_collection()
             .map_err(|_| AccountError::new("default Secret Service collection is unavailable"))?;
         let existing = existing(&collection, &account.instance)?;
-        if existing.as_ref().is_some_and(|item| {
-            item.account.issuer != account.issuer || item.account.subject != account.subject
-        }) {
-            return Err(AccountError::new(
-                "connected identity differs from the saved account; existing account was preserved",
-            ));
-        }
+        StoredAccount::check_save(
+            existing.as_ref().map(|item| &item.account),
+            account,
+            replace,
+        )
+        .map_err(AccountError::new)?;
         let data = Zeroizing::new(
             serde_json::to_vec(account)
                 .map_err(|_| AccountError::new("cannot encode account secret"))?,
@@ -156,11 +170,7 @@ fn existing<'a>(
     if secret.len() > 131_072 {
         return Err(AccountError::new("account secret exceeds the size limit"));
     }
-    let account: AccountData = serde_json::from_slice(&secret)
-        .map_err(|_| AccountError::new("account secret is invalid"))?;
-    if account.instance != instance {
-        return Err(AccountError::new("account secret does not match instance"));
-    }
+    let account = StoredAccount::decode(&secret, instance).map_err(AccountError::new)?;
     Ok(Some(Existing { item, account }))
 }
 
