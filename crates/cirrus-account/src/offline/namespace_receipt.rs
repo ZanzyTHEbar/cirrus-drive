@@ -350,6 +350,7 @@ mod acceptance {
             subject: subject.into(),
             offline: true,
             offline_writable: false,
+            directory_denials: Default::default(),
         };
         let old_handle = crate::OperationHandle::capture(&conn, instance, "space", 2).unwrap();
         let new_handle = crate::OperationHandle::capture(&conn, instance, "space", 3).unwrap();

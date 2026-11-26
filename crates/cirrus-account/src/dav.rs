@@ -313,10 +313,11 @@ pub(crate) fn directory_snapshot_timed_in(
         return Err(AccountError::unauthorized());
     }
     if response.status().as_u16() != 207 {
-        if matches!(response.status().as_u16(), 403 | 404 | 410) {
-            return Err(AccountError::new(
-                "directory access denied or resource removed",
-            ));
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(AccountError::directory_forbidden());
+        }
+        if matches!(response.status().as_u16(), 404 | 410) {
+            return Err(AccountError::new("directory resource removed"));
         }
         if matches!(response.status().as_u16(), 408 | 425 | 429 | 503) {
             let mut error =

@@ -58,6 +58,17 @@ fn no_refresh(_: &mut ReadSession) -> Result<(), AccountError> {
     panic!("this startup must not request a refresh");
 }
 
+fn reply_invalid_tls_once(listener: TcpListener) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        connection.read_exact(&mut [0; 5]).unwrap();
+        connection.write_all(b"not a TLS record\r\n").unwrap();
+    })
+}
+
 #[test]
 fn explicit_mount_start_requires_initial_transport_and_exact_retained_proof() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -237,18 +248,95 @@ fn explicit_mount_start_requires_initial_transport_and_exact_retained_proof() {
 
     // A listening socket speaks invalid TLS rather than being unreachable.
     let (tls_base, listener) = loopback("https");
-    let server = thread::spawn(move || {
-        let (mut connection, _) = listener.accept().unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        connection.read_exact(&mut [0; 5]).unwrap();
-        connection.write_all(b"not a TLS record\r\n").unwrap();
-    });
+    let server = reply_invalid_tls_once(listener);
     session.base = tls_base;
     session.client = http::client(None).unwrap();
     let error = failure(&mut session, SPACE);
     server.join().unwrap();
     assert_eq!(error.to_string(), "Space request failed");
     assert_eq!(activation(), before);
+}
+
+#[test]
+fn denied_parent_blocks_speculative_cache_hit_but_not_foreground_verification() {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let path = std::env::temp_dir().join(format!("ra-{}-{}", std::process::id(), now.as_nanos()));
+    DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let fixture = Fixture(path);
+    let runtime = fixture.0.join("rt");
+    DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+    let root = StorageRoot::open_container(&fixture.0).unwrap();
+    let accounts = Accounts::with_storage(RuntimeDir::open(&runtime).unwrap(), root.clone());
+
+    let (base, listener) = loopback("https");
+    let instance = base.to_string();
+    let session = Arc::new(ReadSession {
+        root: root.clone(),
+        base: base.clone(),
+        account: AccountData {
+            instance: instance.clone(),
+            issuer: instance.clone(),
+            client_id: "client".into(),
+            token_endpoint: base.join("/token").unwrap().into(),
+            subject: "owner".into(),
+            ca_pem: None,
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: now.as_secs() + 600,
+            refresh_in_progress: false,
+        },
+        client: http::client(None).unwrap(),
+    });
+    offline::bind_identity_in(&root, &instance, &instance, "owner").unwrap();
+    let binding = explicit_space_binding(&session, SPACE, None);
+    let parent = ["parent".to_owned()];
+    let parent_id = "parent-id";
+    let version = FileVersion {
+        instance,
+        space: SPACE.into(),
+        path: vec![parent[0].clone(), "file".into()],
+        id: "file-id".into(),
+        etag: "\"v1\"".into(),
+        size: 5,
+        checksums: Vec::new(),
+    };
+    cache::store(
+        &session,
+        &version,
+        0,
+        b"cache",
+        cache::generation_in(&root).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache::read(&session, &version, 0, 5).unwrap().as_deref(),
+        Some(&b"cache"[..])
+    );
+    *accounts.read_session.lock().unwrap() = Some(session);
+
+    let generation = accounts.metadata_generation();
+    binding.record_directory_denial(&parent, parent_id);
+    assert!(
+        accounts
+            .read_range_ahead(&binding, &version, 0, 5, parent_id)
+            .is_err_and(|error| error.is_directory_forbidden())
+    );
+    assert_eq!(accounts.metadata_generation(), generation);
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        listener
+            .accept()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+
+    listener.set_nonblocking(false).unwrap();
+    let server = reply_invalid_tls_once(listener);
+    assert_eq!(
+        accounts
+            .read_range(&binding, &version, 0, 5)
+            .unwrap_err()
+            .message,
+        "directory request failed"
+    );
+    server.join().unwrap();
 }
