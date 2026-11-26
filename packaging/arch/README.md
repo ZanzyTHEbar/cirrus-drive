@@ -36,7 +36,10 @@ the highest `GLIBC_` version required by any binary, as shown by
 
 Inspect the package contents and dependencies before installing with
 `sudo pacman -U /path/to/cirrus-drive-0.1.0-4-x86_64.pkg.tar.zst`.
-Before upgrading, unmount and stop the old service using its matching client.
+Before upgrading or removing the package, follow the unmount and stop steps in
+[Stop, uninstall or upgrade](../../README.md#stop-uninstall-or-upgrade) using the
+installed client that matches the running service. Use pacman, not the user-local
+uninstall script, to remove the package.
 Pacman cannot manage a previous per-user install. In particular,
 `~/.local/bin/cirrus-*`, a user unit in `~/.config/systemd/user`, and a desktop
 file in `~/.local/share/applications` take precedence over the packaged files.

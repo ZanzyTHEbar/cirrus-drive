@@ -6,7 +6,16 @@ After=graphical-session-pre.target
 Type=simple
 ExecStart=cirrus-drive-service
 # Retry only an explicit busy response; wait rather than signal a service whose outcome is unknown.
-ExecStop=/bin/sh -c 'while kill -0 "$$MAINPID" 2>/dev/null; do cirrus-daemon --stop; case $$? in 75) sleep 5 ;; *) break ;; esac; done; while kill -0 "$$MAINPID" 2>/dev/null; do sleep 1; done'
+# systemd leaves MAINPID unset if the main process is already gone. Never probe a process group.
+ExecStop=/bin/sh -c '\
+    case "$$MAINPID" in ""|0*|*[!0-9]*) exit 0 ;; esac; \
+    [ "$$MAINPID" -le 2147483647 ] 2>/dev/null || exit 0; \
+    alive() { kill -0 "$$MAINPID" 2>/dev/null; }; \
+    while alive; do \
+        cirrus-daemon --stop; \
+        case $$? in 75) alive || exit 0; sleep 5 ;; *) break ;; esac; \
+    done; \
+    while alive; do sleep 1; done'
 Restart=on-failure
 TimeoutStopSec=infinity
 

@@ -47,7 +47,7 @@ The installer uses the debug binaries in `target/debug`, installs user-local bin
 
 Alternatively, run `target/debug/cirrus-drive-service` in a terminal. The service must remain running while the mount is in use. `cirrus-daemon` is the command client; it never starts the service. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
 
-Use matching versions of all three binaries. Before upgrading, unmount and stop the old service with its existing client, then start the new service. The new local protocol rejects clients and services that use the old protocol.
+Use matching versions of all three binaries. Before upgrading, follow [Stop, uninstall or upgrade](#stop-uninstall-or-upgrade) with the installed version. The new local protocol rejects clients and services that use the old protocol.
 
 ## Connect and mount
 
@@ -113,7 +113,15 @@ Before unpin, repin or rename transforms active pin ownership, required original
 
 Offline remote-directory replacement of an exact empty target transforms overlapping pins within bounded entry, byte and metadata limits. Independently pinned source roots follow the move; source ancestors retain their siblings, and destination ancestors gain the fully captured incoming subtree. Coverage may combine agreeing verified source fragments with complete saved directory proofs; descendant directories, including empty ones, need captured metadata. New local creations with no conflicting history move separately, without becoming pinned. Each affected original pin becomes a separate recovery copy, including displaced target pins. Missing content, conflicting captures and unresolved overlapping moves are refused. Pin captures exclude later dirty edits, and pending moves may report stale metadata. Use `--pins-space` and `--pin-copies` before explicitly removing a pin or copy.
 
-To uninstall user artifacts, unmount all Spaces and stop the service first, then run `./packaging/uninstall.sh`. The default uninstall retains local state and credentials. See `cirrus-daemon --help` and `cirrus-ui --help` for additional commands.
+## Stop, uninstall or upgrade
+
+1. Close files and applications using the mounts, and change any terminal's working directory to a location outside the mounts.
+2. Unmount each Space in the Cirrus UI or with `cirrus-daemon --unmount-space HTTPS_URL SPACE_ID`. Use the installed client that matches the running service, including when preparing to upgrade.
+3. Run `cirrus-daemon --mounts` and verify that it succeeds and lists no mounts. Then stop the service with `systemctl --user stop cirrus-drive.service` (or `cirrus-daemon --stop` if you started it in a terminal).
+
+Do not use `umount` or `fusermount3` on a mount still owned by the running Cirrus service. External unmount is unsupported and can leave the service unable to stop cleanly. If that happens, pause the uninstall or upgrade and preserve local state and credentials. Do not delete state or force-detach mounts to get past the error.
+
+Once the service has stopped, use `./packaging/uninstall.sh` to remove the user-installed artifacts. It retains local state and credentials. To upgrade, then install and start the new matching versions. See `cirrus-daemon --help` and `cirrus-ui --help` for additional commands.
 
 Pre-release development state has no migration requirement or compatibility promise. Preserve anything needed before upgrading; do not assume a newer binary can open or safely downgrade that state. There is no supported in-place state upgrade or rollback procedure. Installation, upgrade, crash recovery and hardware/power-loss durability are not yet production-qualified.
 
