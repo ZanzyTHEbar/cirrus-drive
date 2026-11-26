@@ -613,7 +613,10 @@ dependencies = [
  "cirrus-client",
  "cirrus-fuse",
  "cirrus-runtime",
+ "libc",
+ "ring",
  "rustix 1.1.5",
+ "serde",
  "serde_json",
 ]
 

@@ -4,6 +4,114 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Linux resident release-control operations, independently negotiated from account IPC.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReleaseRequest {
+    Status,
+    MountEngines,
+    Activate { release: String },
+    Rollback,
+    CredentialPolicy(CredentialPolicyRequest),
+}
+
+/// Resident-contained Linux automatic credential writer profiles (ABI 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialPolicy {
+    /// One second per method on an automatic writer connection.
+    #[default]
+    StandardV1,
+    /// Two seconds per method on an automatic writer connection.
+    SlowKeyringV1,
+}
+
+/// Independent signed credential-policy selection on the existing release endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CredentialPolicyRequest {
+    Status,
+    Activate { release: String },
+    Rollback,
+}
+
+/// Live mounted read-planning identity and mount-local observations.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountEngineReport {
+    /// Active engine for all live mounts in this resident.
+    pub read_engine: RunningReadEngine,
+    /// No inventory while mount publication or removal is in progress.
+    pub mounts: Option<Vec<MountEngine>>,
+}
+
+/// Identity of the active staged-read planning program, not the FUSE transport.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningReadEngine {
+    /// Signed release supplying the program; absent for the built-in exact engine.
+    pub release: Option<String>,
+    /// Hash of the exact validated program, if supplied by a release.
+    pub sha256: Option<String>,
+    /// Monotonic generation in this resident, including rollback to built-in.
+    pub generation: u64,
+}
+
+/// One live mount using the report's read engine.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountEngine {
+    pub path: String,
+    pub instance: String,
+    pub space: String,
+    /// Cumulative successful staged reads composed from existing cached ranges.
+    pub composed_reads: u64,
+}
+
+/// Resident-observed activation state. A selected set is not proof of a live worker.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseStatus {
+    /// Whether this resident owns a signed user install.
+    pub managed: bool,
+    /// Install directory device and inode observed by this resident.
+    pub installation: Option<String>,
+    /// PID that continues to own the runtime endpoint and all mounts.
+    pub resident_pid: u32,
+    /// Version of the running resident, independent of release selection.
+    pub resident_version: String,
+    /// Digest of the executable inode currently running, when managed.
+    pub resident_sha256: Option<String>,
+    /// Durable set used for new client processes; may have no live worker.
+    pub selected_release: Option<String>,
+    /// Previous durable set available for a verified rollback attempt.
+    pub previous_release: Option<String>,
+    /// Worker currently serving policy, absent if disabled or paused.
+    pub worker: Option<RunningWorker>,
+    /// A negotiated replacement is waiting for the resident policy turn boundary.
+    pub draining_policy_turn: bool,
+    /// Whether automatic transfer scheduling is enabled and has a worker if managed.
+    pub automatic_sync: bool,
+    /// The selected set cannot replace the different running resident live.
+    pub resident_update_pending: bool,
+    /// Observed pause or persistence diagnostic, if any.
+    pub note: Option<String>,
+}
+
+/// Identity of the currently negotiated worker, not a staged artifact.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningWorker {
+    /// Signed release that supplied this process's policy executable.
+    pub release: String,
+    /// Digest of the verified executable bytes.
+    pub sha256: String,
+    /// Worker process ID, not the resident PID.
+    pub pid: u32,
+    /// Monotonic fence within this resident process.
+    pub generation: u64,
+}
+
 /// Stored clean-range payload usage across all accounts and Spaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

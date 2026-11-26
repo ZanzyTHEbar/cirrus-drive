@@ -47,7 +47,23 @@ The installer uses the debug binaries in `target/debug`, installs user-local bin
 
 Alternatively, run `target/debug/cirrus-drive-service` in a terminal. The service must remain running while the mount is in use. `cirrus-daemon` is the command client; it never starts the service. Run `target/debug/cirrus-ui` for the window. The commands below assume the installed binaries are on `PATH`.
 
-Use matching versions of all three binaries. Before upgrading, follow [Stop, uninstall or upgrade](#stop-uninstall-or-upgrade) with the installed version. The new local protocol rejects clients and services that use the old protocol.
+Use matching binaries. Standard and package-managed installations still upgrade through [Stop, uninstall or upgrade](#stop-uninstall-or-upgrade). A user-managed installation can opt in to [signed live scheduling and staged-read planner updates](packaging/linux-live-release.md) after its first maintenance transition. The FUSE transport and resident operation executor are not replaced live.
+
+If the Linux service reports that offline State requires maintenance, stop all
+Cirrus services for this account, unmount their drives, and stop any other
+program using this State directory. Then run the new service binary as the
+same user, with the normal `XDG_RUNTIME_DIR`:
+
+```sh
+cirrus-drive-service --prepare-state --legacy-writers-stopped
+```
+
+Restart the service only after the command succeeds. Preparation upgrades
+known State schemas in place; it does not replace the database or staged
+objects. Older binaries may ignore the maintenance lock, so running this
+command is not a substitute for stopping them. Do not restore an older
+database to roll back the software: it would omit edits acknowledged since
+the upgrade. Use only a previous binary that can read and write the current State.
 
 ## Connect and mount
 
@@ -123,7 +139,7 @@ Prefer Cirrus's own unmount command. If an idle mount was already removed with a
 
 Once the service has stopped, use `./packaging/uninstall.sh` to remove the user-installed artifacts. It retains local state and credentials. To upgrade, then install and start the new matching versions. See `cirrus-daemon --help` and `cirrus-ui --help` for additional commands.
 
-Pre-release development state has no migration requirement or compatibility promise. Preserve anything needed before upgrading; do not assume a newer binary can open or safely downgrade that state. There is no supported in-place state upgrade or rollback procedure. Installation, upgrade, crash recovery and hardware/power-loss durability are not yet production-qualified.
+Pre-release development state has no migration requirement or compatibility promise. Preserve anything needed before upgrading; do not assume a newer binary can open or safely downgrade that state. Live policy rollback does not migrate or revert data. There is no supported in-place resident state upgrade or rollback procedure. Installation, upgrade, crash recovery and hardware/power-loss durability are not yet production-qualified.
 
 ## Contributing and license
 

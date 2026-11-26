@@ -38,6 +38,17 @@ struct AnonymousFile {
 static ANONYMOUS: Mutex<Vec<AnonymousFile>> = Mutex::new(Vec::new());
 static TRACKING_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 
+// A dead observation must not keep a root admitted for cold maintenance.
+// Live scratch (including a sampling reference) still pins its original root.
+#[cfg(target_os = "linux")]
+pub(crate) fn prune_closed_scratch() -> Result<(), AccountError> {
+    ANONYMOUS
+        .lock()
+        .map_err(|_| unavailable())?
+        .retain(|entry| entry.file.strong_count() != 0);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum AnonymousKind {
     Directory,
@@ -144,13 +155,8 @@ impl UsageAccounting for StorageUsage {
     }
 }
 
-fn database(
-    root: &StorageRoot,
-    database: Database,
-    app: i64,
-    version: i64,
-) -> Result<Option<Connection>, AccountError> {
-    let Some(opening) = database
+fn inspect_cache(root: &StorageRoot) -> Result<Option<Connection>, AccountError> {
+    let Some(opening) = Database::Cache
         .open(root, OpenMode::Inspect)
         .map_err(|_| unavailable())?
     else {
@@ -166,15 +172,7 @@ fn database(
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| unavailable())?;
     opening.check_named().map_err(|_| unavailable())?;
-    if identity != app
-        || (schema != version
-            // Read-only accounting can inspect the supported pre-migration
-            // schema without upgrading or opening a second writer. Its payload
-            // tables are unchanged by the additive catalog migration.
-            && !(matches!(database, Database::State)
-                && matches!(schema, 17 | 18)
-                && version == offline::STATE_SCHEMA_VERSION))
-    {
+    if identity != 0x4344_4331 || schema != 2 {
         return Err(unavailable());
     }
     opening
@@ -246,12 +244,7 @@ fn observe(
         Err(error) => result.storage_limits_error = Some(error.to_string()),
     }
     if payload_counts
-        && let Some(conn) = database(
-            root,
-            Database::State,
-            0x4344_5231,
-            offline::STATE_SCHEMA_VERSION,
-        )?
+        && let Some(conn) = offline::inspect_state_in(root).map_err(|_| unavailable())?
     {
         (result.pin_payload_bytes, result.pin_chunks) = conn
             .query_row(
@@ -271,7 +264,7 @@ fn observe(
             .query_row("SELECT count(*) FROM dirty_roots", [], |row| row.get(0))
             .map_err(|_| unavailable())?;
     }
-    if payload_counts && let Some(conn) = database(root, Database::Cache, 0x4344_4331, 2)? {
+    if payload_counts && let Some(conn) = inspect_cache(root)? {
         (result.clean_payload_bytes, result.clean_ranges) = conn
             .query_row(
                 "SELECT coalesce(sum(length(body)),0),count(*) FROM ranges",
@@ -510,7 +503,18 @@ mod tests {
     #[test]
     fn sqlite_inspection_does_not_migrate_or_unlock() {
         const PEER_CONTAINER: &str = "CIRRUS_SQLITE_ADMISSION_PEER_CONTAINER";
+        const PEER_MAINTENANCE: &str = "CIRRUS_SQLITE_ADMISSION_PEER_MAINTENANCE";
         if let Some(path) = std::env::var_os(PEER_CONTAINER) {
+            if std::env::var_os(PEER_MAINTENANCE).is_some() {
+                let path = Path::new(&path);
+                let runtime = cirrus_runtime::RuntimeDir::open(path).unwrap();
+                let error = StorageRoot::prepare_container_state(path, &runtime).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "State maintenance or another storage owner is active"
+                );
+                return;
+            }
             let peer = Connection::open_with_flags(
                 Path::new(&path).join("cirrus-drive/state.db"),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -540,31 +544,74 @@ mod tests {
             .create(&path)
             .unwrap();
         let fixture = Fixture(path);
+        let runtime = cirrus_runtime::RuntimeDir::open(&fixture.0).unwrap();
         let root = StorageRoot::open_container(&fixture.0).unwrap();
+        let instance = "https://fixture.invalid/";
+        let journal =
+            |root: &StorageRoot| offline::journal_in(root, instance, Some("space"), None).unwrap();
+        let accounts = crate::Accounts::with_storage(runtime.try_clone().unwrap(), root.clone());
+        assert!(journal(&root).entries.is_empty());
+        assert!(accounts.activated_spaces().unwrap().is_empty());
+        let idle = accounts.sync_status(instance, "space").unwrap();
+        assert_eq!(idle.phase, crate::SyncPhase::ObservedIdle);
+        assert!(!idle.activated && !idle.new_work && idle.queued == 0);
         assert_eq!(status_in(&root).unwrap().state_sqlite.objects, 0);
         assert_eq!(crate::cache::status_in(&root).unwrap().ranges, 0);
         assert_eq!(status_in(&root).unwrap().cache_sqlite.objects, 0);
 
         let conn = offline::database_in(&root).unwrap();
         conn.execute_batch(
-            "BEGIN IMMEDIATE; DROP TABLE fp_requests; DROP TABLE fp_deletions;
+            "BEGIN IMMEDIATE;
              ALTER TABLE snapshots DROP COLUMN browse_epoch;
              ALTER TABLE snapshots DROP COLUMN browse_at;
-             PRAGMA user_version=18; COMMIT;",
+             PRAGMA user_version=19; COMMIT;",
         )
         .unwrap();
-        assert!(status_in(&root).unwrap().state_sqlite.objects > 0);
+        conn.execute(
+            "INSERT INTO operation_journal(id,instance,space,path,op_type,staged_file,state,updated_at)
+             VALUES(42,?1,'space','[\"saved\"]','write','fixture-root','pending',0)",
+            [instance],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_identities VALUES ('https://fixture.invalid/','issuer','subject');
+             INSERT INTO sync_spaces(instance,space,issuer,subject,phase,failures,next_at,verified_through)
+             VALUES ('https://fixture.invalid/','space','issuer','subject','Queued',0,0,0);",
+        )
+        .unwrap();
         let version = |conn: &Connection| -> i64 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
+        let page = journal(&root);
+        assert_eq!(page.summary.pending, 1);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, 42);
+        assert_eq!(page.entries[0].path, "/saved");
+        assert!(status_in(&root).unwrap().state_sqlite.objects > 0);
+        assert_eq!(
+            accounts.activated_spaces().unwrap(),
+            [(instance.to_owned(), "space".to_owned())]
+        );
+        let active = accounts.sync_status(instance, "space").unwrap();
+        assert_eq!(active.phase, crate::SyncPhase::Queued);
+        assert!(active.activated && active.queued == 1 && active.damaged == 0);
+        assert!(
+            offline::database_in(&root).is_err_and(|e| e.to_string().contains("--prepare-state"))
+        );
+        assert_eq!(version(&conn), 19, "inspection migrated version 19");
+
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; DROP TABLE fp_requests; DROP TABLE fp_deletions;
+             PRAGMA user_version=18; COMMIT;",
+        )
+        .unwrap();
+        assert!(status_in(&root).unwrap().state_sqlite.objects > 0);
         assert_eq!(
             version(&conn),
             18,
             "storage accounting migrated the database"
         );
-        drop(conn);
-
         limits::set_in(
             &root,
             Some(StorageLimits {
@@ -573,21 +620,38 @@ mod tests {
             }),
         )
         .unwrap();
+        let peer = || {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "storage::tests::sqlite_inspection_does_not_migrate_or_unlock",
+                ])
+                .env(PEER_CONTAINER, &fixture.0);
+            command
+        };
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let output = peer().env(PEER_MAINTENANCE, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "peer maintenance check failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+        drop(conn);
+        drop(accounts);
+        drop(root);
+        StorageRoot::prepare_container_state(&fixture.0, &runtime).unwrap();
+        let root = StorageRoot::open_container(&fixture.0).unwrap();
         let writer = offline::database_in(&root).unwrap();
         assert_eq!(version(&writer), offline::STATE_SCHEMA_VERSION);
         assert!(status_in(&root).unwrap().sql_reservations.is_empty());
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
         drop(offline::database_in(&root).unwrap());
         status_in(&root).unwrap();
+        assert_eq!(journal(&root).entries[0].id, 42);
 
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "storage::tests::sqlite_inspection_does_not_migrate_or_unlock",
-            ])
-            .env(PEER_CONTAINER, &fixture.0)
-            .output()
-            .unwrap();
+        let output = peer().output().unwrap();
         let report = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && report.contains("1 passed"),

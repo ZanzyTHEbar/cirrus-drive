@@ -71,13 +71,13 @@ fn retained_file_import_preserves_exact_evidence_and_publishes_latest_durable_he
         }))
         .unwrap()
     };
-    let save = |path: &[String], id: &str, child: Entry| {
-        let mut snapshot = DirectorySnapshot::empty_in(&root).unwrap();
+    let save = |root: &StorageRoot, path: &[String], id: &str, child: Entry| {
+        let mut snapshot = DirectorySnapshot::empty_in(root).unwrap();
         snapshot.set_remote_parent(id, "\"v1\"").unwrap();
         snapshot.insert(&child).unwrap();
         assert!(
             offline::save_directory_snapshot(
-                offline::begin_snapshot_in(&root).unwrap(),
+                offline::begin_snapshot_in(root).unwrap(),
                 INSTANCE,
                 SPACE,
                 path,
@@ -86,14 +86,19 @@ fn retained_file_import_preserves_exact_evidence_and_publishes_latest_durable_he
             .unwrap()
         );
     };
-    save(&[], "root-id", entry("subdir", "subdir-id", true));
+    save(&root, &[], "root-id", entry("subdir", "subdir-id", true));
     assert!(
         import(SPACE)
             .unwrap_err()
             .to_string()
             .contains("metadata is unavailable")
     );
-    save(&target[..1], "subdir-id", entry("draft", "draft-id", false));
+    save(
+        &root,
+        &target[..1],
+        "subdir-id",
+        entry("draft", "draft-id", false),
+    );
     accounts
         .configure_storage_limits(Some(StorageLimits {
             budget_bytes: 512 * 1024 * 1024,
@@ -110,14 +115,38 @@ fn retained_file_import_preserves_exact_evidence_and_publishes_latest_durable_he
 
     // Retained imports join the same principal's shared staging window.
     let _shared = ownership::acquire_offline_in(&root, &runtime).unwrap();
-    let pending = |root| offline::pending_writes(root, INSTANCE, Some(SPACE), 0, i64::MAX).unwrap();
-    let read = |root, staged, bytes: &[u8]| {
+    let pending = |root: &StorageRoot| {
+        offline::pending_writes(root, INSTANCE, Some(SPACE), 0, i64::MAX).unwrap()
+    };
+    let read = |root: &StorageRoot, staged: &str, bytes: &[u8]| {
         let staged = offline::StagedSnapshot::open_at(root, staged).unwrap();
         assert_eq!(staged.len(), bytes.len() as u64);
         assert_eq!(staged.range(0, bytes.len() as u32).unwrap(), bytes);
     };
     import(SPACE).unwrap();
     let original = pending(&root).pop().unwrap();
+    read(&root, &original.staged, CONTENT);
+
+    // Recreate the v19 header and exact predecessor schema around a real
+    // acknowledged journal head, then exercise the cold maintenance path.
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE snapshots DROP COLUMN browse_epoch;
+         ALTER TABLE snapshots DROP COLUMN browse_at;
+         PRAGMA user_version=19; COMMIT;",
+    )
+    .unwrap();
+    drop(conn);
+    drop(_shared);
+    drop(accounts);
+    drop(root);
+    StorageRoot::prepare_container_state(&fixture.0, &runtime).unwrap();
+    let root = StorageRoot::open_container(&fixture.0).unwrap();
+    let conn = offline::database_in(&root).unwrap();
+    let accounts = Accounts::with_storage(runtime.try_clone().unwrap(), root.clone());
+    let _shared = ownership::acquire_offline_in(&root, &runtime).unwrap();
+    let import = |space: &str| accounts.stage_file_offline_space(INSTANCE, space, &target, &source);
+    assert_eq!(pending(&root), [original.clone()]);
     read(&root, &original.staged, CONTENT);
 
     conn.execute_batch(
@@ -135,7 +164,12 @@ fn retained_file_import_preserves_exact_evidence_and_publishes_latest_durable_he
 
     // A newer observation of the underlying file is not a new PUT base for
     // this already acknowledged local edit.
-    save(&target[..1], "subdir-id", entry("draft", "other-id", false));
+    save(
+        &root,
+        &target[..1],
+        "subdir-id",
+        entry("draft", "other-id", false),
+    );
     let input = fs::File::create(&source).unwrap();
     let tail = 64 * 1024 * 1024 + 1;
     input.write_all_at(b"large tail", tail).unwrap();
@@ -286,6 +320,9 @@ fn retained_file_import_preserves_exact_evidence_and_publishes_latest_durable_he
     assert_eq!(write.path, absent);
     assert_eq!(write.base_id, None);
     assert_eq!(write.base_etag, None);
+    let compatible = StorageRoot::open_container(&fixture.0).unwrap();
+    assert_eq!(pending(&compatible), writes);
+    read(&compatible, &write.staged, b"save during rejected upload");
     let entries = accounts
         .offline_directory(INSTANCE, SPACE, &target[..1])
         .unwrap();

@@ -3,11 +3,12 @@ use secret_service::{
     blocking::{Collection, Item, SecretService},
 };
 use std::collections::HashMap;
+use std::sync::Weak;
 use zeroize::Zeroizing;
 
 use super::{AccountData, LegacyAccount, StoredAccount};
 use crate::AccountError;
-use crate::ownership::credentials::Context;
+use crate::ownership::credentials::{Context, Writer};
 
 fn unavailable(message: &'static str) -> AccountError {
     if crate::executor::is_automatic() {
@@ -19,6 +20,7 @@ fn unavailable(message: &'static str) -> AccountError {
 
 pub(crate) struct Store {
     service: SecretService<'static>,
+    writer: Option<Weak<Writer>>,
 }
 
 struct Existing<'a> {
@@ -31,7 +33,10 @@ impl Store {
         let connection = context.connection();
         let service = SecretService::connect_with_existing(EncryptionType::Dh, connection.clone())
             .map_err(|_| unavailable("Secret Service is unavailable"))?;
-        let store = Self { service };
+        let store = Self {
+            service,
+            writer: context.writer(),
+        };
         let collection = store
             .service
             .get_default_collection()
@@ -80,6 +85,13 @@ impl Store {
         account: &AccountData,
         replace: Option<&LegacyAccount>,
     ) -> Result<(), AccountError> {
+        let _writer = self
+            .writer
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                AccountError::new("read-only account ownership cannot save credentials")
+            })?;
         let collection = self
             .service
             .get_default_collection()
@@ -312,7 +324,7 @@ mod acceptance {
     #[test]
     #[ignore = "requires an explicitly guarded disposable Secret Service"]
     fn refuses_corrupt_secret_without_overwriting() {
-        with_private_accounts(|_accounts, guard| {
+        with_private_accounts(|accounts, mut guard| {
             let store = Store::open(guard.credential_context().unwrap()).unwrap();
             let mut account = AccountData {
                 instance: "https://credential-acceptance.invalid/".into(),
@@ -327,9 +339,41 @@ mod acceptance {
                 refresh_in_progress: false,
             };
             store.save(&account).unwrap();
+            guard.guard.as_mut().unwrap().downgrade().unwrap();
             account.access_token = "rotated-disposable-access".into();
             store.save(&account).unwrap();
             assert!(store.load(&account.instance).unwrap() == account);
+            let mut reader = crate::ownership::acquire_shared_in(
+                guard.storage_root().unwrap(),
+                &accounts.runtime,
+            )
+            .unwrap();
+            // Reconnect while the writer still owns the bus name; the reader
+            // must not try to claim it, or gain writes on its replacement bus.
+            reader
+                .credential_context()
+                .connection()
+                .clone()
+                .close()
+                .unwrap();
+            reader.reconnect().unwrap();
+            let reader_store = Store::open(reader.credential_context()).unwrap();
+            assert!(reader_store.load(&account.instance).unwrap() == account);
+            let read_only = |error: AccountError| {
+                error.message == "read-only account ownership cannot save credentials"
+            };
+            let legacy = LegacyAccount {
+                issuer: account.issuer.clone(),
+                subject: account.subject.clone(),
+                fingerprint: [0; 32],
+            };
+            assert!(reader_store.save(&account).is_err_and(read_only));
+            assert!(
+                reader_store
+                    .replace_legacy(&account, &legacy)
+                    .is_err_and(read_only)
+            );
+
             let collection = store.service.get_default_collection().unwrap();
             let mut items = collection
                 .search_items(attributes(&account.instance))
@@ -341,6 +385,106 @@ mod acceptance {
 
             assert!(store.save(&account).is_err());
             assert_eq!(item.get_secret().unwrap(), b"damaged credential");
+            drop(guard);
+            assert!(store.save(&account).is_err_and(read_only));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly guarded disposable Secret Service"]
+    fn credential_policy_switch_refuses_active_and_retained_rotation() {
+        use cirrus_api::CredentialPolicy::{SlowKeyringV1, StandardV1};
+        use std::time::Duration;
+
+        with_private_accounts(|accounts, guard| {
+            let timeout = |operation: &crate::Operation<'_>| {
+                operation
+                    .credential_context()
+                    .unwrap()
+                    .connection()
+                    .method_timeout()
+            };
+            assert_eq!(accounts.credential_policy().unwrap(), StandardV1);
+            assert_eq!(timeout(&guard), None);
+            assert!(
+                accounts
+                    .set_credential_policy(SlowKeyringV1)
+                    .is_err_and(|error| {
+                        error.message == "account operation is active; credential policy unchanged"
+                    })
+            );
+            drop(guard);
+
+            let _automatic = crate::executor::automatic_guard(accounts);
+            let standard = accounts.begin_operation().unwrap();
+            assert_eq!(timeout(&standard), Some(Duration::from_secs(1)));
+            drop(standard);
+            assert_eq!(
+                accounts.set_credential_policy(SlowKeyringV1).unwrap(),
+                SlowKeyringV1
+            );
+
+            let slow = accounts.begin_operation().unwrap();
+            assert_eq!(timeout(&slow), Some(Duration::from_secs(2)));
+            let reader = crate::ownership::acquire_shared_in(
+                slow.storage_root().unwrap(),
+                &accounts.runtime,
+            )
+            .unwrap();
+            assert_eq!(
+                reader.credential_context().connection().method_timeout(),
+                Some(Duration::from_secs(1))
+            );
+            drop(reader);
+
+            let instance = "https://credential-policy-acceptance.invalid/";
+            let mut account = AccountData {
+                instance: instance.into(),
+                issuer: "https://identity-acceptance.invalid/".into(),
+                client_id: "fixture".into(),
+                token_endpoint: "https://identity-acceptance.invalid/token".into(),
+                subject: "fixture".into(),
+                ca_pem: None,
+                access_token: "disposable-access".into(),
+                refresh_token: "disposable-refresh".into(),
+                expires_at: 0,
+                refresh_in_progress: true,
+            };
+            let stale_store = Store::open(slow.credential_context().unwrap()).unwrap();
+            stale_store.save(&account).unwrap();
+            slow.credential_context()
+                .unwrap()
+                .connection()
+                .clone()
+                .close()
+                .unwrap();
+            account.refresh_in_progress = false;
+            account.refresh_token = "rotated-disposable-refresh".into();
+            assert!(accounts.save_refresh(&stale_store, &account).is_err());
+            drop(slow);
+            assert!(accounts.set_credential_policy(StandardV1).is_err_and(|error| {
+                error.message
+                    == "account credentials await keyring persistence; credential policy unchanged"
+            }));
+            assert_eq!(accounts.credential_policy().unwrap(), SlowKeyringV1);
+
+            let retained = accounts.begin_operation().unwrap();
+            assert_eq!(timeout(&retained), Some(Duration::from_secs(2)));
+            assert!(stale_store.save(&account).is_err_and(|error| {
+                error.message == "read-only account ownership cannot save credentials"
+            }));
+            let store = Store::open(retained.credential_context().unwrap()).unwrap();
+            retained.persist_pending(&store, instance).unwrap();
+            drop(store);
+            drop(retained);
+            assert_eq!(
+                accounts.set_credential_policy(StandardV1).unwrap(),
+                StandardV1
+            );
+            let rolled_back = accounts.begin_operation().unwrap();
+            assert_eq!(timeout(&rolled_back), Some(Duration::from_secs(1)));
+            let store = Store::open(rolled_back.credential_context().unwrap()).unwrap();
+            assert!(store.load(instance).unwrap() == account);
         });
     }
 

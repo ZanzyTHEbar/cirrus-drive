@@ -1,5 +1,6 @@
 //! FUSE adapter for daemon-owned Space metadata and durable staged file writes.
 
+mod read_engine;
 mod recovery;
 mod session;
 
@@ -9,7 +10,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,11 +30,15 @@ use rustix::{
     process,
 };
 
+pub use read_engine::{ReadEngines, ReadProgram};
+pub use recovery::MountTable;
+
 const MAX_NODES: usize = 16_384;
 const MAX_HANDLES: usize = 128;
 const MAX_RANGE: u32 = 128 * 1024;
 const READ_AHEAD_BYTES: u32 = 64 * 1024;
 const READ_AHEAD_MIN_READ: u32 = 16 * 1024;
+const READ_VERSION_ATTEMPTS: usize = 3;
 const CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 64;
 const MAX_WRITE_FILE: u64 = 1024 * 1024 * 1024 * 1024;
@@ -257,6 +262,11 @@ impl std::fmt::Debug for Mounted {
 }
 
 impl Mounted {
+    /// Number of staged FUSE reads served by admitted cache composition.
+    pub fn composed_reads(&self) -> u64 {
+        self.refresh.drive.composed_reads.load(Ordering::Relaxed)
+    }
+
     /// Mounts an explicit Space, allowing retained startup only at a custom path.
     ///
     /// # Errors
@@ -267,6 +277,7 @@ impl Mounted {
         id: &str,
         path: Option<&Path>,
         runtime: RuntimeDir,
+        engine: Arc<ReadEngines>,
     ) -> io::Result<Self> {
         let (space, startup) = if path.is_some() {
             accounts.bind_mount_space(&instance, id)
@@ -290,7 +301,7 @@ impl Mounted {
             default_path = create_default_mountpoint(name)?;
             &default_path
         };
-        Self::start_bound(accounts, instance, space, path, runtime, startup).map_err(|error| {
+        Self::start_bound(accounts, instance, space, path, runtime, startup, engine).map_err(|error| {
             if created_default {
                 io::Error::new(
                     error.kind(),
@@ -315,6 +326,7 @@ impl Mounted {
         id: &str,
         path: &Path,
         runtime: RuntimeDir,
+        engine: Arc<ReadEngines>,
     ) -> io::Result<Self> {
         let space = accounts
             .bind_offline_space(instance, id)
@@ -326,6 +338,7 @@ impl Mounted {
             path,
             runtime,
             MountStartup::Normal,
+            engine,
         )
     }
 
@@ -339,6 +352,7 @@ impl Mounted {
         id: &str,
         path: &Path,
         runtime: RuntimeDir,
+        engine: Arc<ReadEngines>,
     ) -> io::Result<Self> {
         let space = accounts
             .bind_writable_offline_space(instance, id)
@@ -350,6 +364,7 @@ impl Mounted {
             path,
             runtime,
             MountStartup::Normal,
+            engine,
         )
     }
 
@@ -360,6 +375,7 @@ impl Mounted {
         path: &Path,
         runtime: RuntimeDir,
         startup: MountStartup,
+        engine: Arc<ReadEngines>,
     ) -> io::Result<Self> {
         recovery::ensure_available(&runtime, path)?;
         let seed = if matches!(startup, MountStartup::Normal) {
@@ -408,7 +424,7 @@ impl Mounted {
         let offline = space.is_offline();
         let mut config = Config::default();
         config.n_threads = Some(4);
-        let filesystem = Drive::new(accounts.clone(), instance, space.clone(), source.clone());
+        let filesystem = Drive::new(accounts.clone(), instance, space.clone(), source.clone(), engine);
         let walk_seed = seed.and_then(|(entries, generation, started)| {
             // Reuse the preflight without making a capacity error fatal to mount startup.
             filesystem
@@ -530,6 +546,12 @@ impl Mounted {
     pub fn is_active(&self) -> io::Result<bool> {
         Ok(!self.is_disconnected()?
             && recovery::mount_state(&self.path, &self.source)?.exact_id == Some(self.mount_id))
+    }
+
+    /// Checks the original mount ID in a previously read namespace table.
+    /// Inspect the device separately with [`Self::is_disconnected`].
+    pub fn matches_mount_table(&self, table: &MountTable) -> bool {
+        table.exact_id(&self.path, &self.source) == Some(self.mount_id)
     }
 
     /// Checks the old kernel connection, independent of its mountpoint.
@@ -1015,11 +1037,13 @@ struct RangeKey {
     version: FileVersion,
     offset: u64,
     length: u32,
+    staged_cache_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RangePriority {
     Foreground,
+    Staged(u64),
     ReadAhead,
 }
 
@@ -1247,6 +1271,18 @@ impl Namespace {
 }
 
 impl State {
+    fn read_file(&self, ino: INodeNo, handle: FileHandle) -> Result<&OpenFile, Errno> {
+        let file = self
+            .files
+            .get(&handle.0)
+            .filter(|file| file.ino == ino.0)
+            .ok_or(Errno::EBADF)?;
+        if file.failed {
+            return Err(Errno::EIO);
+        }
+        Ok(file)
+    }
+
     fn live_node(&self, ino: u64) -> Option<&Node> {
         self.nodes
             .get(&ino)
@@ -1320,10 +1356,21 @@ impl State {
 struct OpenFile {
     ino: u64,
     version: SharedVersion,
+    namespace_rebind: u64,
     failed: bool,
     writable: bool,
     append: bool,
     last_read: Option<(u64, u32)>,
+}
+
+impl OpenFile {
+    // Only ordinary content publication may change the version within a
+    // read's original lineage. Namespace changes must not be retried as writes.
+    fn rebind_namespace(&mut self, version: SharedVersion) -> SharedVersion {
+        self.namespace_rebind = self.namespace_rebind.wrapping_add(1);
+        self.last_read = None;
+        std::mem::replace(&mut self.version, version)
+    }
 }
 
 struct ReadAheadLease(Arc<Accounts>);
@@ -1344,6 +1391,8 @@ struct Drive {
     directory_ready: Arc<Condvar>,
     flights: Arc<Mutex<HashMap<RangeKey, Arc<Flight>>>>,
     mutation: Arc<Mutex<()>>,
+    engine: Arc<ReadEngines>,
+    composed_reads: Arc<AtomicU64>,
 }
 
 impl Drive {
@@ -1352,6 +1401,7 @@ impl Drive {
         instance: String,
         space: MountBinding,
         browse_id: String,
+        engine: Arc<ReadEngines>,
     ) -> Self {
         let cache_generation = accounts.clean_cache_generation();
         let root = Node {
@@ -1370,6 +1420,8 @@ impl Drive {
             instance,
             space,
             browse_id,
+            engine,
+            composed_reads: Arc::new(AtomicU64::new(0)),
             state: Arc::new(Mutex::new(State {
                 namespace: Arc::new(Namespace {
                     nodes: HashMap::from([(1, root)]),
@@ -2054,7 +2106,7 @@ impl Drive {
                        mut next_node: u64,
                        groups: &[(usize, u64, Vec<u64>)],
                        detached: &[(u64, Arc<Node>)],
-                       entries: &mut DirectorySnapshot|
+                       mut entries: DirectorySnapshot|
          -> Result<PreparedListing, Errno> {
             let mut promotions = Vec::with_capacity(MAX_HANDLES);
             for (path, resource, remote) in &confirmed_directories {
@@ -2098,7 +2150,7 @@ impl Drive {
                 }
             }
             state.scans.insert(u64::from(ino), ticket);
-            let mut replaced = std::collections::HashSet::new();
+            let mut replaced = HashSet::new();
             let mut invalidated = Vec::new();
             for (path, id) in &state.paths {
                 if path.len() == parent.path.len() + 1 && path.starts_with(&parent.path) {
@@ -2126,26 +2178,32 @@ impl Drive {
                     }
                 }
             }
-            // Reserve inode identities and finish all scratch writes before removing
-            // any old paths. Capacity/write failures must not publish half a scan.
-            let retained: HashSet<u64> = state
-                .paths
-                .iter()
-                .filter(|(path, _)| {
-                    path.len() <= parent.path.len()
-                        || !path.starts_with(&parent.path)
-                        || !replaced.contains(&path[parent.path.len()])
-                })
-                .map(|(_, id)| *id)
-                .chain(detached.iter().map(|(id, _)| *id))
-                .collect();
+            // Prune only in the private draft, by the exact path component of
+            // each removed/replaced child. A new child has no old subtree.
+            let mut live_nodes = HashSet::new();
+            state.paths.retain(|path, id| {
+                let keep = path.len() <= parent.path.len()
+                    || !path.starts_with(&parent.path)
+                    || !replaced.contains(&path[parent.path.len()]);
+                if keep {
+                    live_nodes.insert(*id);
+                }
+                keep
+            });
+            let retained_count = live_nodes.len()
+                + detached
+                    .iter()
+                    .filter(|(id, _)| !live_nodes.contains(id))
+                    .count();
             let mut new_nodes = 0;
             let mut after = 0;
+            let mut bindings = Vec::new();
             loop {
                 let page = entries.page(after).map_err(|_| Errno::EIO)?;
                 if page.is_empty() {
                     break;
                 }
+                bindings.reserve(page.len());
                 for (cookie, entry) in page {
                     after = cookie;
                     if !entry.is_directory() && entry.size().is_none() {
@@ -2154,27 +2212,25 @@ impl Drive {
                     let mut path = parent.path.clone();
                     path.push(entry.name().to_owned());
                     let existing = state.paths.get(&path).copied().filter(|id| {
-                        retained.contains(id)
-                            && state.nodes.get(id).is_some_and(|node| {
-                                node.directory == entry.is_directory()
-                                    && node.resource_id == entry.id()
-                            })
+                        state.nodes.get(id).is_some_and(|node| {
+                            node.directory == entry.is_directory() && node.resource_id == entry.id()
+                        })
                     });
                     let id = if let Some(id) = existing {
                         id
                     } else {
                         new_nodes += 1;
-                        if retained.len() + new_nodes > MAX_NODES {
+                        if retained_count + new_nodes > MAX_NODES {
                             return Err(Errno::ENOSPC);
                         }
                         let id = next_node;
                         next_node = next_node.checked_add(1).ok_or(Errno::ENOSPC)?;
                         id
                     };
-                    entries
-                        .bind_inode(entry.name(), id)
-                        .map_err(|_| Errno::EIO)?;
+                    bindings.push((cookie, id));
                 }
+                entries = entries.bind_inodes(&bindings).map_err(|_| Errno::EIO)?;
+                bindings.clear();
             }
             #[cfg(feature = "fault-injection")]
             for id in &invalidated {
@@ -2184,14 +2240,8 @@ impl Drive {
                     eprintln!("injected race: scan invalidated a staged inode");
                 }
             }
-            state.paths.retain(|path, _| {
-                path.len() <= parent.path.len()
-                    || !path.starts_with(&parent.path)
-                    || !replaced.contains(&path[parent.path.len()])
-            });
             // Removed or replaced paths already fail node() validation. Reclaim their
             // inode records without reusing inode numbers, including descendants.
-            let live_nodes: HashSet<u64> = state.paths.values().copied().collect();
             state.nodes.retain(|id, _| live_nodes.contains(id));
             state.scans.retain(|id, _| {
                 live_nodes.contains(id) || detached.iter().any(|(detached, _)| detached == id)
@@ -2218,10 +2268,6 @@ impl Drive {
                     let id = if let Some(id) = existing {
                         id
                     } else {
-                        // A replacement directory must not inherit the old directory's children.
-                        state.paths.retain(|candidate, _| {
-                            candidate.len() <= path.len() || !candidate.starts_with(&path)
-                        });
                         let id = entries
                             .child(entry.name())
                             .map_err(|_| Errno::EIO)?
@@ -2256,7 +2302,7 @@ impl Drive {
                     state.nodes.insert(id, node);
                 }
             }
-            let children = DirectoryView(entries.clone());
+            let children = DirectoryView(entries);
             Ok(PreparedListing {
                 namespace: state,
                 next_node,
@@ -2277,7 +2323,7 @@ impl Drive {
                 baseline_next_node,
                 &groups,
                 &detached,
-                &mut entries,
+                entries,
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -2402,8 +2448,9 @@ impl Drive {
                 current_detached.extend(live.detached.iter().map(|(id, node)| (*id, node.clone())));
                 drop(live);
                 drop(namespace);
-                drop(children);
                 drop(cached);
+                // Recover the sole snapshot owner to rebind the changed draft.
+                entries = children.0;
                 let mut index = 0;
                 groups.retain(|_| {
                     let keep = remaining.binary_search(&index).is_ok();
@@ -2426,11 +2473,7 @@ impl Drive {
                     .get_mut(&promotion.handle)
                     .filter(|file| !file.failed && file.version.same_owner(&promotion.expected))
                 {
-                    retired_versions.push(std::mem::replace(
-                        &mut file.version,
-                        promotion.replacement.clone(),
-                    ));
-                    file.last_read = None;
+                    retired_versions.push(file.rebind_namespace(promotion.replacement.clone()));
                 }
             }
             for handle in &effects.invalidated_handles {
@@ -2487,6 +2530,7 @@ impl Drive {
         version: &FileVersion,
         offset: u64,
         length: u32,
+        priority: RangePriority,
     ) -> Result<Vec<u8>, Errno> {
         Self::fetch_range_with(
             &self.accounts,
@@ -2495,7 +2539,7 @@ impl Drive {
             version,
             offset,
             length,
-            RangePriority::Foreground,
+            priority,
         )
     }
 
@@ -2563,11 +2607,16 @@ impl Drive {
             version: version.clone(),
             offset,
             length,
+            staged_cache_generation: match priority {
+                RangePriority::Staged(generation) => Some(generation),
+                _ => None,
+            },
         };
         let (flight, leader, flight_offset, flight_end) = {
             let mut flights = flights.lock().map_err(|_| Errno::EIO)?;
             if let Some((existing, flight)) = flights.iter().find(|(existing, _)| {
                 existing.version == *version
+                    && existing.staged_cache_generation == key.staged_cache_generation
                     && existing.offset < end
                     && existing
                         .offset
@@ -3472,6 +3521,7 @@ impl Filesystem for Drive {
                 OpenFile {
                     ino: u64::from(ino),
                     version,
+                    namespace_rebind: 0,
                     failed: false,
                     writable,
                     append: flags.0 & OFlags::APPEND.bits() as i32 != 0,
@@ -3567,6 +3617,7 @@ impl Filesystem for Drive {
                 OpenFile {
                     ino: id,
                     version,
+                    namespace_rebind: 0,
                     failed: false,
                     writable: true,
                     append: flags & OFlags::APPEND.bits() as i32 != 0,
@@ -4306,9 +4357,7 @@ impl Filesystem for Drive {
                         };
                         owner.bind(version);
                         if let Some(file) = state.files.get_mut(&handle) {
-                            retired_versions
-                                .push(std::mem::replace(&mut file.version, owner.clone()));
-                            file.last_read = None;
+                            retired_versions.push(file.rebind_namespace(owner.clone()));
                         }
                     }
                     state.retire_ranges(&mut retired_ranges, |entry| {
@@ -4556,11 +4605,7 @@ impl Filesystem for Drive {
                                 .values_mut()
                                 .filter(|file| file.ino == id && !file.failed)
                             {
-                                retired_versions.push(std::mem::replace(
-                                    &mut file.version,
-                                    detached_owner.clone(),
-                                ));
-                                file.last_read = None;
+                                retired_versions.push(file.rebind_namespace(detached_owner.clone()));
                             }
                         }
                     }
@@ -4578,9 +4623,7 @@ impl Filesystem for Drive {
                     .values_mut()
                     .filter(|file| file.ino == source_id && !file.failed)
                 {
-                    retired_versions
-                        .push(std::mem::replace(&mut file.version, renamed_owner.clone()));
-                    file.last_read = None;
+                    retired_versions.push(file.rebind_namespace(renamed_owner.clone()));
                 }
                 retired_namespace = std::mem::replace(&mut state.namespace, draft);
                 drop(state);
@@ -4606,66 +4649,137 @@ impl Filesystem for Drive {
         _: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let result = (|| {
-            let staged = {
-                let state = self.state.lock().map_err(|_| Errno::EIO)?;
-                state
-                    .files
-                    .get(&handle.0)
-                    .is_some_and(|file| file.version.id().starts_with("cirrus-staged:"))
-            };
-            // A staged write updates its journal before publishing the new handle version.
-            let _mutation = if staged {
-                Some(self.mutation.lock().map_err(|_| Errno::EIO)?)
-            } else {
-                None
-            };
+        let read_once = |retry_lineage: &mut Option<(u64, bool)>| {
             let mut retired_ranges = Vec::with_capacity(CACHE_MAX_ENTRIES * 2 + 1);
-            let (version, cached, cache_generation) = {
+            let (version, lineage, length, cached, cache_generation, epoch, ranges) = {
+                let _capture;
                 let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+                // Decide under the same State guard used to capture the version.
+                // If staged, wait out a journal-to-handle publication and recapture.
+                if state
+                    .read_file(ino, handle)?
+                    .version
+                    .id()
+                    .starts_with("cirrus-staged:")
+                {
+                    drop(state);
+                    _capture = self.mutation.lock().map_err(|_| Errno::EIO)?;
+                    state = self.state.lock().map_err(|_| Errno::EIO)?;
+                }
                 let cache_generation = self.accounts.clean_cache_generation();
                 state.refresh_cache_generation(cache_generation, &mut retired_ranges);
-                let file = state.files.get(&handle.0).ok_or(Errno::EBADF)?;
-                if file.ino != u64::from(ino) {
-                    return Err(Errno::EBADF);
-                }
-                if file.failed {
+                let file = state.read_file(ino, handle)?;
+                let staged = file.version.id().starts_with("cirrus-staged:");
+                let detached = state.detached.contains_key(&ino.0);
+                let lineage = (file.namespace_rebind, detached);
+                if retry_lineage.is_some_and(|expected| expected != lineage) {
                     return Err(Errno::EIO);
                 }
                 let length = u64::from(size.min(MAX_RANGE))
                     .min(file.version.size().saturating_sub(offset))
-                    as usize;
-                let cached = state.cache.iter().any(|entry| {
-                    entry.version == file.version
-                        && entry.offset == offset
-                        && entry.bytes.len() == length
-                });
-                (file.version.clone(), cached, cache_generation)
+                    as u32;
+                if length == 0 && !staged {
+                    return Ok(Some(Vec::new()));
+                }
+                let cached = state
+                    .cache
+                    .iter()
+                    .find(|entry| {
+                        length != 0
+                            && entry.version == file.version
+                            && entry.offset == offset
+                            && entry.bytes.len() == length as usize
+                    })
+                    .cloned();
+                let epoch = staged.then(|| self.engine.snapshot());
+                // Capture references, not payloads. Planning and copying run
+                // outside both locks. Only staged reads use this ABI.
+                let ranges = if cached.is_none()
+                    && length != 0
+                    && epoch.is_some_and(|epoch| epoch.can_reuse())
+                {
+                    state
+                        .cache
+                        .iter()
+                        .filter(|entry| {
+                            entry.version == file.version
+                                && entry.offset < offset + u64::from(length)
+                                && entry.offset.saturating_add(entry.bytes.len() as u64) > offset
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (
+                    file.version.clone(),
+                    lineage,
+                    length,
+                    cached,
+                    cache_generation,
+                    epoch,
+                    ranges,
+                )
             };
-            if offset >= version.size() || size == 0 {
-                return Ok(Vec::new());
+            let (namespace_rebind, detached) = lineage;
+            let staged = epoch.is_some();
+            let request = offset..offset + u64::from(length);
+            let planned = epoch.and_then(|epoch| {
+                if ranges.is_empty() {
+                    return None;
+                }
+                let plan = epoch.plan(request.clone(), &ranges)?;
+                Some((epoch, plan))
+            });
+            #[cfg(feature = "fault-injection")]
+            if planned.is_some() {
+                wait_test_window("CIRRUS_TEST_READ_ENGINE_PLAN_WINDOW")?;
             }
-            let length = u64::from(size.min(MAX_RANGE)).min(version.size() - offset) as u32;
+            let composed = planned.and_then(|(epoch, plan)| {
+                // No stale planner result may start effects. A retired
+                // proposal falls back to the resident's ordinary demand read.
+                (self.accounts.clean_cache_generation() == cache_generation
+                    && self.engine.admit(epoch))
+                .then_some(plan)
+            });
+            let using_engine = composed.is_some();
             #[cfg(feature = "fault-injection")]
             if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
-                && version.id().starts_with("cirrus-staged:")
+                && staged
+                && length != 0
             {
                 eprintln!(
-                    "cirrus lab owner read: pid={} thread={:?} boundary=fuse-read-dispatch handle={} cached={cached} offset={offset} length={length}",
+                    "cirrus lab owner read: pid={} thread={:?} boundary=fuse-read-dispatch handle={} cached={} offset={offset} length={length}",
                     std::process::id(),
                     std::thread::current().id(),
-                    handle.0
+                    handle.0,
+                    cached.is_some(),
                 );
             }
-            let fetched = if cached {
+            let fetched = if let Some(plan) = composed {
+                self.accounts
+                    .verify_file(&self.space, &version)
+                    .map_err(|_| Errno::EIO)
+                    .and_then(|()| plan.assemble(request).ok_or(Errno::EIO))
+                    .map(Some)
+            } else if length == 0 || cached.is_some() {
                 self.accounts
                     .verify_file(&self.space, &version)
                     .map(|()| None)
                     .map_err(|_| Errno::EIO)
             } else {
-                self.fetch_range(&version, offset, length).map(Some)
+                let priority = if staged {
+                    // An old flight can still answer its own caller, but must
+                    // not seed the staged cache for a new generation.
+                    RangePriority::Staged(cache_generation)
+                } else {
+                    RangePriority::Foreground
+                };
+                self.fetch_range(&version, offset, length, priority).map(Some)
             };
-            let mut prepared_range =
+            let mut prepared_range = if using_engine {
+                None
+            } else {
                 fetched
                     .as_ref()
                     .ok()
@@ -4676,20 +4790,69 @@ impl Filesystem for Drive {
                             offset,
                             bytes: bytes.clone(),
                         })
-                    });
+                    })
+            };
             let mut cached_range = None;
+            // Staged range I/O and flight joins above never own mutation. Wait
+            // out local publication before trusting staged State (including EOF)
+            // or poisoning an old remote version a writer could be replacing.
+            let publication = if staged || fetched.is_err() {
+                Some(self.mutation.lock().map_err(|_| Errno::EIO)?)
+            } else {
+                None
+            };
             let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+            let file = state.read_file(ino, handle).map_err(|_| Errno::EIO)?;
+            let detached_now = state.detached.contains_key(&ino.0);
+            if file.namespace_rebind != namespace_rebind {
+                return Err(Errno::EIO);
+            }
+            if file.version != version {
+                // A successful local write/resize (including remote -> staged)
+                // may have superseded this attempt. Never retry failed, moved,
+                // released or newly detached handles as ordinary writes.
+                if detached == detached_now && file.version.id().starts_with("cirrus-staged:") {
+                    *retry_lineage = Some(lineage);
+                    return Ok(None);
+                }
+                return Err(Errno::EIO);
+            }
+            if staged {
+                if fetched.is_err() {
+                    // Missing original-base ranges may become available again.
+                    return Err(Errno::EIO);
+                }
+                drop(state);
+                // An ambiguous write/rename may have committed without rebinding
+                // the handle. Check the durable head/fence, not just memory.
+                let durable_detached = self
+                    .accounts
+                    .verify_staged_read_head(&self.space, &version)
+                    .map_err(|_| Errno::EIO)?;
+                state = self.state.lock().map_err(|_| Errno::EIO)?;
+                let file = state.read_file(ino, handle).map_err(|_| Errno::EIO)?;
+                if file.version != version
+                    || file.namespace_rebind != namespace_rebind
+                    || durable_detached != detached_now
+                    || state.detached.contains_key(&ino.0) != detached_now
+                {
+                    return Err(Errno::EIO);
+                }
+                if length == 0 {
+                    return Ok(Some(Vec::new()));
+                }
+            }
             let current_cache_generation = self.accounts.clean_cache_generation();
             state.refresh_cache_generation(current_cache_generation, &mut retired_ranges);
-            let still_current = state.files.get(&handle.0).is_some_and(|file| {
-                !file.failed && file.ino == u64::from(ino) && file.version == version
-            });
-            if !still_current {
+            if staged
+                && (using_engine || cached.is_some())
+                && cache_generation != current_cache_generation
+            {
                 return Err(Errno::EIO);
             }
             match &fetched {
                 Ok(Some(_)) => {
-                    if cache_generation == current_cache_generation {
+                    if cache_generation == current_cache_generation && detached == detached_now {
                         if let Some(entry) = &mut prepared_range {
                             // Canonicalize even an equal version captured before
                             // a rebind, so publication can match current owners.
@@ -4711,18 +4874,21 @@ impl Filesystem for Drive {
                             entry.version == version
                                 && entry.offset == offset
                                 && entry.bytes.len() == length as usize
-                        })
-                        .ok_or(Errno::EIO)?;
-                    let entry = state.cache.remove(position).ok_or(Errno::EIO)?;
-                    cached_range = Some(entry.clone());
-                    state.cache.push_back(entry);
+                        });
+                    if let Some(position) = position {
+                        let entry = state.cache.remove(position).ok_or(Errno::EIO)?;
+                        cached_range = Some(entry.clone());
+                        state.cache.push_back(entry);
+                    } else if staged {
+                        // An identical detached head can outlive retirement of
+                        // its live cache entry. Do not put that entry back.
+                        cached_range = cached;
+                    } else {
+                        return Err(Errno::EIO);
+                    }
                 }
                 Err(_) => {
-                    // Missing original-base ranges can become available again;
-                    // a transient offline read must not poison a durable handle.
-                    if !version.id().starts_with("cirrus-staged:") {
-                        state.invalidate_id(version.id(), &mut retired_ranges);
-                    }
+                    state.invalidate_id(version.id(), &mut retired_ranges);
                     return Err(Errno::EIO);
                 }
             };
@@ -4735,20 +4901,29 @@ impl Filesystem for Drive {
             });
             file.last_read = Some((next, length));
             drop(state);
+            drop(publication);
             let bytes = match fetched {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => cached_range.expect("validated cache hit").bytes.clone(),
                 Err(error) => return Err(error),
             };
+            if using_engine {
+                self.composed_reads.fetch_add(1, Ordering::Relaxed);
+            }
             if sequential {
                 self.read_ahead(&version, next);
             }
-            Ok(bytes)
-        })();
-        match result {
-            Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(error),
+            Ok(Some(bytes))
+        };
+        let mut retry_lineage = None;
+        for _ in 0..READ_VERSION_ATTEMPTS {
+            match read_once(&mut retry_lineage) {
+                Ok(Some(bytes)) => return reply.data(&bytes),
+                Ok(None) => continue,
+                Err(error) => return reply.error(error),
+            }
         }
+        reply.error(Errno::EIO);
     }
 
     fn release(

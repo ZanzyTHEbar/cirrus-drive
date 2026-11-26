@@ -488,21 +488,38 @@ impl DirectorySnapshot {
         state.conn.query_row("SELECT '[' || coalesce(group_concat(entry,','),'') || ']' FROM (SELECT entry FROM entries ORDER BY name)", [], |row| row.get(0)).map_err(|_| unavailable())
     }
 
-    /// Assigns an inode before publishing/sharing this immutable snapshot.
-    pub fn bind_inode(&mut self, name: &str, inode: u64) -> Result<(), AccountError> {
-        let state = self.unique()?;
-        if state
-            .conn
-            .execute(
-                "UPDATE entries SET inode=?1 WHERE name=?2",
-                params![inode, name],
-            )
-            .map_err(|_| unavailable())?
-            != 1
-        {
+    /// Binds one page of `(cookie, inode)` pairs in ascending cookie order.
+    ///
+    /// # Errors
+    /// Rejects shared snapshots, invalid bindings (including missing or repeated
+    /// cookies within a page), and write or allocation failures. On error the
+    /// private candidate is consumed: scratch SQLite has no rollback guarantee.
+    pub fn bind_inodes(mut self, bindings: &[(u64, u64)]) -> Result<Self, AccountError> {
+        if bindings.len() > PAGE || bindings.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Err(unavailable());
         }
-        state.validate_allocation()
+        let state = self.unique()?;
+        let mut tx = state.conn.transaction().map_err(|_| unavailable())?;
+        // journal_mode=OFF: close and discard the private file on any error.
+        tx.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+        {
+            let mut update = tx
+                .prepare("UPDATE entries SET inode=?1 WHERE seq=?2")
+                .map_err(|_| unavailable())?;
+            for &(cookie, inode) in bindings {
+                if inode == 0
+                    || update
+                        .execute(params![inode, cookie])
+                        .map_err(|_| unavailable())?
+                        != 1
+                {
+                    return Err(unavailable());
+                }
+            }
+        }
+        tx.commit().map_err(|_| unavailable())?;
+        state.validate_allocation()?;
+        Ok(self)
     }
 
     /// Reads at most 32 names/cookies without decoding entry metadata.

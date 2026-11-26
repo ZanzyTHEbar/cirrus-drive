@@ -216,6 +216,22 @@ fn status_service_recovers_and_preserves_unrelated_objects() {
         ipc::status(&fixture.runtime()).unwrap(),
         ipc::ServiceStatus::ManualSync
     );
+    let mut fragment = fixture.connect();
+    fragment.set_read_timeout(Some(ipc::wire::TIMEOUT)).unwrap();
+    fragment.write_all(b"CIRRUS/3 STA").unwrap();
+    assert_eq!(
+        ipc::status(&fixture.runtime()).expect("STATUS while another request is incomplete"),
+        ipc::ServiceStatus::ManualSync,
+    );
+    fragment
+        .write_all(b"TUS\n")
+        .expect("complete the first request after the second received its reply");
+    let mut reply = Vec::new();
+    fragment
+        .read_to_end(&mut reply)
+        .expect("fragmented STATUS reply");
+    assert_eq!(reply, ipc::wire::MANUAL_STATUS_RESPONSE);
+
     let duplicate = fixture.command().output().unwrap();
     assert!(
         !duplicate.status.success(),

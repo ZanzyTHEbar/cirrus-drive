@@ -1,5 +1,6 @@
 //! One account transfer owner, round-robin Space turns, foreground-first admission.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,6 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cirrus_account::Accounts;
+
+use crate::release::Policy;
 
 const POLL: Duration = Duration::from_secs(2);
 
@@ -19,6 +22,7 @@ struct Control {
     admission: Mutex<()>,
     wake: Condvar,
     sleep: Mutex<()>,
+    policy: Arc<Policy>,
 }
 
 pub(crate) struct Scheduler {
@@ -95,6 +99,7 @@ impl Scheduler {
         busy: Arc<AtomicBool>,
         mounts: Arc<Mutex<crate::application::MountRegistry>>,
         automatic: bool,
+        policy: Arc<Policy>,
     ) -> io::Result<Self> {
         let control = Arc::new(Control {
             accounts,
@@ -105,6 +110,7 @@ impl Scheduler {
             admission: Mutex::new(()),
             wake: Condvar::new(),
             sleep: Mutex::new(()),
+            policy,
         });
         // Most fault scenarios explicitly control remote observation timing.
         #[cfg(feature = "fault-injection")]
@@ -118,7 +124,7 @@ impl Scheduler {
         let warm_mounts = std::env::var_os("CIRRUS_LAB_BROWSE").is_some();
         #[cfg(not(feature = "fault-injection"))]
         let warm_mounts = true;
-        if !namespace_refresh {
+        if !namespace_refresh && !control.policy.managed() {
             return Ok(Self {
                 control,
                 automatic,
@@ -130,6 +136,7 @@ impl Scheduler {
             .name("cirrus-sync".into())
             .spawn(move || {
                 let mut after: Option<(String, String)> = None;
+                let mut served = HashSet::new();
                 let mut leader: Option<cirrus_account::SchedulerGuard> = None;
                 let mut refreshed = Instant::now();
                 let mut mount_after = 0;
@@ -141,9 +148,17 @@ impl Scheduler {
                     if worker.stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    if automatic
+                    // Reaping belongs to the scheduler, even when transfers
+                    // and namespace work are disabled or paused.
+                    worker.policy.reap_exited();
+                    let policy_available = automatic && worker.policy.available();
+                    if !policy_available {
+                        leader = None;
+                    }
+                    if policy_available
                         && !worker.paused.load(Ordering::Acquire)
                         && worker.pending.load(Ordering::Acquire) == 0
+                        && let Some(turn) = worker.policy.turn()
                     {
                         // This preflight only avoids idle elections. Once elected,
                         // enumerate again through the retained election capability.
@@ -158,14 +173,13 @@ impl Scheduler {
                                 Vec::new()
                             }
                         };
-                        let next =
-                            spaces
+                        let mut eligible = spaces
                                 .iter()
                                 .filter(|key| after.as_ref().is_none_or(|after| *key > after))
                                 .chain(spaces.iter().filter(|key| {
                                     after.as_ref().is_some_and(|after| *key <= after)
                                 }))
-                                .find(|(instance, space)| {
+                                .filter(|(instance, space)| {
                                     !election_failed
                                         && leader.is_some()
                                         && !worker.accounts.background_yield_requested()
@@ -173,14 +187,7 @@ impl Scheduler {
                                         && !worker.paused.load(Ordering::Acquire)
                                         && worker.pending.load(Ordering::Acquire) == 0
                                         && match leader.as_ref().expect("dispatcher election missing").sync_status(&worker.accounts, instance, space) {
-                                            Ok(status) => {
-                                                status.new_work
-                                                    && !matches!(
-                                                        status.phase,
-                                                        cirrus_account::SyncPhase::Retry
-                                                            | cirrus_account::SyncPhase::Attention
-                                                    )
-                                            },
+                                            Ok(status) => eligible_now(&status),
                                             Err(_) => {
                                                 // A Space-specific status failure must
                                                 // not starve other Spaces. Recheck only
@@ -190,16 +197,35 @@ impl Scheduler {
                                                 false
                                             }
                                         }
-                                })
-                                .cloned();
-                        if let Some((instance, space)) = next {
-                            after = Some((instance.clone(), space.clone()));
+                                });
+                        let next = if worker.policy.managed() {
+                            let candidates: Vec<_> = eligible.collect();
+                            // A worker can vary order inside the fair cohort,
+                            // but cannot repeatedly select a just-served Space
+                            // while another eligible Space has yet to run.
+                            served.retain(|key| spaces.binary_search(key).is_ok());
+                            if !candidates.is_empty() && candidates.iter().all(|key| served.contains(*key)) {
+                                served.clear();
+                            }
+                            let cohort: Vec<_> = candidates.into_iter().filter(|key| !served.contains(*key)).collect();
+                            turn.choose(cohort.len()).map(|index| cohort[index])
+                        } else {
+                            eligible.next()
+                        };
+                        if let Some((instance, space)) = next.filter(|_| !election_failed) {
+                            let guard = leader.as_ref().expect("dispatcher election missing");
+                            let current = !worker.policy.managed() || guard
+                                .sync_status(&worker.accounts, instance, space)
+                                .is_ok_and(|status| eligible_now(&status));
                             let admitted = {
                                 let _gate = worker
                                     .admission
                                     .lock()
                                     .expect("account admission lock poisoned");
-                                worker.pending.load(Ordering::Acquire) == 0
+                                current && turn.still_selected()
+                                    && !worker.accounts.background_yield_requested()
+                                    && !worker.stopping.load(Ordering::Acquire)
+                                    && worker.pending.load(Ordering::Acquire) == 0
                                     && !worker.paused.load(Ordering::Acquire)
                                     && worker
                                         .busy
@@ -212,22 +238,25 @@ impl Scheduler {
                                         .is_ok()
                             };
                             if admitted {
+                                let key = (instance.clone(), space.clone());
+                                if worker.policy.managed() {
+                                    served.insert(key.clone());
+                                }
+                                after = Some(key);
                                 let permit = Background(Arc::clone(&worker));
                                 #[cfg(feature = "fault-injection")]
                                 if std::env::var_os("CIRRUS_TEST_AUTO_DIAGNOSTICS").is_some() && diagnostic_events < 1024 {
                                     diagnostic_events += 1;
                                     eprintln!("cirrus lab scheduler diagnostic: time_ms={} begin space={space}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
                                 }
-                                let result = leader.as_ref().expect("dispatcher election missing")
-                                    .automatic_sync_turn(&worker.accounts, &instance, &space);
+                                let result = guard.automatic_sync_turn(&worker.accounts, instance, space);
                                 #[cfg(feature = "fault-injection")]
                                 if std::env::var_os("CIRRUS_TEST_AUTO_DIAGNOSTICS").is_some() && diagnostic_events < 1024 {
                                     diagnostic_events += 1;
                                     eprintln!("cirrus lab scheduler diagnostic: time_ms={} end space={space} result={result:?}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
                                 }
                                 election_failed = result.is_err()
-                                    && leader.as_ref().expect("dispatcher election missing")
-                                        .activated_spaces(&worker.accounts).is_err();
+                                    && guard.activated_spaces(&worker.accounts).is_err();
                                 progressed = result.unwrap_or(false);
                                 #[cfg(feature = "fault-injection")]
                                 if std::env::var_os("CIRRUS_TEST_DIRTY_RANGE").is_some() {
@@ -242,6 +271,7 @@ impl Scheduler {
                             // The normal bounded wait precedes fresh election.
                             leader = None;
                             after = None;
+                            served.clear();
                             progressed = false;
                         }
                     }
@@ -250,7 +280,8 @@ impl Scheduler {
                     // global transfer leader cannot see another daemon's mounts.
                     // Keep local foreground-first admission, but do not require
                     // the account-global mutation election for read-only DAV.
-                    if refreshed.elapsed() >= POLL
+                    if namespace_refresh
+                        && refreshed.elapsed() >= POLL
                         && !worker.accounts.background_yield_requested()
                         && !worker.stopping.load(Ordering::Acquire)
                     {
@@ -291,7 +322,8 @@ impl Scheduler {
                         }
                     }
                     let mut walked = false;
-                    if warm_mounts
+                    if namespace_refresh
+                        && warm_mounts
                         && !worker.accounts.background_yield_requested()
                         && !worker.stopping.load(Ordering::Acquire)
                     {
@@ -378,12 +410,35 @@ impl Scheduler {
     }
 
     pub(crate) fn enabled(&self) -> bool {
+        self.configured() && self.control.policy.available()
+    }
+
+    pub(crate) fn enabled_probe(&self) -> impl FnOnce() -> bool + Send + 'static {
+        let running = self.automatic
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished());
+        let control = Arc::clone(&self.control);
+        move || running && !control.paused.load(Ordering::Acquire) && control.policy.available()
+    }
+
+    pub(crate) fn configured(&self) -> bool {
         self.automatic
             && !self.control.paused.load(Ordering::Acquire)
             && self
                 .thread
                 .as_ref()
                 .is_some_and(|thread| !thread.is_finished())
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.control.paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn waker(&self) -> impl FnOnce() + Send + 'static {
+        let control = Arc::clone(&self.control);
+        move || control.wake.notify_all()
     }
 
     pub(crate) fn pause(&self) {
@@ -430,6 +485,12 @@ impl Scheduler {
         }
         Ok(())
     }
+}
+
+fn eligible_now(status: &cirrus_account::SyncStatus) -> bool {
+    status.activated
+        && status.new_work
+        && !matches!(status.phase, cirrus_account::SyncPhase::Retry | cirrus_account::SyncPhase::Attention)
 }
 
 impl Drop for Scheduler {

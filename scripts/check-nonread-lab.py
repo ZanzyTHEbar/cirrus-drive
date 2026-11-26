@@ -8,7 +8,10 @@ Use --browse-cache for the mounted metadata prefetch and refresh scenario.
 """
 
 import json
+import ctypes
+from contextlib import ExitStack
 import errno
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +21,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -85,6 +89,270 @@ def openssl(*args):
     require(run(["openssl", *map(str, args)]), "creating disposable TLS certificate")
 
 
+def release_lab(root, runtime, process, url, normal, env, cli, uploaded, mutation_order, held_turn):
+    """Use the real install and worker IPC with the fixture's two FUSE Spaces."""
+    owner = root / "mount"
+    peer = root / "second-mount"
+    peer.mkdir(mode=0o700)
+    client = root / "prefix/bin/cirrus-daemon"
+    manage = ROOT / "packaging/manage.py"
+    database = runtime / "home/.local/state/cirrus-drive/state.db"
+    engine_lab = os.environ.get("CIRRUS_LAB_READ_ENGINE") == "1"
+
+    def invoke(*args):
+        return run([str(client), *map(str, args)], env=env)
+
+    def status():
+        return json.loads(require(invoke("--release-status"), "release status").stdout)
+
+    def engine_status():
+        return json.loads(require(invoke("--mount-engines"), "mounted engine status").stdout)
+
+    def composed_reads():
+        report = engine_status()
+        assert {mount["path"] for mount in report["mounts"]} == {str(owner), str(peer)}
+        return next(mount["composed_reads"] for mount in report["mounts"] if mount["path"] == str(owner))
+
+    def publish(release, worker, valid=True, engine=None):
+        directory = root / ("bundle-" + release)
+        directory.mkdir()
+        files = {"resident": "cirrus-drive-service", "worker": "cirrus-control-worker",
+                 "cli": "cirrus-daemon", "ui": "cirrus-ui"}
+        hashes = {}
+        for role, name in files.items():
+            os.link(worker if role == "worker" else normal / name, directory / name)
+            with (directory / name).open("rb") as binary:
+                hashes[role] = hashlib.file_digest(binary, "sha256").hexdigest()
+        if engine is not None:
+            encoded = json.dumps(engine).encode()
+            (directory / "cirrus-read-engine.json").write_bytes(encoded)
+            hashes["read_engine"] = hashlib.sha256(encoded).hexdigest()
+        (directory / "manifest.json").write_text(json.dumps({
+            "format": 2 if engine is not None else 1, "release": release, "target_os": "linux",
+            "target_arch": os.uname().machine, "public_protocol": 3, "worker_protocol": 1,
+            "worker_role": "eligible-space-policy", "store_access": "none", "artifacts": hashes,
+        }))
+        openssl("pkeyutl", "-sign", "-rawin", "-inkey", root / "key", "-in",
+                directory / "manifest.json", "-out", directory / "manifest.sig")
+        if not valid:
+            with (directory / "manifest.json").open("a") as manifest:
+                manifest.write("\n")
+        return subprocess.run([sys.executable, str(manage), "release", str(directory)],
+                              env=env, text=True, capture_output=True, timeout=125)
+
+    def mounts():
+        return {row[4]: (row[0], row[row.index("-") + 2])
+                for line in Path("/proc/self/mountinfo").read_text().splitlines()
+                if (row := line.split())[4] in (str(owner), str(peer))}
+
+    def wait_for(check):
+        deadline = time.monotonic() + 30
+        while not check():
+            assert time.monotonic() < deadline, (mutation_order, status())
+            time.sleep(0.1)
+
+    def both_synced():
+        with sqlite3.connect(database) as db:
+            return db.execute("SELECT count(*) FROM operation_journal "
+                              "WHERE state='synced' AND path LIKE '%release-turn-%'").fetchone()[0] == 2
+
+    def directory_page(fd, length):
+        data = ctypes.create_string_buffer(length)
+        lib = ctypes.CDLL(None, use_errno=True)
+        size = lib.getdents64(fd, data, length)
+        if size < 0:
+            raise OSError(ctypes.get_errno(), "getdents64")
+        names = []
+        offset = 0
+        while offset < size:
+            record = struct.unpack_from("=H", data.raw, offset + 16)[0]
+            assert record >= 20
+            names.append(data.raw[offset + 19:offset + record].split(b"\0", 1)[0].decode())
+            offset += record
+        return names
+
+    require(cli("one", "--mount-space", url, "space", owner), "first mounted Space")
+    require(cli("one", "--mount-space", url, "other-space", peer), "second mounted Space")
+    mount_ids = mounts()
+    assert len(mount_ids) == 2
+    assert status()["worker"] is None
+    # Hold the exact election lock so both real operations can enter one
+    # snapshot and A remains live until the negotiated activation of B.
+    lock = database.parent / "scheduler.lock"
+    with lock.open("xb") as file:
+        file.write(b"cirrus-drive scheduler lock v1\n")
+    lock.chmod(0o600)
+    fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    staged_plan = root / "read-engine-plan"
+    delayed_read = None
+    try:
+        with ExitStack() as stack:
+            directory = os.open(owner, os.O_RDONLY | os.O_DIRECTORY)
+            stack.callback(os.close, directory)
+            held = stack.enter_context((peer / "other.txt").open("rb", buffering=0))
+            detached = stack.enter_context((owner / "release-detached").open("w+b", buffering=0))
+            detached.write(b"exact")
+            os.fsync(detached.fileno())
+            (owner / "release-detached").unlink()
+            first = directory_page(directory, 48)
+            assert first and len(first) < 4
+            expected = {"/dav/spaces/" + space + "/release-turn-" + space: ("bytes " + space).encode()
+                        for space in ("space", "other-space")}
+            for space in ("space", "other-space"):
+                source = root / space
+                source.write_bytes(expected["/dav/spaces/" + space + "/release-turn-" + space])
+                require(invoke("--stage-file-space", url, space, "release-turn-" + space, source),
+                        "staging an eligible Space")
+            a = json.loads(require(publish("a", normal / "cirrus-control-worker"), "activate A").stdout)
+            rejected = publish("unsigned", normal / "cirrus-control-worker", valid=False)
+            assert rejected.returncode and "signature is not trusted" in rejected.stderr
+            assert status()["worker"] == a["worker"]
+            program = None
+            if engine_lab:
+                program = {"abi": 1, "role": "mounted-staged-read-plan",
+                           "rules": ["cover", "stitch", "fetch_exact"]}
+                before = engine_status()["read_engine"]
+                rejected_engine = publish("wrong-read-abi", normal / "cirrus-control-worker",
+                                          engine=dict(program, abi=2))
+                assert rejected_engine.returncode and "incompatible mounted read-engine" in rejected_engine.stderr
+                assert engine_status()["read_engine"] == before and status()["worker"] == a["worker"]
+                assert composed_reads() == 0
+                assert os.pread(detached.fileno(), 2, 0) == b"ex"
+                assert os.pread(detached.fileno(), 2, 2) == b"ac"
+                assert os.pread(detached.fileno(), 1, 4) == b"t"
+            b = json.loads(require(publish("b", Path(os.environ["CIRRUS_LAB_RELEASE_WORKER_B"]),
+                                           engine=program), "activate B").stdout)
+            assert a["worker"]["pid"] != b["worker"]["pid"]
+            assert b["worker"]["generation"] > a["worker"]["generation"]
+            assert a["resident_pid"] == b["resident_pid"] == process.pid
+            assert b["resident_update_pending"] and a["resident_sha256"] == b["resident_sha256"]
+            assert not Path(f"/proc/{a['worker']['pid']}").exists()
+            worker_proc = Path(f"/proc/{b['worker']['pid']}")
+            assert not (worker_proc / "environ").read_bytes()
+            assert {entry.name for entry in (worker_proc / "fd").iterdir()} == {"0", "1", "2"}
+            assert mounts() == mount_ids
+            if engine_lab:
+                active = engine_status()["read_engine"]
+                assert active["release"] == "b" and active["generation"] == b["worker"]["generation"]
+                assert active["sha256"] == hashlib.sha256(json.dumps(program).encode()).hexdigest()
+                # Same pre-B descriptor and cached fragments: one covering
+                # lookup and one read that spans two pre-B cache entries.
+                assert os.pread(detached.fileno(), 1, 0) == b"e"
+                assert os.pread(detached.fileno(), 3, 1) == b"xac"
+                assert composed_reads() == 2
+                print("PASS: B covered and stitched real staged reads on a pre-B detached FD", flush=True)
+            assert held.read() == b"other Space content"
+            detached.seek(0, os.SEEK_END)
+            detached.write(b" bytes")
+            os.fsync(detached.fileno())
+            assert os.pread(detached.fileno(), 100, 0) == b"exact bytes"
+            assert os.fstat(detached.fileno()).st_nlink == 0
+            rest = directory_page(directory, 4096)
+            assert "folder" in first + rest and "item.txt" in first + rest
+            assert len(set(first + rest)) == len(first + rest)
+            if engine_lab:
+                assert os.pread(detached.fileno(), 2, 0) == b"ex"
+                assert os.pread(detached.fileno(), 2, 2) == b"ac"
+                # The full post-write read above may now cover both small
+                # requests. Snapshot the count before racing a new plan.
+                baseline_compositions = composed_reads()
+                staged_plan.touch(mode=0o600)
+                delayed_result = []
+                def read_old_proposal():
+                    try:
+                        delayed_result.append(os.pread(detached.fileno(), 3, 0))
+                    except OSError as error:
+                        delayed_result.append(error)
+                delayed_read = threading.Thread(target=read_old_proposal)
+                delayed_read.start()
+                wait_for(lambda: staged_plan.with_suffix(".waiting").exists())
+            assert not mutation_order
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            entered, complete = held_turn
+            try:
+                assert entered.wait(timeout=10), "B never entered the real DAV mutation"
+                with subprocess.Popen([str(client), "--rollback-release"], env=env, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) as rollback:
+                    try:
+                        wait_for(lambda: status()["draining_policy_turn"])
+                        assert status()["worker"] == b["worker"] and rollback.poll() is None
+                        assert mounts() == mount_ids
+                    finally:
+                        complete.set()
+                    out, error = rollback.communicate(timeout=30)
+                    assert rollback.returncode == 0, error
+            finally:
+                complete.set()
+            restored = json.loads(out)
+            if engine_lab:
+                assert engine_status()["read_engine"] == {
+                    "release": None, "sha256": None, "generation": restored["worker"]["generation"]
+                }
+                staged_plan.unlink()
+                delayed_read.join(timeout=15)
+                assert not delayed_read.is_alive() and delayed_result == [b"exa"], delayed_result
+                assert composed_reads() == baseline_compositions
+                # A does not use a covering plan on the same live handle.
+                assert os.pread(detached.fileno(), 1, 1) == b"x"
+                assert composed_reads() == baseline_compositions
+                print("PASS: rolled-back engine rejects a held B plan; same FD reads exact resident bytes", flush=True)
+            wait_for(both_synced)
+            # With no prior admitted turn, A would propose other-space.
+            assert mutation_order == ["/dav/spaces/space/release-turn-space",
+                                      "/dav/spaces/other-space/release-turn-other-space"], mutation_order
+            assert {path: data for path, (data, _) in uploaded.items()} == expected
+            assert restored["worker"]["sha256"] == a["worker"]["sha256"]
+            assert restored["worker"]["generation"] > b["worker"]["generation"]
+            assert restored["resident_pid"] == process.pid and mounts() == mount_ids
+            assert os.pread(held.fileno(), 100, 0) == b"other Space content"
+            assert os.pread(detached.fileno(), 100, 0) == b"exact bytes"
+            assert len(mutation_order) == 2
+            ui = root / "prefix/bin/cirrus-ui"
+            assert "(release a)" in require(run([str(ui), "--version"], env=env), "selected installed UI").stdout
+            assert "(release a)" in require(invoke("--version"), "selected installed CLI").stdout
+            print(f"PASS: resident={process.pid} generations="
+                  f"{[s['worker']['generation'] for s in (a, b, restored)]}; "
+                  f"rollback drained B's admitted PUT; sync order={mutation_order}", flush=True)
+            if stale := os.environ.get("CIRRUS_LAB_RELEASE_STALE_WORKER"):
+                require(publish("stale", Path(stale)), "negotiate stale-response control")
+                payload = b"exact pending bytes survive rejected generation"
+                source = root / "stale-pending"
+                source.write_bytes(payload)
+                require(invoke("--stage-file-space", url, "space", "release-turn-stale", source),
+                        "stage a real operation for stale reply")
+                wait_for(lambda: status()["worker"] is None)
+                paused = status()
+                assert not paused["automatic_sync"] and "stale or mismatched" in paused["note"]
+                assert paused["selected_release"] == "stale" and paused["resident_pid"] == process.pid
+                assert len(mutation_order) == 2 and mounts() == mount_ids
+                pending = require(invoke("--retained-staged", url), "inspect pending retained bytes")
+                items = map(json.loads, pending.stdout.splitlines())
+                row = next(row for row in items if row.get("path") == ["release-turn-stale"])
+                dest = root / "pending-export"
+                require(invoke("--export-staged", url, row["id"], row["selector"], dest), "export exact pending bytes")
+                assert dest.read_bytes() == payload
+                require(invoke("--rollback-release"), "restore A after protocol failure")
+                path = "/dav/spaces/space/release-turn-stale"
+                wait_for(lambda: path in uploaded)
+                assert mutation_order.count(path) == 1 and uploaded[path][0] == payload
+                print("PASS: stale generation rejected before DAV; paused status and exact staged export; "
+                      "rollback executes the retained operation once", flush=True)
+            print(f"PASS: unchanged mount IDs {mount_ids}; file and directory descriptors survived; "
+                  "detached fsync exact", flush=True)
+    finally:
+        staged_plan.unlink(missing_ok=True)
+        if delayed_read is not None:
+            delayed_read.join(timeout=20)
+        os.close(fd)
+    for space in ("other-space", "space"):
+        require(cli("one", "--unmount-space", url, space), "unmounting live-release fixture")
+    if engine_lab:
+        require(invoke("--activate-release", "b"), "select B for durable restart check")
+    require(cli("one", "--stop"), "stopping resident")
+    process.wait(timeout=5)
+
+
 def child(root):
     global BINARY, UI
     BINARY = root / "cirrus-daemon"
@@ -97,6 +365,11 @@ def child(root):
     mountpoint = Path(os.environ["CIRRUS_LAB_MOUNT"])
     runtime_root = Path(os.environ["CIRRUS_LAB_RUNTIME"])
     browse_only = os.environ.get("CIRRUS_LAB_BROWSE") == "1"
+    live_release = os.environ.get("CIRRUS_LAB_LIVE_RELEASE") == "1"
+    engine_lab = os.environ.get("CIRRUS_LAB_READ_ENGINE") == "1"
+    uploaded = {}
+    mutation_order = []
+    held_turn = threading.Event(), threading.Event()
     state = {"lock_on_refresh": True, "dir_name": "folder", "dir_id": "folder-1",
              "file_present": True, "refreshes": 0, "bulk": None, "dav_error": False,
              "crash_refresh": False, "content": b"abcdefg" * 30000,
@@ -130,8 +403,13 @@ def child(root):
             env["CIRRUS_TEST_MOUNT_STOP"] = fault
         if bus_dir:
             env["CIRRUS_TEST_USER_BUS_DIR"] = str(bus_dir)
+        args = [str(service_binary())]
+        if live_release:
+            args += ["--release-root", str(root / "prefix/share/cirrus-drive/releases-v1")]
+        if engine_lab:
+            env["CIRRUS_TEST_READ_ENGINE_PLAN_WINDOW"] = str(root / "read-engine-plan")
         with (root / (runtime + "-daemon.log")).open("w") as log:
-            process = subprocess.Popen([str(service_binary())], env=env, stdout=subprocess.DEVNULL, stderr=log)
+            process = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=log)
         daemons[runtime] = process
         for _ in range(150):
             if cli(runtime, "--status").returncode == 0:
@@ -224,6 +502,20 @@ def child(root):
                     body["@odata.nextLink"] = "/graph/v1.0/me/drives?cursor=2"
                 self.send_body(200, "application/json", json.dumps(body).encode())
                 return
+            if live_release and self.path in uploaded:
+                data, etag = uploaded[self.path]
+                match = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
+                if not match or self.headers.get("If-Match") != etag:
+                    self.send_error(412)
+                    return
+                start, end = map(int, match.groups())
+                self.send_response(206)
+                self.send_header("ETag", etag)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.end_headers()
+                self.wfile.write(data[start:end + 1])
+                return
             if self.path == "/dav/spaces/other-space/other.txt":
                 data = b"other Space content"
                 match = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
@@ -287,6 +579,28 @@ def child(root):
             self.wfile.write(body[:-1] if fault == "short" else body)
             self.close_connection = True
 
+        def do_PUT(self):
+            if not live_release or not self.path.rsplit("/", 1)[-1].startswith("release-turn-"):
+                self.send_error(501)
+                return
+            mutation_order.append(self.path)
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if (self.headers.get("Authorization") != "Bearer " + state["access_token"]
+                    or self.headers.get("If-None-Match") != "*" or self.path in uploaded):
+                self.send_error(412)
+                return
+            etag = '"release-' + hashlib.sha256(body).hexdigest() + '"'
+            if self.path.endswith("/release-turn-space"):
+                held_turn[0].set()
+                if not held_turn[1].wait(timeout=12):
+                    self.close_connection = True
+                    return
+            uploaded[self.path] = body, etag
+            self.send_response(201)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_PROPFIND(self):
             state["propfind_requests"] += 1
             self.rfile.read(int(self.headers["Content-Length"]))
@@ -336,9 +650,14 @@ def child(root):
                 rows = [(path, True, "leaf"), (path + "deep.txt", False, "deep-file")]
             elif path in wide_paths:
                 rows = [(path, True, wide_paths[path])]
+            elif live_release and path in uploaded:
+                rows = [(path, False, "id-" + path)]
             else:
                 self.send_error(404)
                 return
+            if live_release and path in (base, "/dav/spaces/other-space/"):
+                rows += [(name, False, "id-" + name) for name in list(uploaded)
+                         if name.rsplit("/", 1)[0] + "/" == path]
             responses = []
             for href, directory, resource_id in rows:
                 kind = "<d:collection/>" if directory else ""
@@ -353,6 +672,10 @@ def child(root):
                             "SHA1:" + hashlib.sha1(state["content"]).hexdigest())
                 checksums = (f"<oc:checksums><oc:checksum>{checksum}</oc:checksum></oc:checksums>"
                              if resource_id == "file-1" else "")
+                if live_release and href in uploaded:
+                    data, version = uploaded[href]
+                    size = f"<d:getcontentlength>{len(data)}</d:getcontentlength>"
+                    etag = f"<d:getetag>{escape(version)}</d:getetag>"
                 missing = ('<d:propstat><d:prop><d:getcontentlength/></d:prop>'
                            '<d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>') if directory else ""
                 responses.append(f'<d:response><d:href>{escape(href)}</d:href><d:propstat>'
@@ -373,7 +696,7 @@ def child(root):
         openssl("x509", "-req", "-in", root / "tls.csr", "-CA", root / "ca.pem", "-CAkey", root / "ca.key",
                 "-CAcreateserial", "-out", root / "tls.pem", "-days", "1", "-extfile", root / "ext")
         keyring = keyring_start()
-        for name in ("one", "two"):
+        for name in (() if live_release else ("one", "two")):
             address = "unix:path=" + str(runtime_root / name / "session-bus")
             bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--address=" + address,
                                     "--print-address=1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -382,8 +705,11 @@ def child(root):
             if not actual:
                 raise RuntimeError("disposable independent session bus did not start")
             session_buses[name] = (bus, actual)
-        assert session_buses["one"][1] != session_buses["two"][1]
-        assert all(address != os.environ["DBUS_SESSION_BUS_ADDRESS"] for _, address in session_buses.values())
+        if live_release:
+            session_buses = dict.fromkeys(("one", "two"), (None, os.environ["DBUS_SESSION_BUS_ADDRESS"]))
+        else:
+            assert session_buses["one"][1] != session_buses["two"][1]
+            assert all(address != os.environ["DBUS_SESSION_BUS_ADDRESS"] for _, address in session_buses.values())
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(root / "tls.pem", root / "tls.key")
@@ -394,10 +720,40 @@ def child(root):
         account = dict(instance=url, issuer=url + "issuer", client_id="lab", token_endpoint=url + "token",
                        subject="lab", ca_pem=(root / "ca.pem").read_text(), access_token="lab-access",
                        refresh_token="lab-refresh", expires_at=0, refresh_in_progress=False)
-        if browse_only:
+        if browse_only or live_release:
             account.update(access_token=state["access_token"], expires_at=int(time.time()) + 3600)
         require(run(["secret-tool", "store", "--label=cirrus-lab", "application", "cirrus-drive",
                      "instance", url], input=json.dumps(account)), "saving disposable account")
+        if live_release:
+            state["second_space"] = True
+            # Keep the actual packaged CLI/UI and release manager, while the
+            # fault-enabled resident redirects Accounts to the private lab.
+            release_env = dict(os.environ, PREFIX=str(root / "prefix"),
+                               XDG_RUNTIME_DIR=str(runtime_root / "one"))
+            normal = Path(os.environ["CIRRUS_LAB_RELEASE_BIN_DIR"])
+            require(run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(root / "key")]),
+                    "create disposable release key")
+            openssl("pkey", "-in", root / "key", "-pubout", "-outform", "DER", "-out", root / "key.der")
+            (root / "trust").write_bytes((root / "key.der").read_bytes()[-32:])
+            # Installing the complete notice inventory syncs hundreds of files.
+            require(subprocess.run([str(ROOT / "packaging/install.sh"), "--trust-key", str(root / "trust")],
+                                   env=dict(release_env, CIRRUS_BIN_DIR=str(normal)),
+                                   capture_output=True, text=True, timeout=120), "install user-managed launchers")
+            process = start_daemon("one")
+            release_lab(root, runtime_root, process, url, normal, release_env, cli, uploaded, mutation_order, held_turn)
+            restarted = start_daemon("one")
+            recovered = json.loads(require(cli("one", "--release-status"), "load durable worker selection").stdout)
+            assert recovered["resident_pid"] == restarted.pid != process.pid
+            expected_release = "b" if engine_lab else "a"
+            assert recovered["selected_release"] == recovered["worker"]["release"] == expected_release
+            if engine_lab:
+                report = json.loads(require(cli("one", "--mount-engines"), "load durable read program").stdout)
+                assert report["read_engine"]["release"] == "b" and report["mounts"] == []
+            assert len(mutation_order) == (3 if os.environ.get("CIRRUS_LAB_RELEASE_STALE_WORKER") else 2)
+            require(cli("one", "--stop"), "stop restarted resident")
+            restarted.wait(timeout=5)
+            print(f"PASS: after explicit stop, persisted selection renegotiated {expected_release} on restart", flush=True)
+            return
         start_daemon("one")
         if browse_only:
             def wait_for(predicate, message, timeout):
@@ -1306,19 +1662,26 @@ def check_lab_binaries(directory):
 
 
 def main():
+    global BINARY, UI
     if len(sys.argv) == 3 and sys.argv[1] == "--child":
         child(Path(sys.argv[2]))
         return
     browse_only = sys.argv[1:] == ["--browse-cache"]
+    engine_lab = sys.argv[1:] == ["--live-release-engine"]
+    live_release = sys.argv[1:] == ["--live-release"] or engine_lab
+    if live_release:
+        BINARY = Path(os.environ["CIRRUS_LAB_FAULT_BIN_DIR"]) / "cirrus-daemon"
+        UI = Path(os.environ["CIRRUS_LAB_RELEASE_BIN_DIR"]) / "cirrus-ui"
     if not BINARY.is_file() or not service_binary().is_file() or (not browse_only and not UI.is_file()):
         raise SystemExit("build first: cargo build --workspace --locked")
     check_lab_binaries(BINARY.parent)
-    if sys.argv[1:] not in ([], ["--fault-injection"], ["--browse-cache"]):
-        raise SystemExit("usage: check-nonread-lab.py [--fault-injection | --browse-cache]")
+    if sys.argv[1:] not in ([], ["--fault-injection"], ["--browse-cache"], ["--live-release"], ["--live-release-engine"]):
+        raise SystemExit("usage: check-nonread-lab.py [--fault-injection | --browse-cache | --live-release | --live-release-engine]")
     # The runtime requires O_TMPFILE, which is unavailable on some project filesystems.
-    root = Path(tempfile.mkdtemp(prefix="cirrus-read-lab-"))
+    root = Path(tempfile.mkdtemp(prefix="l-" if live_release else "cirrus-read-lab-"))
     os.chmod(root, 0o700)
-    runtime_root = Path(tempfile.mkdtemp(prefix="cdr-", dir=None if browse_only else "/dev/shm"))
+    runtime_root = Path(tempfile.mkdtemp(prefix="r-", dir=root)) if live_release else Path(
+        tempfile.mkdtemp(prefix="cdr-", dir=None if browse_only else "/dev/shm"))
     mountpoint = root / "mount"
     for name in ("data", "config", "mount"):
         (root / name).mkdir(mode=0o700)
@@ -1340,6 +1703,10 @@ def main():
         env.update(CIRRUS_LAB_BROWSE="1", CIRRUS_TEST_NAMESPACE_POLL="1")
     if sys.argv[1:] == ["--fault-injection"]:
         env["CIRRUS_LAB_FAULT"] = "1"
+    if live_release:
+        env.update(CIRRUS_LAB_LIVE_RELEASE="1", CIRRUS_TEST_AUTO_SYNC="1")
+    if engine_lab:
+        env.update(CIRRUS_LAB_READ_ENGINE="1")
     try:
         shutil.copy2(BINARY, root / "cirrus-daemon")
         shutil.copy2(service_binary(), root / "cirrus-drive-service")
@@ -1366,8 +1733,15 @@ def main():
         if any(line.split()[4] in (str(mountpoint), str(root / "second-mount"), str(root / "Other")) for line in mounts):
             print(f"lab mount remains; inspect {root} and {runtime_root}", file=sys.stderr)
         else:
+            if live_release:
+                releases = root / "prefix/share/cirrus-drive/releases-v1/releases"
+                if releases.is_dir():
+                    for directory in releases.iterdir():
+                        if directory.is_dir() and not directory.is_symlink():
+                            directory.chmod(0o700)
             shutil.rmtree(root)
-            shutil.rmtree(runtime_root)
+            if not live_release:
+                shutil.rmtree(runtime_root)
 
 
 if __name__ == "__main__":

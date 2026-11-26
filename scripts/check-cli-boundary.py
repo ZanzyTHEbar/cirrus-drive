@@ -25,9 +25,12 @@ def main():
     for name in ("cirrus-api", "cirrus-discovery", "cirrus-runtime"):
         assert not local_dependencies(name), name
 
-    for package, binary in (("cirrus-cli", "cirrus-daemon"), ("cirrus-daemon", "cirrus-drive-service")):
+    for package, binaries in (
+        ("cirrus-cli", {"cirrus-daemon"}),
+        ("cirrus-daemon", {"cirrus-drive-service", "cirrus-control-worker"}),
+    ):
         targets = {target["name"] for target in packages[package]["targets"] if "bin" in target["kind"]}
-        assert targets == {binary}, (package, targets)
+        assert targets == binaries, (package, targets)
     print("CLI dependency boundary and separate service entrypoint verified")
 
 

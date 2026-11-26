@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
@@ -255,30 +256,90 @@ pub(crate) struct MountState {
     pub(crate) exact_id: Option<u64>,
 }
 
+struct MountEntry<'a> {
+    id: &'a [u8],
+    path: &'a [u8],
+    kind: &'a [u8],
+    source: &'a [u8],
+}
+
+impl MountEntry<'_> {
+    fn cirrus_id(&self) -> Option<u64> {
+        (self.kind == b"fuse.cirrus-drive")
+            .then(|| std::str::from_utf8(self.id).ok()?.parse().ok())
+            .flatten()
+    }
+}
+
+fn mount_entries(info: &[u8]) -> impl Iterator<Item = MountEntry<'_>> {
+    info.split(|b| *b == b'\n').filter_map(|line| {
+        let mut fields = line.split(|b| *b == b' ');
+        let mut fixed = [b"".as_slice(); 6];
+        for field in &mut fixed {
+            *field = fields.next()?;
+        }
+        if fixed.contains(&b"-".as_slice()) {
+            return None;
+        }
+        let [id, _, _, _, path, _] = fixed;
+        fields.find(|field| *field == b"-")?;
+        Some(MountEntry {
+            id,
+            path,
+            kind: fields.next()?,
+            source: fields.next()?,
+        })
+    })
+}
+
+/// One mount namespace observation for read-only inspection of multiple FUSE mounts.
+#[derive(Debug)]
+pub struct MountTable {
+    paths: HashMap<Vec<u8>, Option<(Vec<u8>, u64)>>,
+    sources: HashMap<Vec<u8>, usize>,
+}
+
+impl MountTable {
+    /// Reads and indexes `/proc/self/mountinfo` once, without opening mountpoints.
+    ///
+    /// # Errors
+    /// Returns an error if the kernel mount table cannot be read.
+    pub fn read() -> io::Result<Self> {
+        let info = std::fs::read("/proc/self/mountinfo")?;
+        let mut paths = HashMap::new();
+        let mut sources = HashMap::new();
+        for entry in mount_entries(&info) {
+            *sources.entry(entry.source.to_vec()).or_insert(0) += 1;
+            paths
+                .entry(entry.path.to_vec())
+                .and_modify(|mount| *mount = None)
+                .or_insert_with(|| entry.cirrus_id().map(|id| (entry.source.to_vec(), id)));
+        }
+        Ok(Self { paths, sources })
+    }
+
+    pub(crate) fn exact_id(&self, path: &Path, source: &str) -> Option<u64> {
+        let (mounted_source, id) = self.paths.get(&escape_mount_path(path))?.as_ref()?;
+        (mounted_source == source.as_bytes() && self.sources.get(source.as_bytes()) == Some(&1))
+            .then_some(*id)
+    }
+}
+
 pub(crate) fn mount_state(path: &Path, source: &str) -> io::Result<MountState> {
     let info = std::fs::read("/proc/self/mountinfo")?;
     let path = escape_mount_path(path);
     let mut count = 0;
     let mut exact_id = None;
     let mut source_count = 0;
-    for line in info.split(|b| *b == b'\n') {
-        let fields: Vec<_> = line.split(|b| *b == b' ').collect();
-        let Some(separator) = fields.iter().position(|field| *field == b"-") else {
-            continue;
-        };
-        if separator < 6 || fields.len() <= separator + 2 {
-            continue;
-        }
-        let has_source = fields[separator + 2] == source.as_bytes();
+    for entry in mount_entries(&info) {
+        let has_source = entry.source == source.as_bytes();
         if has_source {
             source_count += 1;
         }
-        if fields[4] == path {
+        if entry.path == path {
             count += 1;
-            if has_source && fields[separator + 1] == b"fuse.cirrus-drive" {
-                exact_id = std::str::from_utf8(fields[0])
-                    .ok()
-                    .and_then(|id| id.parse().ok());
+            if has_source && entry.kind == b"fuse.cirrus-drive" {
+                exact_id = entry.cirrus_id();
             }
         }
     }

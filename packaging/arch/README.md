@@ -40,6 +40,8 @@ Before upgrading or removing the package, follow the unmount and stop steps in
 [Stop, uninstall or upgrade](../../README.md#stop-uninstall-or-upgrade) using the
 installed client that matches the running service. Use pacman, not the user-local
 uninstall script, to remove the package.
+The packaged unit does not opt in to user-managed release activation. Cirrus
+does not replace package-owned artifacts or restart the unit for live updates.
 Pacman cannot manage a previous per-user install. In particular,
 `~/.local/bin/cirrus-*`, a user unit in `~/.config/systemd/user`, and a desktop
 file in `~/.local/share/applications` take precedence over the packaged files.

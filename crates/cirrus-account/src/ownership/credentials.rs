@@ -1,14 +1,87 @@
 //! Concrete credential ownership, independent of mutable principal-lock mode.
 
 #[cfg(target_os = "linux")]
-pub(crate) struct Context {
-    pub(super) bus: zbus::blocking::Connection,
-}
+pub(crate) use linux::{Context, Writer};
 
 #[cfg(target_os = "linux")]
-impl Context {
-    pub(crate) fn connection(&self) -> &zbus::blocking::Connection {
-        &self.bus
+mod linux {
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    use cirrus_api::CredentialPolicy;
+    use zbus::blocking::Connection;
+
+    use super::super::{acquire_operation_name, connect_bus, connect_policy_bus};
+    use crate::AccountError;
+
+    pub(crate) struct Context(Access);
+
+    enum Access {
+        Reader(Connection),
+        Writer(Arc<Writer>),
+    }
+
+    pub(crate) struct Writer {
+        bus: Connection,
+        policy: CredentialPolicy,
+    }
+
+    const STANDARD_TIMEOUT: Duration = Duration::from_secs(1);
+
+    impl Context {
+        pub(in crate::ownership) fn connect_reader() -> Result<Self, AccountError> {
+            let timeout = crate::executor::is_automatic().then_some(STANDARD_TIMEOUT);
+            Ok(Self(Access::Reader(connect_bus(timeout)?)))
+        }
+
+        pub(in crate::ownership) fn connect_writer(
+            policy: CredentialPolicy,
+        ) -> Result<Self, AccountError> {
+            let timeout = crate::executor::is_automatic().then(|| match policy {
+                CredentialPolicy::StandardV1 => STANDARD_TIMEOUT,
+                CredentialPolicy::SlowKeyringV1 => Duration::from_secs(2),
+            });
+            Self::admit_writer(policy, connect_bus(timeout)?)
+        }
+
+        pub(in crate::ownership) fn connect_policy_writer() -> Result<Self, AccountError> {
+            // Control only negotiates the name. It never opens Secret Service.
+            Self::admit_writer(
+                CredentialPolicy::StandardV1,
+                connect_policy_bus(STANDARD_TIMEOUT)?,
+            )
+        }
+
+        fn admit_writer(policy: CredentialPolicy, bus: Connection) -> Result<Self, AccountError> {
+            acquire_operation_name(&bus)?;
+            Ok(Self(Access::Writer(Arc::new(Writer { bus, policy }))))
+        }
+
+        pub(in crate::ownership) fn reconnect(&mut self) -> Result<(), AccountError> {
+            if self.connection().is_closed() {
+                *self = match &self.0 {
+                    Access::Reader(_) => Self::connect_reader()?,
+                    Access::Writer(writer) => Self::connect_writer(writer.policy)?,
+                };
+            }
+            Ok(())
+        }
+
+        pub(crate) fn connection(&self) -> &Connection {
+            match &self.0 {
+                Access::Reader(bus) => bus,
+                Access::Writer(writer) => &writer.bus,
+            }
+        }
+
+        // A Store may clone the transport for Secret Service, but it cannot
+        // extend the guard's write authority or inherit a replacement bus.
+        pub(crate) fn writer(&self) -> Option<Weak<Writer>> {
+            match &self.0 {
+                Access::Reader(_) => None,
+                Access::Writer(writer) => Some(Arc::downgrade(writer)),
+            }
+        }
     }
 }
 

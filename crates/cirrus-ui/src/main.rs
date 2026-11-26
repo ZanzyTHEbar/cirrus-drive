@@ -47,7 +47,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(arg) if arg == "--version" => {
-            println!("cirrus-ui {}", env!("CARGO_PKG_VERSION"));
+            print!("cirrus-ui {}", env!("CARGO_PKG_VERSION"));
+            if let Ok(release) = env::var("CIRRUS_RUNNING_RELEASE") {
+                print!(" (release {release})");
+            }
+            println!();
             ExitCode::SUCCESS
         }
         _ => {

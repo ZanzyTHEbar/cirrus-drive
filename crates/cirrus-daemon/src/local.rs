@@ -1,15 +1,17 @@
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixListener;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::application::{Application, Shutdown};
-use cirrus_api::{AccountRequest, AccountResponse};
+use cirrus_account::Accounts;
+use cirrus_api::{AccountRequest, AccountResponse, ReleaseRequest};
 use cirrus_client::wire::{
-    ERROR_RESPONSE, INCOMPATIBLE_RESPONSE, MANUAL_STATUS_RESPONSE, PREFIX, SOCKET_NAME,
-    STATUS_REQUEST, STATUS_RESPONSE, STOP_BUSY_RESPONSE, STOP_PENDING_RESPONSE, STOP_REQUEST,
-    STOP_RESPONSE, TIMEOUT, proc_fd_path, read_line, verify_peer, verify_socket,
-    write_account_response, write_line,
+    ERROR_RESPONSE, INCOMPATIBLE_RESPONSE, LineReader, MANUAL_STATUS_RESPONSE, PREFIX,
+    RELEASE_PREFIX, SOCKET_NAME, STATUS_REQUEST, STATUS_RESPONSE, STOP_BUSY_RESPONSE,
+    STOP_PENDING_RESPONSE, STOP_REQUEST, STOP_RESPONSE, TIMEOUT, proc_fd_path, verify_peer,
+    verify_socket, write_account_response, write_line,
 };
 use cirrus_runtime::RuntimeDir;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags};
@@ -18,6 +20,9 @@ use rustix::process;
 
 const OWNER_NAME: &str = "cirrus-drive.owner";
 const OWNER_CONTENT: &[u8] = b"cirrus-drive runtime socket v1\n";
+// Bound the number of accepted but not yet dispatched sockets and their frames.
+const MAX_PENDING: usize = 8;
+const POLL_TERMINAL: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
 
 fn endpoint(runtime: &RuntimeDir) -> io::Result<Option<std::os::fd::OwnedFd>> {
     match fs::openat2(
@@ -168,7 +173,118 @@ fn recover_endpoint(runtime: &RuntimeDir, socket: impl AsFd) -> io::Result<()> {
     }
 }
 
-pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
+struct Pending {
+    stream: UnixStream,
+    reader: LineReader,
+    deadline: Instant,
+}
+
+struct Ingress {
+    listener: UnixListener,
+    pending: Vec<Pending>,
+}
+
+impl Ingress {
+    fn next_request(&mut self, runtime: &RuntimeDir) -> io::Result<(UnixStream, Vec<u8>, Instant)> {
+        let mut fds = [libc::pollfd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0,
+        }; MAX_PENDING + 1];
+        loop {
+            let now = Instant::now();
+            self.pending.retain(|peer| peer.deadline > now);
+            // When full, leave new connections in the bounded kernel backlog.
+            fds[0].fd = if self.pending.len() < MAX_PENDING {
+                self.listener.as_raw_fd()
+            } else {
+                -1
+            };
+            let fds = &mut fds[..1 + self.pending.len()];
+            for (fd, peer) in fds[1..].iter_mut().zip(&self.pending) {
+                fd.fd = peer.stream.as_raw_fd();
+            }
+            let timeout = self
+                .pending
+                .iter()
+                .map(|peer| peer.deadline)
+                .min()
+                // Round up to avoid repeatedly polling with a zero timeout.
+                .map_or(-1, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_nanos()
+                        .div_ceil(1_000_000) as libc::c_int
+                });
+            // SAFETY: fds is a writable array of pollfd values. The listener and
+            // pending streams own the descriptors until poll returns.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+
+            let mut index = 0;
+            for fd in &fds[1..] {
+                let peer = &mut self.pending[index];
+                if fd.revents == 0 {
+                    index += 1;
+                    continue;
+                }
+                // Read even on HUP: buffered bytes can still contain a frame.
+                let keep = if peer.deadline > Instant::now() {
+                    match peer.reader.try_read(&peer.stream) {
+                        Ok(Some(line)) if peer.deadline > Instant::now() => {
+                            let peer = self.pending.remove(index);
+                            runtime.revalidate()?;
+                            return Ok((peer.stream, line, peer.deadline));
+                        }
+                        Ok(None) => true,
+                        Err(error) => {
+                            error.kind() == io::ErrorKind::Interrupted
+                                || (error.kind() == io::ErrorKind::WouldBlock
+                                    && fd.revents & POLL_TERMINAL == 0)
+                        }
+                        Ok(Some(_)) => false,
+                    }
+                } else {
+                    false
+                };
+                if keep {
+                    index += 1;
+                } else {
+                    self.pending.remove(index);
+                }
+            }
+
+            let listener_events = fds[0].revents;
+            if listener_events & POLL_TERMINAL != 0 {
+                return Err(io::Error::other("local listener is no longer usable"));
+            }
+            if listener_events & libc::POLLIN != 0 {
+                // On Linux accept does not inherit O_NONBLOCK from the listener.
+                // Request handlers still receive a blocking stream for replies.
+                let stream = match net::accept_with(&self.listener, SocketFlags::CLOEXEC) {
+                    Ok(fd) => UnixStream::from(fd),
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                runtime.revalidate()?;
+                if verify_peer(&stream).is_ok() {
+                    self.pending.push(Pending {
+                        stream,
+                        reader: LineReader::default(),
+                        deadline: Instant::now() + TIMEOUT,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn acquire_runtime_guard(runtime: &RuntimeDir) -> io::Result<std::os::fd::OwnedFd> {
     runtime.revalidate()?;
     // An unlistening abstract socket is an atomic, process-lifetime guard. It
     // cannot be unlinked or replaced through a pathname while the daemon runs.
@@ -194,6 +310,15 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
             format!("cannot acquire Cirrus instance guard: {error}"),
         )
     })?;
+    Ok(guard)
+}
+
+pub(crate) fn serve(
+    runtime: &RuntimeDir,
+    automatic: bool,
+    release_root: Option<&Path>,
+) -> io::Result<()> {
+    let guard = acquire_runtime_guard(runtime)?;
     if owner_marker(runtime)?.is_none() {
         match create_owner_marker(runtime) {
             Ok(()) => (),
@@ -216,6 +341,11 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
             "another Cirrus daemon owns this runtime",
         )
     })?;
+    let accounts = if release_root.is_some() {
+        Accounts::for_managed_service(runtime.try_clone()?).map_err(io::Error::other)?
+    } else {
+        Accounts::new(runtime.try_clone()?)
+    };
     let owned = owner_marker(runtime)?;
     if let Some(existing) = endpoint(runtime)? {
         let identity = fs::fstat(&existing).map_err(io::Error::from)?;
@@ -237,7 +367,7 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
     let fd = net::socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
-        SocketFlags::CLOEXEC,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
         None,
     )
     .map_err(io::Error::from)?;
@@ -257,23 +387,36 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
     let identity = fs::fstat(&socket).map_err(io::Error::from)?;
     write_owner(runtime, Some((identity.st_dev, identity.st_ino)))?;
     net::listen(&fd, 8).map_err(io::Error::from)?;
-    let listener = UnixListener::from(fd);
-    let mut application = Application::start(runtime.try_clone()?, automatic)?;
+    let mut ingress = Ingress {
+        listener: UnixListener::from(fd),
+        pending: Vec::with_capacity(MAX_PENDING),
+    };
+    let mut application =
+        Application::start(runtime.try_clone()?, automatic, release_root, accounts)?;
     loop {
-        let (mut stream, _) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        runtime.revalidate()?;
-        if verify_peer(&stream).is_err() {
+        let (mut stream, line, deadline) = ingress.next_request(runtime)?;
+        if let Some(json) = line.strip_prefix(RELEASE_PREFIX)
+            && let Ok(request) = serde_json::from_slice::<ReleaseRequest>(json)
+        {
+            let ownership = (marker_lock.try_clone()?, guard.try_clone()?);
+            match request {
+                ReleaseRequest::MountEngines => application.dispatch_mount_engines(move |result| {
+                    let _ownership = ownership;
+                    write_release_response(&mut stream, result);
+                })?,
+                ReleaseRequest::CredentialPolicy(request) => {
+                    application.dispatch_credential_policy(request, move |result| {
+                        let _ownership = ownership;
+                        write_release_response(&mut stream, result);
+                    })?;
+                }
+                request => application.dispatch_release(request, move |result| {
+                    let _ownership = ownership;
+                    write_release_response(&mut stream, result);
+                })?,
+            }
             continue;
         }
-        let deadline = Instant::now() + TIMEOUT;
-        let line = match read_line(&mut stream, deadline) {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
         if let Some(json) = line.strip_prefix(PREFIX) {
             let request = serde_json::from_slice::<AccountRequest>(json);
             if let Ok(request) = request {
@@ -313,11 +456,19 @@ pub(crate) fn serve(runtime: &RuntimeDir, automatic: bool) -> io::Result<()> {
             }
             remove_endpoint(runtime, &socket)?;
             write_owner(runtime, None)?;
-            drop(listener);
+            drop(ingress);
             drop(guard);
             write_line(&mut stream, response, Instant::now() + TIMEOUT)?;
             return Ok(());
         }
         let _ = write_line(&mut stream, response, deadline);
+    }
+}
+
+fn write_release_response(stream: &mut UnixStream, response: impl serde::Serialize) {
+    let mut bytes = RELEASE_PREFIX.to_vec();
+    if serde_json::to_writer(&mut bytes, &response).is_ok() {
+        bytes.push(b'\n');
+        let _ = write_line(stream, &bytes, Instant::now() + TIMEOUT);
     }
 }

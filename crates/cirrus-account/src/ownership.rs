@@ -74,9 +74,7 @@ impl Guard {
         }
         self.root.revalidate()?;
         #[cfg(target_os = "linux")]
-        if self.credentials.bus.is_closed() {
-            self.credentials.bus = connect_bus(true)?;
-        }
+        self.credentials.reconnect()?;
         #[cfg(target_os = "macos")]
         {
             self.credentials
@@ -104,11 +102,14 @@ impl Guard {
 pub(crate) fn acquire_in(
     root: &StorageRoot,
     runtime: &RuntimeDir,
+    #[cfg(target_os = "linux")] policy: cirrus_api::CredentialPolicy,
     #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
 ) -> Result<Guard, AccountError> {
     acquire_principal_in(
         root,
         runtime,
+        #[cfg(target_os = "linux")]
+        policy,
         #[cfg(target_os = "macos")]
         config,
         false,
@@ -118,11 +119,14 @@ pub(crate) fn acquire_in(
 pub(crate) fn acquire_local_in(
     root: &StorageRoot,
     runtime: &RuntimeDir,
+    #[cfg(target_os = "linux")] policy: cirrus_api::CredentialPolicy,
     #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
 ) -> Result<Guard, AccountError> {
     acquire_principal_in(
         root,
         runtime,
+        #[cfg(target_os = "linux")]
+        policy,
         #[cfg(target_os = "macos")]
         config,
         true,
@@ -132,6 +136,7 @@ pub(crate) fn acquire_local_in(
 fn acquire_principal_in(
     root: &StorageRoot,
     runtime: &RuntimeDir,
+    #[cfg(target_os = "linux")] policy: cirrus_api::CredentialPolicy,
     #[cfg(target_os = "macos")] config: Option<&credentials::KeychainConfig>,
     local: bool,
 ) -> Result<Guard, AccountError> {
@@ -157,9 +162,7 @@ fn acquire_principal_in(
         },
     )?;
     #[cfg(target_os = "linux")]
-    let credentials = credentials::Context {
-        bus: connect_bus(true)?,
-    };
+    let credentials = credentials::Context::connect_writer(policy)?;
     #[cfg(target_os = "macos")]
     let (lock, credentials) = credential_ownership(
         root,
@@ -183,6 +186,16 @@ fn acquire_principal_in(
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_credential_policy_writer(
+    runtime: &RuntimeDir,
+) -> Result<credentials::Context, AccountError> {
+    runtime
+        .revalidate()
+        .map_err(|_| AccountError::new("runtime directory is unavailable or unsafe"))?;
+    credentials::Context::connect_policy_writer()
+}
+
 pub(crate) fn acquire_shared_in(
     root: &StorageRoot,
     runtime: &RuntimeDir,
@@ -201,9 +214,7 @@ pub(crate) fn acquire_shared_in(
     // Staging may coexist with sync's exclusive bus name and same-principal
     // automatic rotation. Shared flock still excludes foreground account changes.
     #[cfg(target_os = "linux")]
-    let credentials = credentials::Context {
-        bus: connect_bus(false)?,
-    };
+    let credentials = credentials::Context::connect_reader()?;
     #[cfg(target_os = "macos")]
     let (lock, credentials) = credential_ownership(
         root,
@@ -292,6 +303,26 @@ pub(crate) fn acquire_offline_exclusive_in(
         CONTENT,
         fs::FlockOperation::NonBlockingLockExclusive,
     )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_state_admission(
+    directory: &OwnedFd,
+    operation: fs::FlockOperation,
+) -> Result<OwnedFd, AccountError> {
+    marker::lock(
+        directory,
+        "state-admission.lock",
+        b"cirrus-drive state admission v1\n",
+        operation,
+        true,
+    )
+    .map_err(|error| match error {
+        marker::MarkerError::Failure(message) => AccountError::new(message),
+        marker::MarkerError::Contended => {
+            AccountError::retryable_read("State maintenance or another storage owner is active")
+        }
+    })
 }
 
 pub(crate) fn acquire_sync_in(
@@ -797,7 +828,7 @@ fn bus_failure(message: &'static str, transient: bool) -> AccountError {
 }
 
 #[cfg(target_os = "linux")]
-fn connect_bus(exclusive: bool) -> Result<zbus::blocking::Connection, AccountError> {
+fn open_bus_stream() -> Result<UnixStream, AccountError> {
     let directory = RuntimeDir::open(&bus_dir()).map_err(|_| {
         AccountError::new("standard per-user bus directory is unavailable or unsafe")
     })?;
@@ -862,27 +893,72 @@ fn connect_bus(exclusive: bool) -> Result<zbus::blocking::Connection, AccountErr
     if peer.uid != process::geteuid() {
         return Err(AccountError::new("per-user bus peer UID does not match"));
     }
-    let builder = zbus::blocking::connection::Builder::async_io_unix_stream(stream);
+    Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
+fn connect_bus(timeout: Option<Duration>) -> Result<zbus::blocking::Connection, AccountError> {
+    let builder = zbus::blocking::connection::Builder::async_io_unix_stream(open_bus_stream()?);
     // Bound each background Secret Service method, not whole authentication
     // or local I/O. Timed-out credential writes retain existing refresh fences.
-    let builder = if crate::executor::is_automatic() {
-        builder.method_timeout(Duration::from_secs(1))
+    let builder = if let Some(timeout) = timeout {
+        builder.method_timeout(timeout)
     } else {
         builder
     };
-    let bus = builder.build().map_err(|error| {
-        bus_failure(
-            "cannot authenticate standard per-user bus",
-            transient_bus_error(&error),
-        )
-    })?;
-    if !exclusive {
-        return Ok(bus);
+    builder.build().map_err(bus_auth_failure)
+}
+
+#[cfg(target_os = "linux")]
+fn bus_auth_failure(error: zbus::Error) -> AccountError {
+    bus_failure(
+        "cannot authenticate standard per-user bus",
+        transient_bus_error(&error),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn connect_policy_bus(timeout: Duration) -> Result<zbus::blocking::Connection, AccountError> {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Signal(std::thread::Thread);
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
     }
+
+    // zbus's per-method cutoff does not cover the initial authentication.
+    // While holding Accounts::operation, poll it to a deadline; dropping an
+    // unfinished handshake cannot claim the bus name later on a helper thread.
+    let builder =
+        zbus::connection::Builder::async_io_unix_stream(open_bus_stream()?).method_timeout(timeout);
+    let deadline = Instant::now() + timeout;
+    let mut handshake = std::pin::pin!(builder.build());
+    let waker = Waker::from(Arc::new(Signal(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(bus_failure(
+                "account operation bus authentication timed out",
+                true,
+            ));
+        }
+        if let Poll::Ready(result) = handshake.as_mut().poll(&mut context) {
+            return result.map(Into::into).map_err(bus_auth_failure);
+        }
+        std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_operation_name(bus: &zbus::blocking::Connection) -> Result<(), AccountError> {
     #[cfg(feature = "fault-injection")]
     if crate::executor::is_automatic() {
         crate::wait_test_window("CIRRUS_TEST_ACCOUNT_BUS_WINDOW")?;
     }
+    // The primary owner can neither queue nor be replaced by another connection.
     let reply = bus
         .request_name_with_flags(
             "org.cirrusdrive.AccountOperation",
@@ -908,5 +984,5 @@ fn connect_bus(exclusive: bool) -> Result<zbus::blocking::Connection, AccountErr
             "another account operation is in progress",
         ));
     }
-    Ok(bus)
+    Ok(())
 }

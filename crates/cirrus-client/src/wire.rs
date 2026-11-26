@@ -12,9 +12,11 @@ use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use rustix::process;
 
 pub const PREFIX: &[u8] = b"CIRRUS/3 ";
+pub const RELEASE_PREFIX: &[u8] = b"CIRRUS/3 RELEASE/1 ";
 pub const SOCKET_NAME: &str = "cirrus-drive.sock";
 pub const MAX_LINE: usize = 262_144;
 pub const TIMEOUT: Duration = Duration::from_secs(2);
+const READ_CHUNK: usize = 8 * 1024;
 pub const STATUS_REQUEST: &[u8] = b"CIRRUS/3 STATUS\n";
 pub const STOP_REQUEST: &[u8] = b"CIRRUS/3 STOP\n";
 pub const STATUS_RESPONSE: &[u8] =
@@ -115,32 +117,74 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local request timed out"))
 }
 
+/// Accumulates the first newline-terminated frame of a one-shot connection.
+#[derive(Debug, Default)]
+pub struct LineReader(Vec<u8>);
+
+impl LineReader {
+    /// Reads at most one chunk without changing the socket's blocking mode.
+    ///
+    /// # Errors
+    /// Returns the receive error (including `WouldBlock`), or an error for
+    /// premature EOF or a frame at the byte limit without a newline.
+    pub fn try_read(&mut self, stream: &UnixStream) -> io::Result<Option<Vec<u8>>> {
+        self.read_chunk(|buf| {
+            net::recv(stream, buf, net::RecvFlags::DONTWAIT)
+                .map(|(_, len)| len)
+                .map_err(io::Error::from)
+        })
+    }
+
+    fn read_chunk(
+        &mut self,
+        read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let too_long = || io::Error::new(io::ErrorKind::InvalidData, "local message exceeds limit");
+        let mut buf = [0; READ_CHUNK];
+        let limit = buf.len().min(MAX_LINE - self.0.len());
+        if limit == 0 {
+            return Err(too_long());
+        }
+        let len = read(&mut buf[..limit])?;
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete local message",
+            ));
+        }
+        let newline = buf[..len].iter().position(|&byte| byte == b'\n');
+        let end = newline.map_or(len, |index| index + 1);
+        let total = self.0.len() + end;
+        if total > self.0.capacity() {
+            self.0
+                .reserve_exact(total.next_power_of_two().min(MAX_LINE) - self.0.len());
+        }
+        // No subsequent frame is read on this connection; ignore trailing bytes.
+        self.0.extend_from_slice(&buf[..end]);
+        if newline.is_some() {
+            Ok(Some(std::mem::take(&mut self.0)))
+        } else if total == MAX_LINE {
+            Err(too_long())
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 pub fn read_line(stream: &mut UnixStream, deadline: Instant) -> io::Result<Vec<u8>> {
-    let mut line = Vec::with_capacity(MAX_LINE);
-    while line.len() < MAX_LINE {
+    let mut reader = LineReader::default();
+    loop {
         stream.set_read_timeout(Some(remaining(deadline)?))?;
-        let mut byte = [0];
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete local message",
-                ));
+        match reader.read_chunk(|buf| stream.read(buf)) {
+            Ok(Some(line)) => {
+                remaining(deadline)?;
+                return Ok(line);
             }
-            Ok(_) => {
-                line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    return Ok(line);
-                }
-            }
+            Ok(None) => (),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "local message exceeds limit",
-    ))
 }
 
 pub fn write_line(stream: &mut UnixStream, mut data: &[u8], deadline: Instant) -> io::Result<()> {

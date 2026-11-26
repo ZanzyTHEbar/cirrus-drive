@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cirrus_client::{
-    AccountReply, AccountRequest as Q, ClientError, MountMode, Operation, Reply, SpacePath,
-    StorageLimits,
+    AccountReply, AccountRequest as Q, ClientError, CredentialPolicyRequest, MountMode, Operation,
+    ReleaseRequest, Reply, SpacePath, StorageLimits,
 };
 
 const HELP: &str = "\
 Usage: cirrus-daemon --help | --version | --check-runtime | --status | --stop
+       cirrus-daemon --release-status | --mount-engines | --activate-release RELEASE_ID | --rollback-release
+       cirrus-daemon --credential-policy | --activate-credential-policy RELEASE_ID | --rollback-credential-policy
        cirrus-daemon --discover HTTPS_URL [--ca-cert PEM_FILE]
        cirrus-daemon --connect HTTPS_URL [--ca-cert PEM_FILE]
        cirrus-daemon --spaces HTTPS_URL
@@ -72,9 +74,16 @@ impl Presentation {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if let [flag] = args.as_slice() {
+        if flag == "--version" {
+            print!("cirrus-daemon {}", env!("CARGO_PKG_VERSION"));
+            if let Ok(release) = env::var("CIRRUS_RUNNING_RELEASE") {
+                print!(" (release {release})");
+            }
+            println!();
+            return ExitCode::SUCCESS;
+        }
         let info = match flag.to_str() {
             Some("--help") => Some(HELP),
-            Some("--version") => Some(concat!("cirrus-daemon ", env!("CARGO_PKG_VERSION"))),
             #[cfg(feature = "fault-injection")]
             Some("--lab-capabilities") => Some("cirrus-drive disposable account and mount lab v1"),
             _ => None,
@@ -165,6 +174,42 @@ fn parse(args: &[OsString]) -> Result<(Operation, Presentation), &'static str> {
         }
         ("--stop", []) => {
             return Ok((Operation::Stop, Presentation::new("local daemon")));
+        }
+        ("--release-status", []) => {
+            return Ok((Operation::Release(ReleaseRequest::Status), Presentation::new("release")));
+        }
+        ("--mount-engines", []) => {
+            return Ok((Operation::MountEngines, Presentation::new("mounted read engine")));
+        }
+        ("--rollback-release", []) => {
+            return Ok((Operation::Release(ReleaseRequest::Rollback), Presentation::new("release rollback")));
+        }
+        ("--activate-release", [id]) => {
+            let release = id.to_str().filter(|id| !id.is_empty() && id.len() <= 64)
+                .ok_or("invalid release ID")?.to_owned();
+            return Ok((Operation::Release(ReleaseRequest::Activate { release }), Presentation::new("release activation")));
+        }
+        ("--credential-policy" | "--rollback-credential-policy", []) => {
+            let request = if flag == "--credential-policy" {
+                CredentialPolicyRequest::Status
+            } else {
+                CredentialPolicyRequest::Rollback
+            };
+            return Ok((
+                Operation::CredentialPolicy(request),
+                Presentation::new("credential policy"),
+            ));
+        }
+        ("--activate-credential-policy", [id]) => {
+            let release = id
+                .to_str()
+                .filter(|id| !id.is_empty() && id.len() <= 64)
+                .ok_or("invalid release ID")?
+                .to_owned();
+            return Ok((
+                Operation::CredentialPolicy(CredentialPolicyRequest::Activate { release }),
+                Presentation::new("credential policy activation"),
+            ));
         }
         ("--discover" | "--connect", _) => {
             let (instance, ca) = match rest {
@@ -568,6 +613,9 @@ fn render(reply: Reply, output: Presentation) -> serde_json::Result<()> {
         ),
         Reply::Status(status) => println!("{status}"),
         Reply::Stopping => println!("daemon stopping"),
+        Reply::Release(status) => println!("{}", serde_json::to_string(&status)?),
+        Reply::CredentialPolicy(profile) => print_json(&profile)?,
+        Reply::MountEngines(report) => println!("{}", serde_json::to_string(&report)?),
         Reply::Discovery(config) => println!(
             "issuer: {}\nclient ID: {}\nscopes: {}\nauthorization endpoint: {}\ntoken endpoint: {}\nJWKS URI: {}\ndynamic registration advertised: {} (not used by Cirrus)",
             config.issuer(),

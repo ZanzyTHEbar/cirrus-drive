@@ -2,6 +2,7 @@
 
 mod settings;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
@@ -14,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cirrus_daemon::{
-    CleanCacheStatus, Daemon, JournalPage, JournalSummary, MountInfo, MountState, RetainedPage,
+    CleanCacheStatus, Daemon, JournalPage, JournalSummary, MountInfo, MountState, ReleaseStatus, RetainedPage,
     RetainedPin, RetainedPinCopy, RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
 };
 use cirrus_runtime::RuntimeDir;
@@ -191,7 +192,10 @@ enum ResultValue {
     Settings(Option<String>),
     ChosenMountpoint(Arc<MountpointOrigin>, Result<String, &'static str>),
     DefaultMountpoint(String, String, Result<String, &'static str>),
-    Status(Result<Vec<MountInfo>, String>),
+    Status {
+        mounts: Result<Vec<MountInfo>, String>,
+        runtime: RuntimeDir,
+    },
     PreparedConnect(String, String, std::io::Result<String>),
     Connected(String, std::io::Result<()>),
     Spaces(String, Vec<(String, String)>, std::io::Result<()>),
@@ -252,6 +256,12 @@ struct State {
     edit_account: bool,
     show_mount_recovery: bool,
     service_running: bool,
+    release_status: Option<ReleaseStatus>,
+    status_generation: u64,
+    release_in_flight: bool,
+    pending_release: Option<RuntimeDir>,
+    release_sender: Sender<(u64, Option<ReleaseStatus>)>,
+    release_receiver: Receiver<(u64, Option<ReleaseStatus>)>,
     service_unavailable: bool,
     instance: TextEdit,
     ca: TextEdit,
@@ -305,6 +315,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel();
         let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
         let (_, accent_receiver) = mpsc::channel();
         let accent_lifetime = Arc::new(());
         Self {
@@ -313,6 +324,12 @@ impl Default for State {
             edit_account: true,
             show_mount_recovery: false,
             service_running: false,
+            release_status: None,
+            status_generation: 0,
+            release_in_flight: false,
+            pending_release: None,
+            release_sender,
+            release_receiver,
             service_unavailable: false,
             instance: TextEdit::new(""),
             ca: TextEdit::new(""),
@@ -465,6 +482,9 @@ impl State {
         let checking_status = matches!(action, Action::Status);
         if checking_status {
             self.service_unavailable = false;
+            self.status_generation = self.status_generation.wrapping_add(1);
+            self.release_status = None;
+            self.pending_release = None;
         }
         if matches!(
             action,
@@ -549,6 +569,33 @@ impl State {
                 wake();
             }
         });
+    }
+
+    fn start_release_check(&mut self) {
+        if self.release_in_flight {
+            return;
+        }
+        let Some(runtime) = self.pending_release.take() else {
+            return;
+        };
+        let generation = self.status_generation;
+        let sender = self.release_sender.clone();
+        let wake = self.wake.clone();
+        // Keep one optional request in flight; only the newest primary check
+        // may queue a replacement while the old request finishes.
+        self.release_in_flight = thread::Builder::new()
+            .name("cirrus-ui-release-status".into())
+            .spawn(move || {
+                let release = Daemon::new()
+                    .release_status(&runtime)
+                    .ok()
+                    .filter(|status| status.managed);
+                let _ = sender.send((generation, release));
+                if let Some(wake) = wake {
+                    wake();
+                }
+            })
+            .is_ok();
     }
 
     fn cancel_sign_in(&mut self) {
@@ -639,15 +686,14 @@ fn execute(action: Action) -> std::io::Result<ResultValue> {
         }
         Action::Status => {
             daemon.status(&runtime)?;
-            Ok(ResultValue::Status(daemon.mounts(&runtime).map_err(
-                |error| {
-                    if error.raw_os_error().is_some() {
-                        "Could not check the mount. Retry the service check.".to_owned()
-                    } else {
-                        error.to_string()
-                    }
-                },
-            )))
+            let mounts = daemon.mounts(&runtime).map_err(|error| {
+                if error.raw_os_error().is_some() {
+                    "Could not check the mount. Retry the service check.".to_owned()
+                } else {
+                    error.to_string()
+                }
+            });
+            Ok(ResultValue::Status { mounts, runtime })
         }
         Action::Connect {
             instance,
@@ -905,6 +951,14 @@ fn desktop_accent() -> Option<Color> {
 fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
     let _keep_accent_worker_alive = &state.accent_lifetime;
     let mut accent_changed = false;
+    if let Ok((generation, release)) = state.release_receiver.try_recv() {
+        state.release_in_flight = false;
+        if generation == state.status_generation {
+            state.release_status = release;
+            accent_changed = true;
+        }
+        state.start_release_check();
+    }
     if let Some(started) = state.sign_in_started {
         let seconds = started.elapsed().as_secs();
         if seconds != state.sign_in_seconds {
@@ -1008,21 +1062,26 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
                 };
             }
         }
-        Ok(ResultValue::Status(Ok(mounts))) => {
+        Ok(ResultValue::Status { mounts, runtime }) => {
             state.service_running = true;
             state.service_unavailable = false;
-            state.mounts = mounts;
-            state.mount_checked = true;
-            state.message = state.status_notice.take().unwrap_or_else(||
-                "Closing this window leaves the service running.".into());
-        }
-        Ok(ResultValue::Status(Err(error))) => {
-            state.status_notice = None;
-            state.service_running = true;
-            state.service_unavailable = false;
-            state.mount_checked = false;
-            state.error = true;
-            state.message = format!("Mount status could not be verified: {error}");
+            match mounts {
+                Ok(mounts) => {
+                    state.mounts = mounts;
+                    state.mount_checked = true;
+                    state.message = state.status_notice.take().unwrap_or_else(|| {
+                        "Closing this window leaves the service running.".into()
+                    });
+                }
+                Err(error) => {
+                    state.status_notice = None;
+                    state.mount_checked = false;
+                    state.error = true;
+                    state.message = format!("Mount status could not be verified: {error}");
+                }
+            }
+            state.pending_release = Some(runtime);
+            state.start_release_check();
         }
         Ok(ResultValue::Connected(instance, saved)) => {
             state.service_running = true;
@@ -1205,6 +1264,43 @@ impl Paint {
             accent_text,
         }
     }
+
+    fn input(
+        self,
+        can_work: bool,
+        field: &TextEdit,
+        key: &'static str,
+        hint: &'static str,
+        edit: fn(&mut State) -> &mut TextEdit,
+    ) -> El {
+        let t = self.theme;
+        let input = text_input(field, type_::BODY)
+            .key(key)
+            .label(match key {
+                "instance" => "Server URL",
+                "ca" => "Additional CA certificate path",
+                "mountpoint" => "Mount directory",
+                "recover-path" => "Original mount directory",
+                "pin-path" => "Space path to pin",
+                "stage-path" => "Destination Space path",
+                "stage-source" => "Local source file",
+                "acknowledge-file" => "Journal filename or operation token",
+                "recovery-destination" => "New local destination",
+                "automatic-space-id" => "Space ID override (optional)",
+                _ => hint,
+            })
+            .single_line()
+            .w_full()
+            .h(38.0)
+            .px(10.0)
+            .fill(t.card)
+            .border(1.0, t.separator)
+            .radius(5.0)
+            .color(t.text)
+            .placeholder(hint, t.text_secondary)
+            .on_edit(edit);
+        if can_work { input } else { input.inert() }
+    }
 }
 
 fn button(
@@ -1298,11 +1394,8 @@ fn nav_button(paint: Paint, label: &'static str, page: Page, current: Page) -> E
         .on_press(move |s: &mut State| s.page = page)
 }
 
-fn view(state: &State, cx: &mut Cx<State>) -> El {
-    let t = tok::theme(cx.system_dark());
-    let paint = Paint::new(t, state.accent);
-    let can_work = !state.busy();
-    let space_origin = state
+fn space_origin(state: &State) -> Option<Arc<MountpointOrigin>> {
+    state
         .selected
         .as_ref()
         .map(|space| {
@@ -1311,59 +1404,30 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 space: space.clone(),
             })
         })
-        .filter(|origin| origin.is_current(state));
-    let known_mounted = state.mount_checked && !state.mounts.is_empty();
-    let input = |field: &TextEdit,
-                 key: &'static str,
-                 hint: &'static str,
-                 edit: fn(&mut State) -> &mut TextEdit| {
-        let input = text_input(field, type_::BODY)
-            .key(key)
-            .label(match key {
-                "instance" => "Server URL",
-                "ca" => "Additional CA certificate path",
-                "mountpoint" => "Mount directory",
-                "recover-path" => "Original mount directory",
-                "pin-path" => "Space path to pin",
-                "stage-path" => "Destination Space path",
-                "stage-source" => "Local source file",
-                "acknowledge-file" => "Journal filename or operation token",
-                "recovery-destination" => "New local destination",
-                "automatic-space-id" => "Space ID override (optional)",
-                _ => hint,
-            })
-            .single_line()
-            .w_full()
-            .h(38.0)
-            .px(10.0)
-            .fill(t.card)
-            .border(1.0, t.separator)
-            .radius(5.0)
-            .color(t.text)
-            .placeholder(hint, t.text_secondary)
-            .on_edit(edit);
-        if can_work { input } else { input.inert() }
-    };
+        .filter(|origin| origin.is_current(state))
+}
+
+fn drive_spaces(
+    state: &State,
+    paint: Paint,
+    can_work: bool,
+    mounts_by_space: &HashMap<&str, Option<&MountInfo>>,
+) -> El {
+    let t = paint.theme;
     let mut spaces = col().key("spaces").gap(4.0);
-    let current_spaces = state.spaces_instance.as_deref() == Some(state.instance.text.as_str());
-    for (id, name) in state.spaces.iter().filter(|_| current_spaces) {
-        let id = id.clone();
-        let name = name.clone();
+    let mut name_counts = HashMap::new();
+    for (_, name) in &state.spaces {
+        *name_counts.entry(name.as_str()).or_insert(0usize) += 1;
+    }
+    for (id, name) in &state.spaces {
         let selected = state.selected.as_deref() == Some(id.as_str());
-        let duplicate = state
-            .spaces
-            .iter()
-            .filter(|(_, other)| other == &name)
-            .count()
-            > 1;
+        let duplicate = name_counts.get(name.as_str()).copied().unwrap_or_default() > 1;
         let label = if duplicate {
             format!("{name} · {id}")
         } else {
-            name
+            name.clone()
         };
-        let mounted = state.mounts.iter().find(|mount| {
-            same_instance(&mount.instance, &state.instance.text) && mount.space_id == id
-        });
+        let mounted = mounts_by_space.get(id.as_str()).copied().flatten();
         let status = if !state.mount_checked {
             "Mount status unavailable; refresh the service check.".to_owned()
         } else if let Some(mount) = mounted {
@@ -1464,7 +1528,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         }
         spaces = spaces.child(item.padding(10.0));
     }
-    if current_spaces && state.spaces.is_empty() {
+    if state.spaces.is_empty() {
         spaces = spaces.child(
             text("No Spaces were returned. Check access on your server, then try again.")
                 .font(type_::BODY)
@@ -1473,7 +1537,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .color(t.text_secondary),
         );
     }
-    let current_recovery = state.recovery_instance.as_deref() == Some(state.instance.text.as_str());
+    spaces
+}
+
+fn recovery_listing(
+    state: &State,
+    paint: Paint,
+    can_work: bool,
+    current_recovery: bool,
+) -> (El, String) {
+    let t = paint.theme;
     let mut recovery_rows = col().key("recovery-rows").gap(6.0);
     for (index, entry) in state
         .recovery_rows
@@ -1646,12 +1719,19 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     } else {
         "Load retained copies for this account.".to_owned()
     };
-    let account_context = if state.instance.text.is_empty() {
+    (recovery_rows, selected_recovery)
+}
+
+fn account_context(state: &State) -> String {
+    if state.instance.text.is_empty() {
         "Enter an account URL in Drive setup first.".to_owned()
     } else {
         format!("Account: {}", state.instance.text)
-    };
-    let selected_context = if current_spaces {
+    }
+}
+
+fn selected_context(state: &State, current_spaces: bool) -> String {
+    if current_spaces {
         state
             .selected
             .as_ref()
@@ -1662,7 +1742,35 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             )
     } else {
         "Load Spaces and select one on the Drive page first.".to_owned()
+    }
+}
+
+fn drive_view(state: &State, paint: Paint, can_work: bool) -> El {
+    let t = paint.theme;
+    let current_spaces = state.spaces_instance.as_deref() == Some(state.instance.text.as_str());
+    let visible_spaces = if current_spaces { &state.spaces[..] } else { &[] };
+    let known_mounted = state.mount_checked && !state.mounts.is_empty();
+    let canonical_instance = if visible_spaces.is_empty() || state.mounts.is_empty() {
+        None
+    } else {
+        Daemon::canonical_instance(&state.instance.text).ok()
     };
+    let mut mounts_by_space: HashMap<&str, Option<&MountInfo>> = visible_spaces
+        .iter()
+        .map(|(id, _)| (id.as_str(), None))
+        .collect();
+    let mut other_mounts = Vec::new();
+    for mount in &state.mounts {
+        if let Some(instance) = canonical_instance.as_deref()
+            && let Some(first) = mounts_by_space.get_mut(mount.space_id.as_str())
+            && Daemon::canonical_instance(&mount.instance).is_ok_and(|origin| origin == instance)
+        {
+            // Only the first matching record supplies row actions, but none are "Other".
+            first.get_or_insert(mount);
+        } else if state.mount_checked {
+            other_mounts.push(mount);
+        }
+    }
     let mut account = col().w_full().gap(10.0).child(
         text("OpenCloud account")
             .font(tok::TextStyle::new(16.0, 600.0))
@@ -1688,10 +1796,15 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             )
             .child(text("Server URL").font(type_::LABEL).color(t.text))
             .child(
-                input(&state.instance, "instance", "https://cloud.example", |s| {
-                    &mut s.instance
-                })
-                .max_w(480.0),
+                paint
+                    .input(
+                        can_work,
+                        &state.instance,
+                        "instance",
+                        "https://cloud.example",
+                        |s| &mut s.instance,
+                    )
+                    .max_w(480.0),
             );
         if state.advanced {
             account = account
@@ -1701,7 +1814,9 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                         .color(t.text),
                 )
                 .child(
-                    input(&state.ca, "ca", "Absolute certificate path", |s| &mut s.ca).max_w(480.0),
+                    paint
+                        .input(can_work, &state.ca, "ca", "Absolute certificate path", |s| &mut s.ca)
+                        .max_w(480.0),
                 )
                 .child(
                     text("Certificate verification remains enabled.")
@@ -1818,7 +1933,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     .wrap()
                     .color(t.text_secondary),
             )
-            .child(spaces);
+            .child(drive_spaces(state, paint, can_work, &mounts_by_space));
         drive = drive.child(
             col()
                 .w_full()
@@ -1829,16 +1944,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(space_section),
         );
     }
-    let other_mounts: Vec<_> = state
-        .mounts
-        .iter()
-        .filter(|mount| {
-            !current_spaces
-                || !same_instance(&mount.instance, &state.instance.text)
-                || !state.spaces.iter().any(|(id, _)| id == &mount.space_id)
-        })
-        .collect();
-    if state.mount_checked && !other_mounts.is_empty() {
+    if !other_mounts.is_empty() {
         let mut section = col()
             .w_full()
             .padding(20.0)
@@ -1916,18 +2022,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     let selected_space = state
         .selected
         .as_ref()
-        .and_then(|id| state.spaces.iter().find(|(space_id, _)| space_id == id));
-    let selected_has_mount = state.selected.as_ref().is_some_and(|id| {
-        state.mounts.iter().any(|mount| {
-            same_instance(&mount.instance, &state.instance.text) && &mount.space_id == id
-        })
-    });
-    if current_spaces && selected_space.is_some() && !selected_has_mount {
+        .and_then(|id| visible_spaces.iter().find(|(space_id, _)| space_id == id));
+    if let Some((id, selected_name)) = selected_space
+        && mounts_by_space.get(id.as_str()).copied().flatten().is_none()
+    {
+        let space_origin = space_origin(state);
         let picker_origin = space_origin.clone();
         let default_origin = space_origin.clone();
-        let selected_name = selected_space
-            .map(|(_, name)| name.clone())
-            .unwrap_or_default();
         drive = drive.child(col().w_full().padding(20.0).gap(10.0).radius(8.0).fill(t.card).border(1.0, t.separator)
             .child(text(format!("Mount {selected_name}")).font(tok::TextStyle::new(16.0, 600.0)).w_full().wrap_anywhere().color(t.text))
             .child(text("Your files will appear here:").font(type_::BODY).color(t.text_secondary))
@@ -1965,22 +2066,29 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             drive = drive.child(col().w_full().padding(20.0).gap(10.0).radius(8.0).fill(t.card).border(1.0, t.separator)
                 .child(text("Recover a stale mount").font(tok::TextStyle::new(16.0, 600.0)).color(t.text))
                 .child(text("After restarting the service, enter the original mount directory. Cirrus checks the recorded identity before recovery.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-                .child(input(&state.recovery_mountpoint, "recover-path", "Original absolute mount directory", |s| &mut s.recovery_mountpoint).max_w(480.0))
+                .child(paint.input(can_work, &state.recovery_mountpoint, "recover-path", "Original absolute mount directory", |s| &mut s.recovery_mountpoint).max_w(480.0))
                 .child(row().child(button(paint, "Recover stale mount", "recover".into(), can_work && !state.recovery_mountpoint.text.is_empty(), |s| s.start(Action::Recover { path: s.recovery_mountpoint.text.clone() })) )));
         }
     }
+    drive
+}
+
+fn activity_view(state: &State, paint: Paint, can_work: bool) -> El {
+    let t = paint.theme;
+    let current_spaces = state.spaces_instance.as_deref() == Some(state.instance.text.as_str());
+    let space_origin = space_origin(state);
     let sync_instance = state.instance.text.clone();
     let sync_target = state.sync_target().map(str::to_owned);
     let journal_instance = state.instance.text.clone();
     let journal_space = state.journal_space.clone();
     let journal_before = state.journal_next;
-    let activity = col()
+    col()
         .w_full()
         .gap(12.0)
         .child(text("Activity & sync").font(tok::TextStyle::new(22.0, 600.0)).color(t.text))
         .child(text("Mounted Spaces activate daemon-owned automatic sync. Activation survives restart without remounting. Local saves are not remote confirmation; conflicts and ambiguous requests need attention.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
         .child(text("Space ID override (optional)").font(type_::LABEL).color(t.text))
-        .child(input(&state.sync_space_id,"automatic-space-id","Space ID for local status (or use the selected Space)",|s| &mut s.sync_space_id).max_w(480.0))
+        .child(paint.input(can_work, &state.sync_space_id,"automatic-space-id","Space ID for local status (or use the selected Space)",|s| &mut s.sync_space_id).max_w(480.0))
         .child(text(state.sync_target().map_or_else(|| "Select a Space on Drive, or enter its exact ID above.".to_owned(), |space| format!("Status target: Space {space}. The override affects only this status check, not sync or local staging."))).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(row().child(button(paint,"Automatic sync status","automatic-sync-status".into(),can_work && state.sync_target().is_some(),move |s| {
             if s.busy() || s.instance.text != sync_instance || s.sync_target() != sync_target.as_deref() { return; }
@@ -2007,19 +2115,21 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             format!("Last local observation · Space {}\n{phase}\n{activation}. {worker}.\n{} pending · {} uploading · {} verifying · {} uncertain · {} conflicts · {} local state issues\nRetry attempt {} · {} · reason: {}\nLast historically verified mutation: {}. This does not confirm current remote bytes or connection. Refresh after new work or a service restart.",status.space,status.queued,status.uploading,status.verifying,status.uncertain,status.conflicts,status.damaged,status.retry_attempt,next,status.cause.as_deref().unwrap_or("none reported"),last)
         } else { "No observation available for this status target. Use Automatic sync status to check; a failed check does not confirm connection or upload.".into() }).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(text("Review pending changes, conflicts and errors in the journal. Sync now checks all Spaces; Sync selected Space checks only the selected Space.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-        .child(text(account_context.clone()).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
-        .child(text(selected_context.clone()).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(text(account_context(state)).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(text(selected_context(state, current_spaces)).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(text("Server races can overwrite or delete remote changes. Inspect the journal and retained copies before acknowledging conflicts.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
         .child(text("Local staging").font(type_::TITLE).color(t.text))
         .child(text("Destination Space path").font(type_::LABEL).color(t.text))
-        .child(input(
+        .child(paint.input(
+            can_work,
             &state.stage_path,
             "stage-path",
             "Destination Space path",
             |s| &mut s.stage_path,
         ))
         .child(text("Local source file").font(type_::LABEL).color(t.text))
-        .child(input(
+        .child(paint.input(
+            can_work,
             &state.stage_source,
             "stage-source",
             "Absolute local source file",
@@ -2111,7 +2221,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     s.start(Action::Journal(journal_instance.clone(), journal_space.clone(), Some(before)));
                 }
             })))
-        .child(input(
+        .child(paint.input(
+            can_work,
             &state.acknowledge_file,
             "acknowledge-file",
             "Journal filename or operation token after inspection",
@@ -2127,16 +2238,23 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     staged: s.acknowledge_file.text.clone(),
                 })
             },
-        ));
-    let offline = col()
+        ))
+}
+
+fn offline_view(state: &State, paint: Paint, can_work: bool) -> El {
+    let t = paint.theme;
+    let current_spaces = state.spaces_instance.as_deref() == Some(state.instance.text.as_str());
+    let space_origin = space_origin(state);
+    col()
         .w_full()
         .gap(12.0)
         .child(text("Offline pins").font(tok::TextStyle::new(22.0, 600.0)).color(t.text))
         .child(text("Keep selected paths available offline. Pins are not a backup and retained copies may be stale.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-        .child(text(account_context.clone()).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
-        .child(text(selected_context).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(text(account_context(state)).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(text(selected_context(state, current_spaces)).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(text("Space path").font(type_::TITLE).color(t.text))
-        .child(input(
+        .child(paint.input(
+            can_work,
             &state.pin_path,
             "pin-path",
             "Space path, or / for the root",
@@ -2206,7 +2324,14 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 format!("Last checked: {} payload bytes of {limit} · {} of {} ranges. Excludes pins, unsynced edits and SQLite overhead; refresh for current usage.", status.bytes, status.ranges, status.range_limit)
             },
             None => "Cache usage has not been checked.".to_owned(),
-        }).font(type_::BODY).w_full().wrap().color(t.text_secondary));
+        }).font(type_::BODY).w_full().wrap().color(t.text_secondary))
+}
+
+fn recovery_view(state: &State, paint: Paint, can_work: bool) -> El {
+    let t = paint.theme;
+    let current_recovery = state.recovery_instance.as_deref() == Some(state.instance.text.as_str());
+    let (recovery_rows, selected_recovery) =
+        recovery_listing(state, paint, can_work, current_recovery);
     let more_rows = Arc::clone(&state.recovery_rows);
     let more_instance = state.instance.text.clone();
     let export_rows = Arc::clone(&state.recovery_rows);
@@ -2217,7 +2342,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .gap(12.0)
         .child(text("Recover a local copy").font(tok::TextStyle::new(22.0, 600.0)).color(t.text))
         .child(text("No server or keyring needed. Pins may be stale; staged copies have no recorded original hash. Export never overwrites.").font(type_::BODY).w_full().wrap().color(t.text_secondary))
-        .child(text(account_context).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
+        .child(text(account_context(state)).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
         .child(row().gap(8.0)
             .child(button(paint, "Retained pins", "recovery-pins".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryRoots { instance: s.instance.text.clone(), offset: 0 })))
             .child(button(paint, "Staged copies", "recovery-staged".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryStaged { instance: s.instance.text.clone(), offset: 0 })))
@@ -2237,7 +2362,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(row().child(button(paint, "Displaced pin captures", "recovery-pin-copies".into(), can_work && !state.instance.text.is_empty(), |s| s.start(Action::RecoveryCopies { instance: s.instance.text.clone(), offset: 0 }))))
         .child(recovery_rows)
         .child(text(selected_recovery).font(type_::BODY).w_full().wrap_anywhere().color(t.text_secondary))
-        .child(input(&state.recovery_destination, "recovery-destination", "New absolute local destination", |s| &mut s.recovery_destination))
+        .child(paint.input(can_work, &state.recovery_destination, "recovery-destination", "New absolute local destination", |s| &mut s.recovery_destination))
         .child(button(paint, "Export selected copy", "recovery-export".into(), can_work && current_recovery && state.recovery_selection.is_some() && !state.recovery_destination.text.is_empty(), move |s| {
             if s.busy() || s.instance.text != export_instance
                 || s.recovery_instance.as_deref() != Some(export_instance.as_str())
@@ -2269,11 +2394,18 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .child(button(paint,"Cancel capture removal","cancel-pin-copy-removal".into(),can_work&&confirmed,|s|s.pin_copy_remove=None));
     }
 
+    recovery
+}
+
+fn view(state: &State, cx: &mut Cx<State>) -> El {
+    let t = tok::theme(cx.system_dark());
+    let paint = Paint::new(t, state.accent);
+    let can_work = !state.busy();
     let page = match state.page {
-        Page::Drive => drive,
-        Page::Offline => offline,
-        Page::Activity => activity,
-        Page::Recovery => recovery,
+        Page::Drive => drive_view(state, paint, can_work),
+        Page::Offline => offline_view(state, paint, can_work),
+        Page::Activity => activity_view(state, paint, can_work),
+        Page::Recovery => recovery_view(state, paint, can_work),
     };
     let mount_status = if state.service_unavailable {
         "Background service unavailable".to_owned()
@@ -2333,6 +2465,27 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 |s| s.start(Action::Status),
             )),
     );
+    if let Some(release) = state.release_status.as_ref().filter(|_| state.service_running) {
+        let ui = std::env::var("CIRRUS_RUNNING_RELEASE").ok();
+        let worker = release.worker.as_ref().map_or_else(
+            || "automatic transfers paused".to_owned(),
+            |worker| format!("policy {} · generation {}", worker.release, worker.generation),
+        );
+        let mut detail = format!(
+            "UI {} · resident {} · {worker}",
+            ui.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+            release.resident_version,
+        );
+        if release.resident_update_pending {
+            detail.push_str(" · resident update requires maintenance");
+        }
+        if let Some(ui) = &ui
+            && release.selected_release.as_ref().is_some_and(|selected| ui != selected)
+        {
+            detail.push_str(" · reopen UI for selected release");
+        }
+        status = status.child(text(detail).font(type_::BODY).wrap_anywhere().color(t.text_secondary));
+    }
     if state.sign_in.is_some() {
         status = status.child(row().child(button(
             paint,

@@ -2,7 +2,9 @@
 
 mod application;
 mod local;
+mod release;
 mod scheduler;
+mod worker_wire;
 
 use std::io;
 
@@ -16,7 +18,7 @@ pub use cirrus_account::{
 use cirrus_runtime::RuntimeDir;
 
 pub use cirrus_api::{
-    DirectoryEntry, MountInfo, MountState, RetainedPage, RetainedPin, RetainedPinCopy,
+    DirectoryEntry, MountInfo, MountState, ReleaseStatus, RetainedPage, RetainedPin, RetainedPinCopy,
     RetainedPinCopyEntry, RetainedPinFile, RetainedStaged,
 };
 
@@ -48,7 +50,7 @@ impl Daemon {
     ///
     /// Returns an error if exclusive ownership, socket permissions or serving fails.
     pub fn run(&self, runtime: &RuntimeDir) -> io::Result<()> {
-        local::serve(runtime, true)
+        local::serve(runtime, true, None)
     }
 
     /// Runs diagnostics without automatic transfers or startup account access.
@@ -57,7 +59,35 @@ impl Daemon {
     /// # Errors
     /// Returns an error if the private local service cannot be safely established.
     pub fn run_without_automatic_sync(&self, runtime: &RuntimeDir) -> io::Result<()> {
-        local::serve(runtime, false)
+        local::serve(runtime, false, None)
+    }
+
+    /// Runs the resident with an installed Linux user-release root.
+    #[doc(hidden)]
+    pub fn run_managed(
+        &self, runtime: &RuntimeDir, root: &std::path::Path, automatic: bool,
+    ) -> io::Result<()> {
+        local::serve(runtime, automatic, Some(root))
+    }
+
+    /// Prepares the default State store without starting the resident or opening credentials.
+    ///
+    /// The caller must stop and unmount all older writers first. The runtime
+    /// guard only proves that there is no resident in the supplied runtime.
+    pub fn prepare_state_after_stopping_writers(runtime: &RuntimeDir) -> io::Result<()> {
+        let _runtime = local::acquire_runtime_guard(runtime)?;
+        cirrus_account::StorageRoot::prepare_default_state(runtime).map_err(io::Error::other)
+    }
+
+    /// Runs an authenticated CLI or UI from the selected user-release set.
+    #[doc(hidden)]
+    pub fn launch_client(
+        root: &std::path::Path,
+        role: &str,
+        bootstrap: &std::path::Path,
+        args: &[std::ffi::OsString],
+    ) -> io::Result<()> {
+        release::launch_client(root, role, bootstrap, args)
     }
 
     /// Queries a running daemon; never starts one.
@@ -69,6 +99,11 @@ impl Daemon {
         cirrus_client::status(runtime)
             .map(|status| status.description())
             .map_err(Into::into)
+    }
+
+    /// Observes this resident's Linux release and worker identities.
+    pub fn release_status(&self, runtime: &RuntimeDir) -> io::Result<ReleaseStatus> {
+        cirrus_client::release(runtime, cirrus_api::ReleaseRequest::Status).map_err(Into::into)
     }
 
     /// Requests a running daemon to stop and clean up its socket.

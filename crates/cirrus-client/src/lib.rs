@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use cirrus_api::AccountResponse;
 pub use cirrus_api::{
-    AccountReply, AccountRequest, MountMode, ReservationStore, RetainedPage, SpacePath,
+    AccountReply, AccountRequest, CredentialPolicy, CredentialPolicyRequest, MountEngineReport,
+    MountMode, ReleaseRequest, ReleaseStatus, ReservationStore, RetainedPage, SpacePath,
     StorageLimits,
 };
 pub use cirrus_discovery::Configuration;
@@ -24,6 +25,9 @@ pub enum Operation {
     CheckRuntime,
     Status,
     Stop,
+    Release(ReleaseRequest),
+    CredentialPolicy(CredentialPolicyRequest),
+    MountEngines,
     Discover {
         instance: String,
         ca: Option<PathBuf>,
@@ -40,6 +44,9 @@ pub enum Reply {
     RuntimeChecked,
     Status(ServiceStatus),
     Stopping,
+    Release(ReleaseStatus),
+    CredentialPolicy(CredentialPolicy),
+    MountEngines(MountEngineReport),
     Discovery(Configuration),
     Account(AccountReply),
 }
@@ -180,6 +187,12 @@ pub fn execute(operation: Operation) -> Result<Reply, ClientError> {
             .map_err(not_submitted),
         Operation::Status => status(&runtime().map_err(not_submitted)?).map(Reply::Status),
         Operation::Stop => stop(&runtime().map_err(not_submitted)?).map(|()| Reply::Stopping),
+        Operation::Release(request) => release(&runtime().map_err(not_submitted)?, request).map(Reply::Release),
+        Operation::CredentialPolicy(request) => {
+            credential_policy(&runtime().map_err(not_submitted)?, request)
+                .map(Reply::CredentialPolicy)
+        }
+        Operation::MountEngines => mount_engines(&runtime().map_err(not_submitted)?).map(Reply::MountEngines),
         Operation::Account(request) => {
             account(&runtime().map_err(not_submitted)?, request).map(Reply::Account)
         }
@@ -265,6 +278,79 @@ pub fn account(runtime: &RuntimeDir, request: AccountRequest) -> Result<AccountR
         (None, Some(error)) => Err(ClientError::Rejected(error)),
         _ => Err(invalid_reply()),
     }
+}
+
+/// Queries or changes the managed release through the resident's negotiated endpoint.
+pub fn release(runtime: &RuntimeDir, request: ReleaseRequest) -> Result<ReleaseStatus, ClientError> {
+    if matches!(request, ReleaseRequest::MountEngines) {
+        return Err(ClientError::NotSubmitted(io::Error::other("use mount_engines for the mounted-engine report")));
+    }
+    if matches!(request, ReleaseRequest::CredentialPolicy(_)) {
+        return Err(ClientError::NotSubmitted(io::Error::other(
+            "use credential_policy for the credential policy report",
+        )));
+    }
+    let timeout = if matches!(request, ReleaseRequest::Status) {
+        wire::TIMEOUT
+    } else {
+        Duration::from_secs(120)
+    };
+    serde_json::from_slice::<Result<ReleaseStatus, String>>(&release_exchange(runtime, request, timeout)?)
+        .map_err(|error| ClientError::ReplyLost(error.into()))?
+        .map_err(ClientError::Rejected)
+}
+
+/// Queries or changes the resident's Linux automatic writer policy.
+pub fn credential_policy(
+    runtime: &RuntimeDir,
+    request: CredentialPolicyRequest,
+) -> Result<CredentialPolicy, ClientError> {
+    let timeout = if matches!(request, CredentialPolicyRequest::Status) {
+        wire::TIMEOUT
+    } else {
+        Duration::from_secs(10)
+    };
+    let json = release_exchange(runtime, ReleaseRequest::CredentialPolicy(request), timeout)?;
+    serde_json::from_slice::<Result<CredentialPolicy, String>>(&json)
+        .map_err(|error| ClientError::ReplyLost(error.into()))?
+        .map_err(ClientError::Rejected)
+}
+
+/// Queries the actual read program serving the resident's existing mounts.
+pub fn mount_engines(runtime: &RuntimeDir) -> Result<MountEngineReport, ClientError> {
+    let json = release_exchange(runtime, ReleaseRequest::MountEngines, wire::TIMEOUT)?;
+    serde_json::from_slice::<Result<MountEngineReport, String>>(&json)
+        .map_err(|error| ClientError::ReplyLost(error.into()))?
+        .map_err(ClientError::Rejected)
+}
+
+fn release_exchange(
+    runtime: &RuntimeDir,
+    request: ReleaseRequest,
+    timeout: Duration,
+) -> Result<Vec<u8>, ClientError> {
+    let mut bytes = wire::RELEASE_PREFIX.to_vec();
+    serde_json::to_writer(&mut bytes, &request)
+        .map_err(|error| ClientError::NotSubmitted(error.into()))?;
+    bytes.push(b'\n');
+    if bytes.len() > wire::MAX_LINE {
+        return Err(ClientError::NotSubmitted(io::Error::other("release request exceeds limit")));
+    }
+    let reply = exchange(runtime, &bytes, timeout)?;
+    if reply == wire::ERROR_RESPONSE {
+        let message = if matches!(request, ReleaseRequest::CredentialPolicy(_)) {
+            "running service does not support live credential policy; maintenance is required"
+        } else {
+            "running service has no live-release protocol; first transition requires maintenance"
+        };
+        return Err(ClientError::Rejected(message.into()));
+    }
+    if !reply.starts_with(wire::RELEASE_PREFIX) {
+        return Err(invalid_reply());
+    }
+    let mut reply = reply;
+    reply.drain(..wire::RELEASE_PREFIX.len());
+    Ok(reply)
 }
 
 fn exchange(

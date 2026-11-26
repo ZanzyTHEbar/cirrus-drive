@@ -80,7 +80,41 @@ pub(crate) struct Pin {
     pub metadata_matches: bool,
 }
 
+enum StateOpen {
+    Routine,
+    #[cfg(target_os = "linux")]
+    Maintenance,
+}
+
 pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError> {
+    open_state_in(root, StateOpen::Routine)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_state_in(
+    maintenance: &crate::account_storage::StateMaintenance,
+) -> Result<(), AccountError> {
+    open_state_in(maintenance.root(), StateOpen::Maintenance)?
+        .close()
+        .map_err(|_| AccountError::new("cannot close prepared State; inspect before retrying"))
+}
+
+#[cfg(target_os = "linux")]
+fn maintenance_required() -> AccountError {
+    AccountError::new(
+        "offline State requires maintenance; stop and unmount all writers, then run cirrus-drive-service --prepare-state --legacy-writers-stopped",
+    )
+}
+
+fn state_header(conn: &Connection) -> Result<(i64, i64), AccountError> {
+    let read = |name| {
+        conn.pragma_query_value(None, name, |row| row.get(0))
+            .map_err(|_| AccountError::new("cannot inspect offline state"))
+    };
+    Ok((read("application_id")?, read("user_version")?))
+}
+
+fn open_state_in(root: &StorageRoot, _purpose: StateOpen) -> Result<Connection, AccountError> {
     let opening = Database::State
         .open(root, OpenMode::CreateOrOpen)?
         .ok_or_else(|| Database::State.unavailable())?;
@@ -90,11 +124,15 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
     // EXTRA also syncs the containing directory after deleting a rollback journal.
     conn.execute_batch("PRAGMA synchronous=EXTRA")
         .map_err(|_| AccountError::new("cannot configure offline state durability"))?;
-    let id: i64 = conn
-        .pragma_query_value(None, "application_id", |row| row.get(0))
-        .map_err(|_| AccountError::new("cannot inspect offline state"))?;
     if opening.created() {
-        conn.execute_batch("BEGIN IMMEDIATE; PRAGMA application_id=1128550961; PRAGMA user_version=17;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|_| AccountError::new("cannot initialize offline state"))?;
+        if state_header(&tx)? != (0, 0) {
+            return Err(AccountError::new("new offline state changed"));
+        }
+        tx.execute_batch(
+            "
             CREATE TABLE account_identities(instance TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL);
             CREATE TABLE snapshots(instance TEXT NOT NULL, space TEXT NOT NULL, path TEXT NOT NULL, entries TEXT NOT NULL, updated INTEGER NOT NULL, self_id TEXT, self_etag TEXT, local_operation INTEGER, issuer TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(instance,space,path), CHECK((self_id IS NOT NULL AND self_etag IS NOT NULL AND local_operation IS NULL) OR (self_id IS NULL AND self_etag IS NULL AND local_operation IS NOT NULL AND local_operation>0)));
             CREATE TABLE pins(instance TEXT NOT NULL, space TEXT NOT NULL, root TEXT NOT NULL, is_dir INTEGER NOT NULL, directories TEXT NOT NULL, manifest TEXT NOT NULL, PRIMARY KEY(instance,space,root));
@@ -119,66 +157,33 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
              CREATE TABLE dirty_roots (root TEXT PRIMARY KEY, digest TEXT NOT NULL, size INTEGER NOT NULL, base TEXT);
              CREATE TABLE dirty_bases (version TEXT NOT NULL, offset INTEGER NOT NULL, object TEXT NOT NULL, PRIMARY KEY(version,offset));
              CREATE TABLE dirty_preparations (version TEXT PRIMARY KEY, offset INTEGER NOT NULL);
-            CREATE INDEX space_pending ON operation_journal(instance,space,state,op_type,id); COMMIT;")
+             CREATE INDEX space_pending ON operation_journal(instance,space,state,op_type,id);")
+             .map_err(|_| AccountError::new("cannot initialize offline state"))?;
+        apply_state_ddl(&tx, 17)?;
+        tx.pragma_update(None, "application_id", APP_ID)
             .map_err(|_| AccountError::new("cannot initialize offline state"))?;
+        opening.check_named()?;
+        opening.check_sidecars_and_vfs()?;
+        tx.commit()
+            .map_err(|_| AccountError::new("cannot persist offline state initialization"))?;
         fs::fsync(root.directory())
             .map_err(|_| AccountError::new("cannot persist offline state"))?;
-    } else if id != APP_ID {
-        return Err(AccountError::new("unrecognized offline state"));
-    }
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|_| AccountError::new("cannot inspect offline state"))?;
-    if matches!(version, 17..=19) {
-        let reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
-            root,
-            crate::storage::sql_reservation::Store::State,
-            Some(conn),
-            0,
-            64 * 1024,
-            false,
-        )?;
-        if let Some(reservation) = &reservation {
-            reservation.bound_pages(conn)?;
+    } else {
+        let (id, version) = state_header(conn)?;
+        if id != APP_ID {
+            return Err(AccountError::new("unrecognized offline state"));
         }
-        // Exact additive migration, shared by fresh product DDL and retained
-        // developer databases. No row reset or unsupported-version adoption.
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
-        // Recheck under the writer lock: another process may have upgraded while
-        // this admitted opener waited. Never run CREATE twice or reset its data.
-        let locked_version: i64 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|_| AccountError::new("cannot inspect offline state"))?;
-        if locked_version == 17 {
-            conn.execute_batch(crate::provider_catalog::DDL)
-                .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
-            conn.execute_batch("PRAGMA user_version=18")
-                .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
-        } else if !matches!(locked_version, 18..=20) {
-            return Err(AccountError::new("unsupported offline state version"));
+        if version != STATE_SCHEMA_VERSION {
+            if !matches!(version, 17..=19) {
+                return Err(AccountError::new("unsupported offline state version"));
+            }
+            #[cfg(target_os = "linux")]
+            if matches!(_purpose, StateOpen::Routine) {
+                return Err(maintenance_required());
+            }
+            // macOS still uses its existing, in-place native upgrade path.
+            upgrade_state_in(root, &opening)?;
         }
-        if matches!(locked_version, 17 | 18) {
-            conn.execute_batch(crate::provider_mutation::DDL)
-                .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
-            conn.execute_batch("PRAGMA user_version=19")
-                .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
-        }
-        if locked_version < 20 {
-            conn.execute_batch(
-                "ALTER TABLE snapshots ADD COLUMN browse_epoch TEXT;
-                ALTER TABLE snapshots ADD COLUMN browse_at INTEGER;
-                PRAGMA user_version=20;",
-            )
-            .map_err(|_| AccountError::new("cannot upgrade directory browse metadata"))?;
-        }
-        if let Some(reservation) = &reservation {
-            reservation.validate(conn)?;
-        }
-        conn.execute_batch("COMMIT")
-            .map_err(|_| AccountError::new("cannot persist offline state upgrade"))?;
-    } else if version != STATE_SCHEMA_VERSION {
-        return Err(AccountError::new("unsupported offline state version"));
     }
     opening.check_named()?;
     opening.check_sidecars_and_vfs()?;
@@ -191,6 +196,110 @@ pub(crate) fn database_in(root: &StorageRoot) -> Result<Connection, AccountError
         }
     }
     Ok(opening.into_connection())
+}
+
+fn upgrade_state_in(
+    root: &StorageRoot,
+    opening: &crate::sqlite_open::Opening<'_>,
+) -> Result<(), AccountError> {
+    let conn = opening.connection();
+    let reservation = crate::storage::sql_reservation::SqlReservation::begin_in(
+        root,
+        crate::storage::sql_reservation::Store::State,
+        Some(conn),
+        0,
+        64 * 1024,
+        false,
+    )?;
+    if let Some(reservation) = &reservation {
+        reservation.bound_pages(conn)?;
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
+    // Recheck both fields under the SQLite writer lock. Never reapply DDL
+    // or adopt an unrecognized database if another writer got there first.
+    let (id, version) = state_header(&tx)?;
+    if id != APP_ID {
+        return Err(AccountError::new("unrecognized offline state"));
+    }
+    apply_state_ddl(&tx, version)?;
+    if let Some(reservation) = &reservation {
+        reservation.validate(&tx)?;
+    }
+    opening.check_named()?;
+    opening.check_sidecars_and_vfs()?;
+    tx.commit()
+        .map_err(|_| AccountError::new("cannot persist offline state upgrade"))
+}
+
+// Shared by exact fresh initialization and the supported additive upgrades.
+// No journal, receipt, identity or staged object is recreated or copied.
+fn apply_state_ddl(conn: &Connection, version: i64) -> Result<(), AccountError> {
+    if version == STATE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if !matches!(version, 17..=19) {
+        return Err(AccountError::new("unsupported offline state version"));
+    }
+    if version == 17 {
+        conn.execute_batch(crate::provider_catalog::DDL)
+            .map_err(|_| AccountError::new("cannot upgrade offline state"))?;
+    }
+    if version <= 18 {
+        conn.execute_batch(crate::provider_mutation::DDL)
+            .map_err(|_| AccountError::new("cannot upgrade provider mutation state"))?;
+    }
+    conn.execute_batch(
+        "ALTER TABLE snapshots ADD COLUMN browse_epoch TEXT;
+         ALTER TABLE snapshots ADD COLUMN browse_at INTEGER;",
+    )
+    .map_err(|_| AccountError::new("cannot upgrade directory browse metadata"))?;
+    conn.pragma_update(None, "user_version", STATE_SCHEMA_VERSION)
+        .map_err(|_| AccountError::new("cannot record offline state version"))
+}
+
+/// Observes an existing State database without creating, repairing or migrating it.
+pub(crate) fn inspect_state_in(root: &StorageRoot) -> Result<Option<Connection>, AccountError> {
+    Ok(inspect_state_with_version_in(root)?.map(|(conn, _)| conn))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn check_managed_state_in(root: &StorageRoot) -> Result<(), AccountError> {
+    if inspect_state_with_version_in(root)?
+        .is_some_and(|(_, version)| version != STATE_SCHEMA_VERSION)
+    {
+        return Err(maintenance_required());
+    }
+    Ok(())
+}
+
+fn inspect_state_with_version_in(
+    root: &StorageRoot,
+) -> Result<Option<(Connection, i64)>, AccountError> {
+    let Some(opening) = Database::State.open(root, OpenMode::Inspect)? else {
+        return Ok(None);
+    };
+    let conn = opening.connection();
+    let unavailable = || Database::State.unavailable();
+    conn.busy_timeout(Duration::from_secs(1))
+        .map_err(|_| unavailable())?;
+    let id: i64 = conn
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|_| unavailable())?;
+    if id != APP_ID {
+        return Err(AccountError::new("unrecognized offline state"));
+    }
+    let schema: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| unavailable())?;
+    // These versions share the journal, retained identity and storage-count
+    // tables used by the readers below. Qualify future versions explicitly.
+    if !matches!(schema, 17..=20) {
+        return Err(AccountError::new("unsupported offline state version"));
+    }
+    opening.check_named()?;
+    opening.check_sidecars_and_vfs()?;
+    Ok(Some((opening.into_connection(), schema)))
 }
 
 /// Bind offline state to the first verified identity for an instance.
@@ -7983,35 +8092,119 @@ pub(crate) fn staged_version(
     path: &[String],
     resource: &str,
 ) -> Result<Option<(FileVersion, String)>, AccountError> {
-    let Some(id) = resource
-        .strip_prefix("cirrus-staged:")
-        .and_then(|value| value.parse::<i64>().ok())
-    else {
+    Ok(staged_snapshot(storage, instance, space, path, resource)?
+        .map(|(version, snapshot)| (version, snapshot.name)))
+}
+
+pub(crate) fn staged_snapshot(
+    storage: &StorageRoot,
+    instance: &str,
+    space: &str,
+    path: &[String],
+    resource: &str,
+) -> Result<Option<(FileVersion, StagedSnapshot)>, AccountError> {
+    let Some(id) = staged_operation_id(resource) else {
         return Ok(None);
     };
-    let conn = database_in(storage)?;
+    let mut conn = database_in(storage)?;
+    let tx = conn
+        .transaction()
+        .map_err(|_| AccountError::new("cannot inspect staged snapshot"))?;
+    let Some((name, _)) = staged_head_in(&tx, instance, space, path, id)? else {
+        return Ok(None);
+    };
+    let root = overlay::Overlay::load_in_root(storage, &tx, &name)?;
+    let version = staged_file_version(instance, space, path, resource, &name, root.len());
+    tx.commit()
+        .map_err(|_| AccountError::new("cannot close staged snapshot"))?;
+    Ok(Some((version, StagedSnapshot { name, root })))
+}
+
+fn staged_operation_id(resource: &str) -> Option<i64> {
+    resource.strip_prefix("cirrus-staged:")?.parse().ok()
+}
+
+fn staged_head_in(
+    conn: &Connection,
+    instance: &str,
+    space: &str,
+    path: &[String],
+    id: i64,
+) -> Result<Option<(String, String)>, AccountError> {
     // Ordinary handles must identify the current live write, not merely an
     // unchanged historical row. Only explicitly detached retained rows bypass
     // head selection (unlink and replacement-rename keep their open handles).
-    let file: Option<String> = conn.query_row("SELECT staged_file FROM operation_journal AS j WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND (id=(SELECT max(id) FROM operation_journal WHERE instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state!='resolved') OR (state='resolved' AND error_msg IN ('unlinked open file; staged copies retained','superseded by local rename; staged copy retained')))",
-        params![id,instance,space,path_key(path)?], |row| row.get(0)).optional().map_err(|_| AccountError::new("cannot load staged version"))?;
-    let Some(file) = file else {
-        return Ok(None);
-    };
-    publication::ensure_clear(&conn, instance, space)?;
-    let size = overlay::Overlay::load_in_root(storage, &conn, &file)?.len();
-    Ok(Some((
-        FileVersion {
-            instance: instance.to_owned(),
-            space: space.to_owned(),
-            path: path.to_vec(),
-            id: resource.to_owned(),
-            etag: format!("\"cirrus-staged-{file}\""),
-            size,
-            checksums: Vec::new(),
-        },
-        file,
-    )))
+    let head: Option<(String, String)> = conn.query_row("SELECT staged_file,state FROM operation_journal WHERE id=?1 AND instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND (id=(SELECT max(id) FROM operation_journal WHERE instance=?2 AND space=?3 AND path=?4 AND op_type='write' AND state!='resolved') OR (state='resolved' AND error_msg IN (?5,'superseded by local rename; staged copy retained')))",
+        params![id,instance,space,path_key(path)?,DETACHED_MESSAGE], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|_| AccountError::new("cannot load staged version"))?;
+    if head.is_some() {
+        publication::ensure_clear(conn, instance, space)?;
+    }
+    Ok(head)
+}
+
+fn staged_file_version(
+    instance: &str,
+    space: &str,
+    path: &[String],
+    resource: &str,
+    name: &str,
+    size: u64,
+) -> FileVersion {
+    FileVersion {
+        instance: instance.to_owned(),
+        space: space.to_owned(),
+        path: path.to_vec(),
+        id: resource.to_owned(),
+        etag: format!("\"cirrus-staged-{name}\""),
+        size,
+        checksums: Vec::new(),
+    }
+}
+
+// A final publication fence, not a substitute for verifying the read snapshot.
+pub(crate) fn staged_read_head(
+    binding: &crate::MountBinding,
+    version: &FileVersion,
+) -> Result<bool, AccountError> {
+    let unavailable = || AccountError::new("staged read head changed");
+    let id = staged_operation_id(&version.id).ok_or_else(unavailable)?;
+    let mut conn = inspect_state_in(&binding.root)?.ok_or_else(unavailable)?;
+    let tx = conn.transaction().map_err(|_| unavailable())?;
+    if binding.offline {
+        if retained_space_identity_in(&tx, &binding.instance, &binding.space)?
+            .is_none_or(|(issuer, subject)| issuer != binding.issuer || subject != binding.subject)
+        {
+            return Err(unavailable());
+        }
+    } else {
+        verify_identity(&tx, &binding.instance, &binding.issuer, &binding.subject)?;
+    }
+    let (name, state) =
+        staged_head_in(&tx, &version.instance, &version.space, &version.path, id)?
+            .ok_or_else(unavailable)?;
+    if binding.offline && state == "synced" {
+        return Err(unavailable());
+    }
+    let size = tx
+        .query_row(
+            "SELECT size FROM dirty_roots WHERE root=?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|_| unavailable())?;
+    let current = staged_file_version(
+        &version.instance,
+        &version.space,
+        &version.path,
+        &version.id,
+        &name,
+        size,
+    );
+    if current != *version {
+        return Err(unavailable());
+    }
+    tx.commit().map_err(|_| unavailable())?;
+    Ok(state == "resolved")
 }
 
 pub(crate) fn has_unresolved(
@@ -8036,7 +8229,19 @@ pub(crate) fn journal_in(
 ) -> Result<JournalPage, AccountError> {
     const MAX_ENTRIES: usize = 50;
     const MAX_ENCODED_BYTES: usize = 128 * 1024;
-    let mut conn = database_in(root)?;
+    let Some(mut conn) = inspect_state_in(root)? else {
+        return Ok(JournalPage {
+            summary: JournalSummary {
+                pending: 0,
+                conflict: 0,
+                uncertain_or_in_progress: 0,
+                synced: 0,
+                resolved: 0,
+            },
+            entries: Vec::new(),
+            next_before: None,
+        });
+    };
     let tx = conn
         .transaction()
         .map_err(|_| AccountError::new("cannot inspect operation journal"))?;
@@ -9692,27 +9897,10 @@ pub(crate) fn cache_eviction_identity_in(
     space: &str,
 ) -> Result<(String, String, bool), AccountError> {
     // A clean-cache operation must not create or migrate State for its proof.
-    let opening = Database::State
-        .open(root, OpenMode::Inspect)?
-        .ok_or_else(|| {
-            AccountError::new("offline account identity is missing; local data retained")
-        })?;
-    let conn = opening.connection();
-    let unavailable = || Database::State.unavailable();
-    conn.busy_timeout(Duration::from_secs(1))
-        .map_err(|_| unavailable())?;
-    let id: i64 = conn
-        .pragma_query_value(None, "application_id", |row| row.get(0))
-        .map_err(|_| unavailable())?;
-    let schema: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|_| unavailable())?;
-    if id != APP_ID || !matches!(schema, 17..=STATE_SCHEMA_VERSION) {
-        return Err(unavailable());
-    }
-    opening.check_named()?;
-    opening.check_sidecars_and_vfs()?;
-    retained_account_for_space(&opening.into_connection(), instance, space)
+    let conn = inspect_state_in(root)?.ok_or_else(|| {
+        AccountError::new("offline account identity is missing; local data retained")
+    })?;
+    retained_account_for_space(&conn, instance, space)
 }
 
 fn retained_account_for_space(

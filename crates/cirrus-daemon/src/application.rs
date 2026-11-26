@@ -1,22 +1,29 @@
 //! User-scoped application operations, foreground admission and shutdown.
 
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cirrus_account::{Accounts, PortalBrowser, SignIn};
-use cirrus_fuse::Mounted;
+use cirrus_fuse::{MountTable, Mounted};
 use cirrus_runtime::RuntimeDir;
 
+use crate::release::Policy;
 use crate::scheduler::Scheduler;
 use crate::{DirectoryEntry, MountInfo, MountState};
-use cirrus_api::{AccountReply, AccountRequest, MountMode, MountedSpace, SpaceInfo, SpacePath};
+use cirrus_api::{
+    AccountReply, AccountRequest, CredentialPolicy, CredentialPolicyRequest, MountEngine,
+    MountEngineReport, MountMode, MountedSpace, ReleaseRequest, ReleaseStatus, SpaceInfo,
+    SpacePath,
+};
 
 type ActiveSignIn = Arc<Mutex<Option<(String, Arc<SignIn>)>>>;
 
 struct ActivityPermit(Arc<AtomicUsize>);
+struct ExclusivePermit(Arc<AtomicBool>);
 
 impl Drop for ActivityPermit {
     fn drop(&mut self) {
@@ -24,31 +31,33 @@ impl Drop for ActivityPermit {
     }
 }
 
-pub(crate) enum MountRegistry {
-    Available(Vec<Mounted>),
-    Reserved,
+impl Drop for ExclusivePermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) struct MountRegistry {
+    // None while the actual owners are held by a mount operation.
+    mounts: Option<Vec<Mounted>>,
+    generation: u64,
 }
 
 impl MountRegistry {
     pub(crate) fn ready(&self) -> Result<&[Mounted], String> {
-        match self {
-            Self::Available(mounts) => Ok(mounts),
-            Self::Reserved => Err("mount operation is in progress".to_owned()),
-        }
+        self.mounts
+            .as_deref()
+            .ok_or_else(|| "mount operation is in progress".to_owned())
     }
 
     fn ready_mut(&mut self) -> Result<&mut Vec<Mounted>, String> {
-        match self {
-            Self::Available(mounts) => Ok(mounts),
-            Self::Reserved => Err("mount operation is in progress".to_owned()),
-        }
+        self.mounts
+            .as_mut()
+            .ok_or_else(|| "mount operation is in progress".to_owned())
     }
 
     fn has_mounts(&self) -> bool {
-        match self {
-            Self::Available(mounts) => !mounts.is_empty(),
-            Self::Reserved => true,
-        }
+        self.mounts.as_ref().is_none_or(|mounts| !mounts.is_empty())
     }
 }
 
@@ -62,8 +71,11 @@ impl<'a> MountOperation<'a> {
         let mut state = registry
             .lock()
             .map_err(|_| "mount state is unavailable".to_owned())?;
-        let mounts = std::mem::take(state.ready_mut()?);
-        *state = MountRegistry::Reserved;
+        let mounts = state
+            .mounts
+            .take()
+            .ok_or_else(|| "mount operation is in progress".to_owned())?;
+        state.generation = state.generation.wrapping_add(1);
         Ok(Self { registry, mounts })
     }
 
@@ -83,7 +95,7 @@ impl Drop for MountOperation<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().expect("mount state lock poisoned");
         // Return the actual owners before foreground/reply admission is released.
-        *registry = MountRegistry::Available(std::mem::take(&mut self.mounts));
+        registry.mounts = Some(std::mem::take(&mut self.mounts));
     }
 }
 
@@ -110,63 +122,110 @@ fn check_mount_owners(runtime: &RuntimeDir, mounts: &[Mounted]) -> Result<(), St
     Ok(())
 }
 
-fn mount_statuses(runtime: &RuntimeDir, mounts: &[Mounted]) -> Result<Vec<MountInfo>, String> {
-    let owners = cirrus_fuse::recovery_owners(runtime).map_err(|error| error.to_string())?;
-    let mut paths = std::collections::HashSet::new();
-    let mut spaces = std::collections::HashSet::new();
-    let mut sources = std::collections::HashSet::new();
-    for owner in &owners {
-        if !paths.insert(&owner.path)
-            || !spaces.insert((&owner.instance, &owner.space_id))
-            || !sources.insert(&owner.source)
-        {
-            return Err("ambiguous mount owner records require inspection".to_owned());
-        }
-    }
-    for mount in mounts {
-        if (!mount.is_active().map_err(|e| e.to_string())?
-            && !mount.is_disconnected().map_err(|e| e.to_string())?)
-            || owners
-                .iter()
-                .filter(|owner| {
-                    owner.path == mount.path()
-                        && owner.source == mount.source()
-                        && owner.instance == mount.instance()
-                        && owner.space_id == mount.space_id()
-                        && owner.space_name == mount.space_name()
-                })
-                .count()
-                != 1
-        {
-            return Err("mountpoint identity changed or cannot be verified".to_owned());
-        }
-    }
-    let mut result = Vec::with_capacity(owners.len());
-    for owner in owners {
-        let active = mounts
-            .iter()
-            .find(|mount| mount.path() == owner.path && mount.source() == owner.source);
-        let active = match active {
-            Some(mount) if !mount.is_disconnected().map_err(|e| e.to_string())? => Some(mount),
-            _ => None,
+fn inspect_mounts<C, T>(
+    registry: &Mutex<MountRegistry>,
+    prepare: impl FnOnce() -> Result<C, String>,
+    report: impl FnOnce(C, &[Mounted], Option<&io::Result<MountTable>>) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let (generation, nonempty) = {
+        let state = registry.lock().map_err(|_| "mount registry unavailable")?;
+        let Ok(mounts) = state.ready() else {
+            return Ok(None);
         };
-        let offline_read_only =
-            active.map(|mount| mount.is_offline() && !mount.is_offline_writable());
-        let offline_writable = active.map(Mounted::is_offline_writable);
-        result.push(MountInfo {
-            instance: owner.instance,
-            space_id: owner.space_id,
-            space_name: owner.space_name,
-            path: owner.path.to_string_lossy().into_owned(),
-            state: if active.is_some() {
-                MountState::Mounted
-            } else {
-                MountState::RecoveryRequired
-            },
-            offline_read_only,
-            offline_writable,
-        });
+        (state.generation, !mounts.is_empty())
+    };
+    let context = prepare();
+    let table = (nonempty && context.is_ok()).then(MountTable::read);
+    let state = registry.lock().map_err(|_| "mount registry unavailable")?;
+    // Refuse a mixed inventory even if a lifecycle operation came and went
+    // during the scan. Borrow devices only now, for nonblocking liveness polls.
+    if state.generation != generation {
+        return Ok(None);
     }
+    report(context?, state.ready()?, table.as_ref()).map(Some)
+}
+
+// None is a disconnected old device; Some(false) is still live but no longer
+// uniquely at its recorded path and mount ID.
+fn mount_liveness(
+    mount: &Mounted,
+    table: Option<&io::Result<MountTable>>,
+) -> Result<Option<bool>, String> {
+    if mount.is_disconnected().map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+    let table = table
+        .expect("mount table captured for a nonempty registry")
+        .as_ref()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(mount.matches_mount_table(table)))
+}
+
+fn mount_statuses(
+    runtime: &RuntimeDir,
+    registry: &Mutex<MountRegistry>,
+) -> Result<Vec<MountInfo>, String> {
+    let mut result = inspect_mounts(
+        registry,
+        || {
+            let owners = cirrus_fuse::recovery_owners(runtime).map_err(|error| error.to_string())?;
+            let mut paths = std::collections::HashSet::new();
+            let mut spaces = std::collections::HashSet::new();
+            let mut sources = std::collections::HashSet::new();
+            for owner in &owners {
+                if !paths.insert(&owner.path)
+                    || !spaces.insert((&owner.instance, &owner.space_id))
+                    || !sources.insert(&owner.source)
+                {
+                    return Err("ambiguous mount owner records require inspection".to_owned());
+                }
+            }
+            Ok(owners)
+        },
+        |owners, mounts, table| {
+            let mut active = Vec::with_capacity(mounts.len());
+            for mount in mounts {
+                let live = mount_liveness(mount, table)?;
+                if live == Some(false)
+                    || !owners.iter().any(|owner| {
+                        owner.path == mount.path()
+                            && owner.source == mount.source()
+                            && owner.instance == mount.instance()
+                            && owner.space_id == mount.space_id()
+                            && owner.space_name == mount.space_name()
+                    })
+                {
+                    return Err("mountpoint identity changed or cannot be verified".to_owned());
+                }
+                if live == Some(true) {
+                    active.push(mount);
+                }
+            }
+            Ok(owners
+                .into_iter()
+                .map(|owner| {
+                    let active = active
+                        .iter()
+                        .find(|mount| mount.path() == owner.path && mount.source() == owner.source);
+                    MountInfo {
+                        instance: owner.instance,
+                        space_id: owner.space_id,
+                        space_name: owner.space_name,
+                        path: owner.path.to_string_lossy().into_owned(),
+                        state: if active.is_some() {
+                            MountState::Mounted
+                        } else {
+                            MountState::RecoveryRequired
+                        },
+                        offline_read_only: active
+                            .map(|mount| mount.is_offline() && !mount.is_offline_writable()),
+                        offline_writable: active.map(|mount| mount.is_offline_writable()),
+                    }
+                })
+                .collect::<Vec<_>>())
+        },
+    )?
+    .ok_or_else(|| "mount operation is in progress".to_owned())?;
     result.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(result)
 }
@@ -230,22 +289,35 @@ pub(crate) struct Application {
     accounts: Arc<Accounts>,
     mount: Arc<Mutex<MountRegistry>>,
     scheduler: Scheduler,
+    policy: Arc<Policy>,
+    activating: Arc<AtomicBool>,
     journal_readers: Arc<AtomicUsize>,
     storage_readers: Arc<AtomicUsize>,
+    mount_reader: Arc<AtomicBool>,
     account_replies: Arc<AtomicUsize>,
     sign_in: ActiveSignIn,
 }
 
 impl Application {
-    pub(crate) fn start(runtime: RuntimeDir, automatic: bool) -> io::Result<Self> {
+    pub(crate) fn start(
+        runtime: RuntimeDir,
+        automatic: bool,
+        release_root: Option<&Path>,
+        accounts: Accounts,
+    ) -> io::Result<Self> {
         let busy = Arc::new(AtomicBool::new(false));
-        let accounts = Arc::new(Accounts::new(runtime.try_clone()?));
-        let mount = Arc::new(Mutex::new(MountRegistry::Available(Vec::new())));
+        let accounts = Arc::new(accounts);
+        let mount = Arc::new(Mutex::new(MountRegistry {
+            mounts: Some(Vec::new()),
+            generation: 0,
+        }));
+        let policy = Arc::new(Policy::open(release_root)?);
         let scheduler = Scheduler::start(
             Arc::clone(&accounts),
             Arc::clone(&busy),
             Arc::clone(&mount),
             automatic,
+            Arc::clone(&policy),
         )?;
         let journal_readers = Arc::new(AtomicUsize::new(0));
         let account_replies = Arc::new(AtomicUsize::new(0));
@@ -257,8 +329,11 @@ impl Application {
             accounts,
             mount,
             scheduler,
+            policy,
+            activating: Arc::new(AtomicBool::new(false)),
             journal_readers,
             storage_readers,
+            mount_reader: Arc::new(AtomicBool::new(false)),
             account_replies,
             sign_in,
         })
@@ -266,6 +341,163 @@ impl Application {
 
     pub(crate) fn automatic_sync_enabled(&self) -> bool {
         self.scheduler.enabled()
+    }
+
+    pub(crate) fn dispatch_mount_engines(
+        &self,
+        reply: impl FnOnce(Result<MountEngineReport, String>) + Send + 'static,
+    ) -> io::Result<()> {
+        let registry = Arc::clone(&self.mount);
+        let policy = Arc::clone(&self.policy);
+        self.dispatch_mount_inspection(
+            move || {
+                let report = inspect_mounts(
+                    &registry,
+                    || Ok(()),
+                    |(), mounts, table| {
+                        let mut live = Vec::with_capacity(mounts.len());
+                        for mount in mounts {
+                            if mount_liveness(mount, table)? == Some(true) {
+                                live.push(MountEngine {
+                                    path: mount.path().to_string_lossy().into_owned(),
+                                    instance: mount.instance().to_owned(),
+                                    space: mount.space_id().to_owned(),
+                                    composed_reads: mount.composed_reads(),
+                                });
+                            }
+                        }
+                        Ok(MountEngineReport {
+                            read_engine: policy.read_engine(),
+                            mounts: Some(live),
+                        })
+                    },
+                )?;
+                Ok(report.unwrap_or_else(|| MountEngineReport {
+                    read_engine: policy.read_engine(),
+                    mounts: None,
+                }))
+            },
+            reply,
+        )
+    }
+
+    fn dispatch_mount_inspection<T: Send + 'static>(
+        &self,
+        inspect: impl FnOnce() -> Result<T, String> + Send + 'static,
+        reply: impl FnOnce(Result<T, String>) + Send + 'static,
+    ) -> io::Result<()> {
+        if self.mount_reader.swap(true, Ordering::AcqRel) {
+            reply(Err("mount status is busy; retry".into()));
+            return Ok(());
+        }
+        let reader = ExclusivePermit(Arc::clone(&self.mount_reader));
+        self.account_replies.fetch_add(1, Ordering::AcqRel);
+        let activity = ActivityPermit(Arc::clone(&self.account_replies));
+        if let Err(error) = thread::Builder::new()
+            .name("cirrus-mount-status".into())
+            .spawn(move || {
+                let (_activity, _reader) = (activity, reader);
+                reply(inspect());
+            })
+        {
+            eprintln!("could not start mount inspection: {error}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_release(
+        &self,
+        request: ReleaseRequest,
+        reply: impl FnOnce(Result<ReleaseStatus, String>) + Send + 'static,
+    ) -> io::Result<()> {
+        let automatic = self.scheduler.configured();
+        if matches!(request, ReleaseRequest::Status) {
+            reply(Ok(self.policy.status(automatic)));
+            return Ok(());
+        }
+        let policy = Arc::clone(&self.policy);
+        let wake = self.scheduler.waker();
+        self.dispatch_release_change(
+            move || {
+                let result = policy.activate(request).and_then(|()| {
+                    let status = policy.status(automatic);
+                    if status.worker.is_some() {
+                        Ok(status)
+                    } else {
+                        Err(io::Error::other(
+                            "selected worker is not serving; automatic transfers paused",
+                        ))
+                    }
+                });
+                wake();
+                result.map_err(|error| {
+                    format!("{error}; inspect --release-status for the actual serving generation")
+                })
+            },
+            reply,
+        )
+    }
+
+    pub(crate) fn dispatch_credential_policy(
+        &self,
+        request: CredentialPolicyRequest,
+        reply: impl FnOnce(Result<CredentialPolicy, String>) + Send + 'static,
+    ) -> io::Result<()> {
+        if matches!(request, CredentialPolicyRequest::Status) {
+            reply(
+                self.accounts
+                    .credential_policy()
+                    .map_err(|error| error.to_string()),
+            );
+            return Ok(());
+        }
+        let policy = Arc::clone(&self.policy);
+        let accounts = Arc::clone(&self.accounts);
+        self.dispatch_release_change(
+            move || {
+                let profile = policy
+                    .authorize_credential_policy(request)
+                    .map_err(|error| error.to_string())?;
+                accounts
+                    .set_credential_policy(profile)
+                    .map_err(|error| error.to_string())
+            },
+            reply,
+        )
+    }
+
+    fn dispatch_release_change<T: Send + 'static>(
+        &self,
+        apply: impl FnOnce() -> Result<T, String> + Send + 'static,
+        reply: impl FnOnce(Result<T, String>) + Send + 'static,
+    ) -> io::Result<()> {
+        if self.scheduler.is_paused() {
+            reply(Err(
+                "shutdown is draining; release selection unchanged".into()
+            ));
+            return Ok(());
+        }
+        if self.activating.swap(true, Ordering::AcqRel) {
+            reply(Err(
+                "another release or credential policy change is in progress".into(),
+            ));
+            return Ok(());
+        }
+        let activation = ExclusivePermit(Arc::clone(&self.activating));
+        self.account_replies.fetch_add(1, Ordering::AcqRel);
+        let activity = ActivityPermit(Arc::clone(&self.account_replies));
+        let started = thread::Builder::new()
+            .name("cirrus-release".into())
+            .spawn(move || {
+                let (_activity, _activation) = (activity, activation);
+                reply(apply());
+            });
+        if let Err(error) = started {
+            // Dropping the unstarted closure releases admission and the reply
+            // stream. Resource pressure must not shut down the FUSE owner.
+            eprintln!("could not start release operation: {error}");
+        }
+        Ok(())
     }
 
     // An adapter provides delivery; the application decides which operations can
@@ -300,9 +532,10 @@ impl Application {
             storage_readers,
             account_replies,
             sign_in,
+            policy,
+            ..
         } = self;
         let automatic = *automatic;
-        let worker_enabled = scheduler.enabled();
         let read_pool = match &request {
             AccountRequest::Journal { .. } => Some((
                 journal_readers,
@@ -340,6 +573,8 @@ impl Application {
             }
             let permit = ActivityPermit(Arc::clone(readers));
             let accounts = Arc::clone(accounts);
+            let worker_enabled =
+                matches!(request, AccountRequest::SyncStatus { .. }).then(|| scheduler.enabled_probe());
             let _ = thread::Builder::new().name(name.into()).spawn(move || {
                 let _permit = permit;
                 let result = match request {
@@ -352,7 +587,7 @@ impl Application {
                         .map(AccountReply::Journal),
                     AccountRequest::SyncStatus { instance, space } => {
                         accounts.sync_status(&instance, &space).map(|mut status| {
-                            status.worker_enabled_here = Some(worker_enabled);
+                            status.worker_enabled_here = worker_enabled.map(|enabled| enabled());
                             AccountReply::SyncStatus(status)
                         })
                     }
@@ -392,12 +627,18 @@ impl Application {
             return Ok(());
         }
         if matches!(request, AccountRequest::Mounts) {
-            let result = mount
-                .try_lock()
-                .map_err(|_| "mount operation is in progress".to_owned())
-                .and_then(|mounts| mount_statuses(runtime, mounts.ready()?));
-            reply(result.map(AccountReply::Mounts));
-            return Ok(());
+            let runtime = match runtime.try_clone() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    reply(Err(error.to_string()));
+                    return Ok(());
+                }
+            };
+            let mount = Arc::clone(mount);
+            return self.dispatch_mount_inspection(
+                move || mount_statuses(&runtime, &mount).map(AccountReply::Mounts),
+                reply,
+            );
         }
         let mut admission = match scheduler.foreground() {
             Ok(admission) => admission,
@@ -414,6 +655,8 @@ impl Application {
         let accounts = Arc::clone(accounts);
         let mount = Arc::clone(mount);
         let active_sign_in = Arc::clone(sign_in);
+        let read_program = policy.read_program();
+        let worker_enabled = scheduler.enabled_probe();
         let attempt = if let AccountRequest::Connect { attempt, .. } = &request {
             if attempt.len() != 32 || !attempt.bytes().all(|b| b.is_ascii_hexdigit()) {
                 drop(admission);
@@ -732,13 +975,14 @@ impl Application {
                         &space,
                         path_ref,
                         worker_runtime,
+                        read_program,
                     )
                     .map_err(|e| e.to_string())?;
                     let actual_path = mounted.path().to_string_lossy().into_owned();
                     slot.push(mounted);
                     Ok(AccountReply::Mounted(MountedSpace {
                         path: actual_path,
-                        automatic_sync_enabled: worker_enabled,
+                        automatic_sync_enabled: worker_enabled(),
                         mode: if offline_writable {
                             MountMode::OfflineWritable
                         } else {
@@ -786,13 +1030,14 @@ impl Application {
                         &space,
                         path.as_deref(),
                         worker_runtime,
+                        read_program,
                     )
                     .map_err(|e| e.to_string())?;
                     let actual_path = mounted.path().to_string_lossy().into_owned();
                     slot.push(mounted);
                     Ok(AccountReply::Mounted(MountedSpace {
                         path: actual_path,
-                        automatic_sync_enabled: worker_enabled,
+                        automatic_sync_enabled: worker_enabled(),
                         mode: MountMode::Online,
                     }))
                 })(),

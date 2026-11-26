@@ -433,6 +433,8 @@ impl Accounts {
 
     /// Enumerates at most 64 local activations without reading credentials or mounting.
     ///
+    /// Does not create or migrate State. An absent database has no activations.
+    ///
     /// # Errors
     /// Returns an error for unsupported or unreadable local state.
     pub fn activated_spaces(&self) -> Result<Vec<(String, String)>, AccountError> {
@@ -444,7 +446,9 @@ impl Accounts {
         &self,
         root: &StorageRoot,
     ) -> Result<Vec<(String, String)>, AccountError> {
-        let conn = offline::database_in(root)?;
+        let Some(conn) = offline::inspect_state_in(root)? else {
+            return Ok(Vec::new());
+        };
         let mut statement = conn
             .prepare("SELECT instance,space FROM sync_spaces ORDER BY instance,space LIMIT 64")
             .map_err(|_| AccountError::new("cannot inspect activated Spaces"))?;
@@ -457,6 +461,8 @@ impl Accounts {
 
     /// Reports one Space's local queue and retry observations without network/keyring access.
     /// Counts may scan retained history; output size, not local I/O time, is bounded.
+    ///
+    /// Does not create or migrate State. An absent database has no local work.
     ///
     /// # Errors
     /// Returns an error for invalid input, unsupported schema or damaged state.
@@ -475,7 +481,32 @@ impl Accounts {
         if space.is_empty() || space.chars().any(char::is_control) {
             return Err(AccountError::new("invalid Space ID"));
         }
-        let conn = offline::database_in(root)?;
+        let idle = SyncStatus {
+            instance,
+            space: space.to_owned(),
+            activated: false,
+            worker_enabled_here: None,
+            phase: SyncPhase::ObservedIdle,
+            queued: 0,
+            uploading: 0,
+            verifying: 0,
+            uncertain: 0,
+            conflicts: 0,
+            damaged: 0,
+            retry_attempt: 0,
+            next_attempt: None,
+            cause: None,
+            last_verified: None,
+            high_water: 0,
+            verified_through: 0,
+            new_work: false,
+        };
+        // The status queries use only journal, identity, sync and receipt
+        // tables already present in v17.
+        let Some(conn) = offline::inspect_state_in(root)? else {
+            return Ok(idle);
+        };
+        let instance = &idle.instance;
         type Saved = (
             String,
             u32,
@@ -514,11 +545,7 @@ impl Accounts {
         let uploading = u64::from(active);
         let uncertain = uncertain.saturating_sub(uploading);
         let mut status = SyncStatus {
-            instance,
-            space: space.to_owned(),
             activated,
-            worker_enabled_here: None,
-            phase: SyncPhase::ObservedIdle,
             queued,
             uploading,
             verifying,
@@ -538,6 +565,7 @@ impl Accounts {
                 || conflicts > 0
                 || damaged > 0
                 || high_water > verified_through,
+            ..idle
         };
         let local_publication: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal WHERE instance=?1 AND space=?2 AND error_msg GLOB 'local publication recovery:*')", params![status.instance,space], |row| row.get(0)).map_err(|_| AccountError::new("cannot inspect local publication status"))?;
         if local_publication {

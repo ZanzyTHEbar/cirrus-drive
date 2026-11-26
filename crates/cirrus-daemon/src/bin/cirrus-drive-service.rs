@@ -1,5 +1,6 @@
 use std::env;
 use std::io;
+use std::path::Path;
 use std::process::ExitCode;
 
 use cirrus_daemon::Daemon;
@@ -7,24 +8,47 @@ use cirrus_runtime::RuntimeDir;
 use rustix::{fs::Mode, process};
 
 fn main() -> ExitCode {
-    let mut args = env::args_os().skip(1);
-    let argument = args.next();
-    let manual = match (
-        argument.as_deref().and_then(|value| value.to_str()),
-        args.next(),
-    ) {
-        (None, None) if argument.is_none() => false,
-        (Some("--no-auto-sync"), None) => true,
-        (Some("--help"), None) => {
-            println!("Usage: cirrus-drive-service [--no-auto-sync | --help | --version]");
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if let [flag, root, role, bootstrap, rest @ ..] = args.as_slice()
+        && flag == "--launch-client"
+        && let Some(role @ ("cli" | "ui")) = role.to_str()
+    {
+        return report(Daemon::launch_client(
+            Path::new(root),
+            role,
+            Path::new(bootstrap),
+            rest,
+        ));
+    }
+    if let [flag, confirmed] = args.as_slice()
+        && flag == "--prepare-state"
+        && confirmed == "--legacy-writers-stopped"
+    {
+        process::umask(Mode::from_raw_mode(0o077));
+        return report(
+            runtime_dir()
+                .and_then(|runtime| Daemon::prepare_state_after_stopping_writers(&runtime)),
+        );
+    }
+    let (manual, release_root) = match args.as_slice() {
+        [] => (false, None),
+        [flag] if flag == "--no-auto-sync" => (true, None),
+        [flag, root] if flag == "--release-root" => (false, Some(Path::new(root))),
+        [flag, root, manual] if flag == "--release-root" && manual == "--no-auto-sync" => {
+            (true, Some(Path::new(root)))
+        }
+        [flag] if flag == "--help" => {
+            println!("Usage: cirrus-drive-service [--release-root DIRECTORY] [--no-auto-sync]");
+            println!("       cirrus-drive-service --prepare-state --legacy-writers-stopped");
+            println!("Stop all Cirrus writers and unmount before preparing State.");
             return ExitCode::SUCCESS;
         }
-        (Some("--version"), None) => {
+        [flag] if flag == "--version" => {
             println!("cirrus-drive-service {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         #[cfg(feature = "fault-injection")]
-        (Some("--lab-capabilities"), None) => {
+        [flag] if flag == "--lab-capabilities" => {
             println!("cirrus-drive disposable account and mount lab v1");
             return ExitCode::SUCCESS;
         }
@@ -35,7 +59,20 @@ fn main() -> ExitCode {
     };
     // This entrypoint is still single-threaded; the setting is process-wide.
     process::umask(Mode::from_raw_mode(0o077));
-    let result = env::var_os("XDG_RUNTIME_DIR")
+    let result = runtime_dir().and_then(|runtime| {
+        if let Some(root) = release_root {
+            Daemon::new().run_managed(&runtime, root, !manual)
+        } else if manual {
+            Daemon::new().run_without_automatic_sync(&runtime)
+        } else {
+            Daemon::new().run(&runtime)
+        }
+    });
+    report(result)
+}
+
+fn runtime_dir() -> io::Result<RuntimeDir> {
+    env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -43,13 +80,9 @@ fn main() -> ExitCode {
             )
         })
         .and_then(|path| RuntimeDir::open(path.as_ref()))
-        .and_then(|runtime| {
-            if manual {
-                Daemon::new().run_without_automatic_sync(&runtime)
-            } else {
-                Daemon::new().run(&runtime)
-            }
-        });
+}
+
+fn report(result: io::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

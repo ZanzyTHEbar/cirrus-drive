@@ -291,6 +291,8 @@ pub struct Accounts {
     #[cfg(target_os = "macos")]
     keychain: Option<ownership::credentials::KeychainConfig>,
     credentials: Mutex<CredentialState>,
+    #[cfg(target_os = "linux")]
+    credential_policy: Mutex<cirrus_api::CredentialPolicy>,
     operation: Mutex<()>,
     cancelled: Arc<AtomicBool>,
     read_session: Mutex<Option<Arc<ReadSession>>>,
@@ -1015,6 +1017,18 @@ impl Accounts {
         accounts
     }
 
+    /// Holds the default Linux State root for the lifetime of a managed resident.
+    ///
+    /// # Errors
+    /// Refuses a root under maintenance or an existing incompatible State store.
+    /// Missing State can still be initialized on first use. No keyring is opened.
+    #[cfg(target_os = "linux")]
+    pub fn for_managed_service(runtime: RuntimeDir) -> Result<Self, AccountError> {
+        let root = StorageRoot::default()?;
+        offline::check_managed_state_in(&root)?;
+        Ok(Self::with_storage(runtime, root))
+    }
+
     /// Creates an account boundary without accessing the keyring or network.
     pub fn new(runtime: RuntimeDir) -> Self {
         Self {
@@ -1023,6 +1037,8 @@ impl Accounts {
             #[cfg(target_os = "macos")]
             keychain: None,
             credentials: Mutex::new(CredentialState::Idle),
+            #[cfg(target_os = "linux")]
+            credential_policy: Mutex::default(),
             operation: Mutex::new(()),
             cancelled: Arc::new(AtomicBool::new(false)),
             read_session: Mutex::new(None),
@@ -5982,29 +5998,7 @@ impl Accounts {
             };
         }
         if version.id.starts_with("cirrus-staged:") {
-            // Flush may be triggered by a fork child's close-on-exec while sync
-            // owns the account and awaits that child's HTTP bridge. It must not
-            // reload credentials, acquire account ownership or attempt recovery.
-            if version.instance != binding.instance || version.space != binding.space {
-                return Err(AccountError::new("staged file binding changed"));
-            }
-            offline::verify_identity_in(
-                &binding.root,
-                &binding.instance,
-                &binding.issuer,
-                &binding.subject,
-            )?;
-            let current = offline::staged_version(
-                &binding.root,
-                &version.instance,
-                &version.space,
-                &version.path,
-                &version.id,
-            )?;
-            if current.is_none_or(|(current, _)| current != *version) {
-                return Err(AccountError::new("file representation changed"));
-            }
-            return Ok(());
+            return Self::verified_online_staged_snapshot(binding, version).map(|_| ());
         }
         let current =
             self.mount_open_file(&version.instance, binding, &version.path, &version.id)?;
@@ -6012,6 +6006,54 @@ impl Accounts {
             return Err(AccountError::new("file representation changed"));
         }
         Ok(())
+    }
+
+    fn verified_online_staged_snapshot(
+        binding: &MountBinding,
+        version: &FileVersion,
+    ) -> Result<offline::StagedSnapshot, AccountError> {
+        // Even a fork child's close-on-exec can trigger verification while
+        // sync owns the account and awaits that child's HTTP bridge. Use the
+        // retained principal, without credentials, ownership or recovery.
+        if version.instance != binding.instance || version.space != binding.space {
+            return Err(AccountError::new("staged file binding changed"));
+        }
+        offline::verify_identity_in(
+            &binding.root,
+            &binding.instance,
+            &binding.issuer,
+            &binding.subject,
+        )?;
+        offline::staged_snapshot(
+            &binding.root,
+            &version.instance,
+            &version.space,
+            &version.path,
+            &version.id,
+        )?
+        .filter(|(current, _)| current == version)
+        .map(|(_, snapshot)| snapshot)
+        .ok_or_else(|| AccountError::new("file representation changed"))
+    }
+
+    /// Checks that a verified staged read still names the exact journal head.
+    ///
+    /// Returns whether the head is detached. This local-only fence does not
+    /// open the manifest or authorize bytes on its own.
+    ///
+    /// # Errors
+    /// Refuses cancelled reads and changed or fenced bindings and heads.
+    pub fn verify_staged_read_head(
+        &self,
+        binding: &MountBinding,
+        version: &FileVersion,
+    ) -> Result<bool, AccountError> {
+        self.check_cancelled()?;
+        self.storage.validate(&binding.root)?;
+        if version.instance != binding.instance || version.space != binding.space {
+            return Err(AccountError::new("staged file binding changed"));
+        }
+        offline::staged_read_head(binding, version)
     }
 
     /// Fetches one bounded range, publishing only a fully validated response.
@@ -6060,25 +6102,12 @@ impl Accounts {
             // live snapshot authorize local bytes, not a credential-cache hit.
             // Missing original ranges still take the authenticated path below.
             self.check_cancelled()?;
-            self.verify_file(binding, version)?;
-            let (current, staged) = offline::staged_version(
-                root,
-                &version.instance,
-                &version.space,
-                &version.path,
-                &version.id,
-            )?
-            .ok_or_else(|| AccountError::new("staged file is unavailable"))?;
-            if &current != version {
-                return Err(AccountError::new("staged file changed"));
-            }
-            let snapshot = offline::StagedSnapshot::open_at(root, &staged)?;
-            if snapshot.len() != version.size {
-                return Err(AccountError::new("staged file changed"));
-            }
-            return snapshot.range_with(offset, length, |base, offset, length| {
+            let snapshot = Self::verified_online_staged_snapshot(binding, version)?;
+            let bytes = snapshot.range_with(offset, length, |base, offset, length| {
                 self.read_range_in(root, binding, base, offset, length)
-            });
+            })?;
+            self.check_cancelled()?;
+            return Ok(bytes);
         }
         let access = SessionAccess::BoundSaved(binding);
         let session = self.read_session_in(root, &version.instance, access);
@@ -6129,7 +6158,7 @@ impl Accounts {
                 // Keep its actual validation scratch owner/allowance alive
                 // through best-effort persistence; don't release paid headroom
                 // between verification and the cache's admission decision.
-                if let Ok(_guard) = self.clean_cache_update.lock()
+                if let Ok(_guard) = self.clean_cache_update.try_lock()
                     && cache_generation == self.clean_cache_generation()
                     && let Some(generation) = disk_generation
                 {
@@ -6658,10 +6687,14 @@ impl Accounts {
                 .reconnect()?;
             return Ok(operation);
         }
+        #[cfg(target_os = "linux")]
+        let policy = self.credential_policy()?;
         let guard = if local {
             ownership::acquire_local_in(
                 root,
                 &self.runtime,
+                #[cfg(target_os = "linux")]
+                policy,
                 #[cfg(target_os = "macos")]
                 self.keychain.as_ref(),
             )?
@@ -6669,6 +6702,8 @@ impl Accounts {
             ownership::acquire_in(
                 root,
                 &self.runtime,
+                #[cfg(target_os = "linux")]
+                policy,
                 #[cfg(target_os = "macos")]
                 self.keychain.as_ref(),
             )?
@@ -6968,6 +7003,64 @@ impl Accounts {
                 !pending.is_empty()
             }
         })
+    }
+
+    /// Returns the resident's effective Linux automatic credential writer policy.
+    ///
+    /// # Errors
+    /// Reports unavailable account policy state.
+    #[cfg(target_os = "linux")]
+    pub fn credential_policy(&self) -> Result<cirrus_api::CredentialPolicy, AccountError> {
+        self.credential_policy
+            .lock()
+            .map(|policy| *policy)
+            .map_err(|_| AccountError::new("credential policy is unavailable"))
+    }
+
+    /// Changes the built-in Linux writer policy after the resident authorizes it.
+    ///
+    /// This is an in-process setting, not a release endpoint. It does not open
+    /// account State or Secret Service, change any binding, or persist a token.
+    ///
+    /// # Errors
+    /// Refuses active operations, retained rotation, or unavailable writer ownership.
+    #[cfg(target_os = "linux")]
+    pub fn set_credential_policy(
+        &self,
+        policy: cirrus_api::CredentialPolicy,
+    ) -> Result<cirrus_api::CredentialPolicy, AccountError> {
+        let _operation = self.operation.try_lock().map_err(|_| {
+            AccountError::retryable_read("account operation is active; credential policy unchanged")
+        })?;
+        {
+            let state = self
+                .credentials
+                .lock()
+                .map_err(|_| AccountError::new("account state is unavailable"))?;
+            match &*state {
+                CredentialState::Idle => {}
+                CredentialState::Retained { .. } => {
+                    return Err(AccountError::new(
+                        "account credentials await keyring persistence; credential policy unchanged",
+                    ));
+                }
+                CredentialState::Active(_) => {
+                    return Err(AccountError::new("account ownership is unavailable"));
+                }
+            }
+        }
+        let writer = ownership::acquire_credential_policy_writer(&self.runtime)?;
+        let mut current = self
+            .credential_policy
+            .lock()
+            .map_err(|_| AccountError::new("credential policy is unavailable"))?;
+        if writer.connection().is_closed() {
+            return Err(AccountError::new(
+                "credential writer connection is unavailable",
+            ));
+        }
+        *current = policy;
+        Ok(policy)
     }
 
     fn check_cancelled(&self) -> Result<(), AccountError> {
