@@ -119,7 +119,7 @@ Offline remote-directory replacement of an exact empty target transforms overlap
 2. Unmount each Space in the Cirrus UI or with `cirrus-daemon --unmount-space HTTPS_URL SPACE_ID`. Use the installed client that matches the running service, including when preparing to upgrade.
 3. Run `cirrus-daemon --mounts` and verify that it succeeds and lists no mounts. Then stop the service with `systemctl --user stop cirrus-drive.service` (or `cirrus-daemon --stop` if you started it in a terminal).
 
-Do not use `umount` or `fusermount3` on a mount still owned by the running Cirrus service. External unmount is unsupported and can leave the service unable to stop cleanly. If that happens, pause the uninstall or upgrade and preserve local state and credentials. Do not delete state or force-detach mounts to get past the error.
+Prefer Cirrus's own unmount command. If an idle mount was already removed with a strict `fusermount3 -u`, use `cirrus-daemon --recover-mount MOUNTPOINT` before remounting, or use `cirrus-daemon --stop` to retire it during normal shutdown. If recovery reports another mount at that path or ambiguous ownership, pause the uninstall or upgrade and inspect the mount. Do not remove the owner record or force-detach a mount to bypass the error.
 
 Once the service has stopped, use `./packaging/uninstall.sh` to remove the user-installed artifacts. It retains local state and credentials. To upgrade, then install and start the new matching versions. See `cirrus-daemon --help` and `cirrus-ui --help` for additional commands.
 

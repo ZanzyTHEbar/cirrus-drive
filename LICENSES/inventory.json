@@ -1007,7 +1007,7 @@
     "crates/cirrus-client/Cargo.toml": "72fe71955cc66dd6194ae784296287b74d7c15bf90df483294ad7748681c492e",
     "crates/cirrus-daemon/Cargo.toml": "eb6a3844c9a7b8fb8b6acaf250281d0e23b47e242edd3f392d27a94631521532",
     "crates/cirrus-discovery/Cargo.toml": "c0f4bff87a8db791dd0a542cf5c069b02a02f72cf8cfb10dcbb9118a020f1ace",
-    "crates/cirrus-fuse/Cargo.toml": "07f970330e0e2015b47ad306217f8f6f7bee41480862bda055cae29c7e300266",
+    "crates/cirrus-fuse/Cargo.toml": "e86b660f8dd9050c8d8edb871bc406b7d2e1b619736eb6a8cbe71d6e4c246902",
     "crates/cirrus-runtime/Cargo.toml": "2af5e5cee104e99b26312ea6828b5cce05111569126cd5f843430650c1116bfb",
     "crates/cirrus-ui/Cargo.toml": "465713821870b9ef397c84bd2bd6f32670ff1253b8050a1c3a74ab22ae39014b",
     "rust-toolchain.toml": "85db324345b7937c49ea2ac8b962d741f710719f4f751cab809985cbe6afbe3c"

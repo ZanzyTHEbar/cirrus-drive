@@ -124,7 +124,8 @@ fn mount_statuses(runtime: &RuntimeDir, mounts: &[Mounted]) -> Result<Vec<MountI
         }
     }
     for mount in mounts {
-        if !mount.is_active().unwrap_or(false)
+        if (!mount.is_active().map_err(|e| e.to_string())?
+            && !mount.is_disconnected().map_err(|e| e.to_string())?)
             || owners
                 .iter()
                 .filter(|owner| {
@@ -145,6 +146,10 @@ fn mount_statuses(runtime: &RuntimeDir, mounts: &[Mounted]) -> Result<Vec<MountI
         let active = mounts
             .iter()
             .find(|mount| mount.path() == owner.path && mount.source() == owner.source);
+        let active = match active {
+            Some(mount) if !mount.is_disconnected().map_err(|e| e.to_string())? => Some(mount),
+            _ => None,
+        };
         let offline_read_only =
             active.map(|mount| mount.is_offline() && !mount.is_offline_writable());
         let offline_writable = active.map(Mounted::is_offline_writable);
@@ -806,13 +811,19 @@ impl Application {
                     })()
                 }
                 AccountRequest::RecoverMount { path } => (|| {
-                    let operation = MountOperation::begin(&mount)?;
-                    let slot = &operation.mounts;
-                    if slot.iter().any(|mount| mount.path() == path.as_path()) {
-                        return Err("unmount the active Space first".to_owned());
+                    let mut operation = MountOperation::begin(&mount)?;
+                    let slot = &mut operation.mounts;
+                    if let Some(index) =
+                        slot.iter().position(|mount| mount.path() == path.as_path())
+                    {
+                        slot[index]
+                            .recover_disconnected()
+                            .map_err(|e| e.to_string())?;
+                        slot.remove(index);
+                    } else {
+                        cirrus_fuse::recover(&worker_runtime, path.as_path())
+                            .map_err(|e| e.to_string())?;
                     }
-                    cirrus_fuse::recover(&worker_runtime, path.as_path())
-                        .map_err(|e| e.to_string())?;
                     Ok(AccountReply::Done)
                 })(),
                 AccountRequest::CleanCacheStatus

@@ -11,7 +11,7 @@ use rustix::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{RecoveryOwner, escape_mount_path};
+use crate::{Mounted, RecoveryOwner, escape_mount_path};
 
 const PREFIX: &str = "cirrus-drive.mount-";
 
@@ -249,39 +249,57 @@ fn remove(runtime: &RuntimeDir, name: &str, held: &OwnedFd) -> io::Result<()> {
     fs::fsync(runtime).map_err(io::Error::from)
 }
 
-fn mount_state(record: &Record) -> io::Result<(bool, bool, bool)> {
+pub(crate) struct MountState {
+    source_present: bool,
+    path_mounted: bool,
+    pub(crate) exact_id: Option<u64>,
+}
+
+pub(crate) fn mount_state(path: &Path, source: &str) -> io::Result<MountState> {
     let info = std::fs::read("/proc/self/mountinfo")?;
-    let path = escape_mount_path(Path::new(&record.path));
+    let path = escape_mount_path(path);
     let mut count = 0;
-    let mut matches = false;
-    let mut id_present = false;
+    let mut exact_id = None;
     let mut source_count = 0;
     for line in info.split(|b| *b == b'\n') {
         let fields: Vec<_> = line.split(|b| *b == b' ').collect();
         let Some(separator) = fields.iter().position(|field| *field == b"-") else {
             continue;
         };
-        if fields.len() > separator + 2 && fields[separator + 2] == record.source.as_bytes() {
-            id_present = true;
+        if separator < 6 || fields.len() <= separator + 2 {
+            continue;
+        }
+        let has_source = fields[separator + 2] == source.as_bytes();
+        if has_source {
             source_count += 1;
         }
-        if fields.len() > separator + 2 && fields.len() >= 5 && fields[4] == path {
+        if fields[4] == path {
             count += 1;
-            matches |= fields[separator + 1] == b"fuse.cirrus-drive"
-                && fields[separator + 2] == record.source.as_bytes();
+            if has_source && fields[separator + 1] == b"fuse.cirrus-drive" {
+                exact_id = std::str::from_utf8(fields[0])
+                    .ok()
+                    .and_then(|id| id.parse().ok());
+            }
         }
     }
-    Ok((
-        id_present,
-        count == 1 && matches && source_count == 1,
-        count != 0,
-    ))
+    Ok(MountState {
+        source_present: source_count != 0,
+        path_mounted: count != 0,
+        exact_id: exact_id.filter(|_| count == 1 && source_count == 1),
+    })
 }
 
-pub(crate) fn remove_owned(runtime: &RuntimeDir, path: &Path) -> io::Result<()> {
+pub(crate) fn remove_owned(mount: &Mounted) -> io::Result<()> {
+    let runtime = &mount.runtime;
+    let path = mount.path();
     let (name, fd, record) = find(runtime, path)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mount owner record not found"))?;
     if record.path != path.to_str().unwrap_or("")
+        || record.source != mount.source()
+        || record.instance != mount.instance()
+        || record.space_id != mount.space_id()
+        || record.space_name != mount.space_name()
+        || record.source.strip_prefix("cirrus-drive-") != name.strip_prefix(PREFIX)
         || record.namespace != namespace()?
         || record.boot_id != boot_id()?
     {
@@ -290,9 +308,11 @@ pub(crate) fn remove_owned(runtime: &RuntimeDir, path: &Path) -> io::Result<()> 
             "mount owner record does not match",
         ));
     }
-    let (present, _, path_mounted) = mount_state(&record)?;
-    if present || path_mounted {
-        return Err(io::Error::other("owned mount is still present"));
+    let state = mount_state(path, &record.source)?;
+    if state.source_present || state.path_mounted {
+        return Err(io::Error::other(
+            "recorded mount or another mount is still present; owner record retained",
+        ));
     }
     remove(runtime, &name, &fd)
 }
@@ -311,15 +331,15 @@ pub(crate) fn recover(runtime: &RuntimeDir, path: &Path) -> io::Result<()> {
             "recorded mount does not match this path and namespace",
         ));
     }
-    let (present, matches, path_mounted) = mount_state(&record)?;
-    if !present && path_mounted {
+    let state = mount_state(path, &record.source)?;
+    if !state.source_present && state.path_mounted {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "another mount occupies the recorded path",
         ));
     }
-    if present {
-        if !matches {
+    if state.source_present {
+        if state.exact_id.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "recorded mount identity is ambiguous",
@@ -334,8 +354,11 @@ pub(crate) fn recover(runtime: &RuntimeDir, path: &Path) -> io::Result<()> {
                 "fusermount3 could not recover the recorded mount",
             ));
         }
-        if mount_state(&record)?.0 {
-            return Err(io::Error::other("recorded mount remains after recovery"));
+        let after = mount_state(path, &record.source)?;
+        if after.source_present || after.path_mounted {
+            return Err(io::Error::other(
+                "recorded path or mount remains after recovery",
+            ));
         }
     }
     remove(runtime, &name, &fd)

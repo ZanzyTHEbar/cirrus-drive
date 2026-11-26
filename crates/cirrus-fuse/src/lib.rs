@@ -1,10 +1,12 @@
 //! FUSE adapter for daemon-owned Space metadata and durable staged file writes.
 
 mod recovery;
+mod session;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +20,8 @@ use cirrus_account::{
 use cirrus_runtime::RuntimeDir;
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    FopenFlags, Generation, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, Session,
     TimeOrNow, WriteFlags,
 };
 use rustix::{
@@ -92,17 +94,22 @@ fn wait_test_window(variable: &str) -> Result<(), Errno> {
     Ok(())
 }
 
-/// A mount owned by this process. Dropping it requests an unmount.
+/// A mount owned by this process. Use explicit teardown to unmount it.
 pub struct Mounted {
     path: PathBuf,
     instance: String,
     space_id: String,
     space_name: String,
     source: String,
-    session: Option<BackgroundSession>,
+    session: Option<FuseWorker>,
     mount_id: u64,
     runtime: RuntimeDir,
     refresh: NamespaceRefresh,
+}
+
+struct FuseWorker {
+    background: BackgroundSession,
+    device: OwnedFd,
 }
 
 /// A lifetime-fenced handle for scheduler-owned, cached-credentials-only refresh.
@@ -110,7 +117,7 @@ pub struct Mounted {
 pub struct NamespaceRefresh {
     drive: Drive,
     alive: Arc<AtomicBool>,
-    notifier: fuser::Notifier,
+    notifier: Option<fuser::Notifier>,
     walk: Arc<Mutex<MountMetadataWalk>>,
 }
 
@@ -206,6 +213,9 @@ impl NamespaceRefresh {
         if !self.alive.load(Ordering::Acquire) {
             return Ok(());
         }
+        let Some(notifier) = &self.notifier else {
+            return Ok(());
+        };
         // Kernel invalidations are hints, not inotify delivery guarantees.
         // Decode at most one existing 32-name snapshot page at a time.
         for (old, new) in [(&before, &after), (&after, &before)] {
@@ -229,8 +239,7 @@ impl NamespaceRefresh {
                             || e.size() != entry.size()
                             || e.is_directory() != entry.is_directory()
                     }) {
-                        self.notifier
-                            .inval_entry(INodeNo(ino), OsStr::new(entry.name()))?;
+                        notifier.inval_entry(INodeNo(ino), OsStr::new(entry.name()))?;
                     }
                 }
             }
@@ -398,17 +407,7 @@ impl Mounted {
         }
         let offline = space.is_offline();
         let mut config = Config::default();
-        config.mount_options = vec![
-            MountOption::NoDev,
-            MountOption::NoSuid,
-            MountOption::NoExec,
-            MountOption::FSName(source.clone()),
-            MountOption::Subtype("cirrus-drive".into()),
-        ];
         config.n_threads = Some(4);
-        if offline && !space.is_offline_writable() {
-            config.mount_options.push(MountOption::RO);
-        }
         let filesystem = Drive::new(accounts.clone(), instance, space.clone(), source.clone());
         let walk_seed = seed.and_then(|(entries, generation, started)| {
             // Reuse the preflight without making a capacity error fatal to mount startup.
@@ -425,8 +424,18 @@ impl Mounted {
                 .map(|view| view.0)
         });
         let refresh_drive = filesystem.clone();
-        let session = match fuser::spawn_mount(filesystem, path, &config) {
-            Ok(session) => session,
+        let start = (|| -> io::Result<_> {
+            let device = session::mount(path, &source, offline && !space.is_offline_writable())?;
+            let mount_id = recovery::mount_state(path, &source)?
+                .exact_id
+                .ok_or_else(|| io::Error::other("cannot verify the new FUSE mount identity"))?;
+            // from_fd never installs fuser's pathname-unmount guard.
+            let background =
+                Session::from_fd(filesystem, device.try_clone()?, config.acl, config)?.spawn()?;
+            Ok((FuseWorker { background, device }, mount_id))
+        })();
+        let (session, mount_id) = match start {
+            Ok(mounted) => mounted,
             Err(error) => {
                 if let Err(cleanup) = recovery::recover(&runtime, path) {
                     return Err(io::Error::other(format!(
@@ -438,11 +447,10 @@ impl Mounted {
         };
         #[cfg(feature = "fault-injection")]
         fault_stop("mounted")?;
-        let mount_id = mount_id(path)?;
         let refresh = NamespaceRefresh {
             drive: refresh_drive,
             alive: Arc::new(AtomicBool::new(true)),
-            notifier: session.notifier(),
+            notifier: Some(session.background.notifier()),
             walk: Arc::new(Mutex::new(MountMetadataWalk::new(walk_seed))),
         };
         let mut mounted = Self {
@@ -520,16 +528,49 @@ impl Mounted {
     /// # Errors
     /// Returns an error if the mountpoint cannot be inspected.
     pub fn is_active(&self) -> io::Result<bool> {
-        if self.session.is_none() {
-            return Ok(false);
+        Ok(!self.is_disconnected()?
+            && recovery::mount_state(&self.path, &self.source)?.exact_id == Some(self.mount_id))
+    }
+
+    /// Checks the old kernel connection, independent of its mountpoint.
+    ///
+    /// # Errors
+    /// Reports an unexpected FUSE descriptor polling error.
+    pub fn is_disconnected(&self) -> io::Result<bool> {
+        match &self.session {
+            Some(worker) => session::disconnected(&worker.device),
+            None => Ok(true),
         }
-        let info = std::fs::read("/proc/self/mountinfo")?;
-        let expected = self.mount_id.to_string();
-        let path = escape_mount_path(&self.path);
-        Ok(info.split(|byte| *byte == b'\n').any(|line| {
-            let fields: Vec<_> = line.split(|byte| *byte == b' ').take(5).collect();
-            fields.len() == 5 && fields[0] == expected.as_bytes() && fields[4] == path
-        }))
+    }
+
+    /// Joins an externally disconnected FUSE worker without unmounting any path.
+    ///
+    /// # Errors
+    /// Refuses a live session or cleanup of an ambiguous or occupied mountpoint.
+    pub fn recover_disconnected(&mut self) -> io::Result<()> {
+        if !self.is_disconnected()? {
+            return Err(io::Error::other("unmount the active Space first"));
+        }
+        self.quiesce_refresh()?;
+        self.refresh.notifier.take();
+        if let Some(worker) = self.session.take() {
+            worker.background.join()?;
+        }
+        recovery::remove_owned(self)
+    }
+
+    fn quiesce_refresh(&self) -> io::Result<()> {
+        self.refresh.alive.store(false, Ordering::Release);
+        // A publication already holding this short lock completes first. DAV
+        // never holds it; a retired handle checks alive again before the swap.
+        drop(
+            self.refresh
+                .drive
+                .mutation
+                .lock()
+                .map_err(|_| io::Error::other("mount publication unavailable"))?,
+        );
+        Ok(())
     }
 
     /// Unmounts and joins the FUSE session.
@@ -543,30 +584,33 @@ impl Mounted {
         {
             return Err(io::Error::other("injected unmount failure"));
         }
-        if self.session.is_none() {
-            return recovery::remove_owned(&self.runtime, &self.path);
+        if self.is_disconnected()? {
+            return self.recover_disconnected();
         }
-        if mount_id(&self.path)? != self.mount_id {
-            return Err(io::Error::other(
-                "mountpoint identity changed; refusing to unmount",
-            ));
+        self.quiesce_refresh()?;
+        let unmount = (|| {
+            if recovery::mount_state(&self.path, &self.source)?.exact_id != Some(self.mount_id)
+                || mount_id(&self.path)? != self.mount_id
+            {
+                return Err(io::Error::other(
+                    "mountpoint identity changed; refusing to unmount",
+                ));
+            }
+            if self.is_disconnected()? {
+                return Ok(());
+            }
+            session::unmount(&self.path)
+        })();
+        if self.is_disconnected()? {
+            return self.recover_disconnected();
         }
-        let session = self
-            .session
-            .take()
-            .ok_or_else(|| io::Error::other("mount session is unavailable"))?;
-        self.refresh.alive.store(false, Ordering::Release);
-        // A publication already holding this short lock completes first. DAV
-        // never holds it; a retired handle checks alive again before the swap.
-        drop(
-            self.refresh
-                .drive
-                .mutation
-                .lock()
-                .map_err(|_| io::Error::other("mount publication unavailable"))?,
-        );
-        session.umount_and_join()?;
-        recovery::remove_owned(&self.runtime, &self.path)
+        self.refresh.alive.store(true, Ordering::Release);
+        unmount?;
+        // A connection may outlive removal of one attachment (e.g. a mount
+        // cloned into another namespace). Do not wait forever for that worker.
+        Err(io::Error::other(
+            "mount detached but the FUSE connection is still live",
+        ))
     }
 }
 
