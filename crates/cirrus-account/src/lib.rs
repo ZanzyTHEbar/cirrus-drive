@@ -21,7 +21,7 @@ mod storage;
 mod sync;
 mod upload;
 
-pub use mount_metadata::{MountBrowseFlight, MountMetadataWalk};
+pub use mount_metadata::{MountBrowseFlight, MountDirectoryDenial, MountMetadataWalk};
 
 #[cfg(target_os = "macos")]
 mod native_bridge;
@@ -183,6 +183,7 @@ pub struct MountBinding {
     subject: String,
     offline: bool,
     offline_writable: bool,
+    directory_denials: Arc<Mutex<mount_metadata::DirectoryDenials>>,
 }
 
 /// Startup work remaining for an explicit mount; both outcomes use a normal RW binding.
@@ -247,6 +248,11 @@ struct PinTree {
 }
 
 impl FileVersion {
+    /// Mounted path bound to this file version.
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
     /// Length recorded at open.
     pub fn size(&self) -> u64 {
         self.size
@@ -461,7 +467,7 @@ enum DirectorySnapshotPublication {
 
 enum DirectoryAccess<'a> {
     Cli(&'a MountBinding),
-    Mount(&'a MountBinding, &'a str, Option<&'a str>),
+    Mount(&'a MountBinding, &'a str, Option<(&'a str, &'a [String])>),
 }
 
 fn check_stage_file_path(path: &[String]) -> Result<(), AccountError> {
@@ -1530,6 +1536,7 @@ impl Accounts {
     ) -> Result<Vec<Entry>, AccountError> {
         let binding = self.bind_space(instance, space)?;
         self.directory_inner(instance, DirectoryAccess::Cli(&binding), path)?
+            .0
             .collect()
     }
 
@@ -1596,6 +1603,7 @@ impl Accounts {
             subject,
             offline: true,
             offline_writable: false,
+            directory_denials: Arc::default(),
         })
     }
 
@@ -1656,6 +1664,24 @@ impl Accounts {
             DirectoryAccess::Mount(space, parent_id, None),
             path,
         )
+        .map(|(entries, _)| entries)
+    }
+
+    /// Resolves the canonical DAV path behind a live mount's local projection.
+    ///
+    /// # Errors
+    /// Refuses an unavailable mapping or a path hidden by a pending rename.
+    pub fn mount_browse_path(
+        &self,
+        binding: &MountBinding,
+        path: &[String],
+    ) -> Result<Vec<String>, AccountError> {
+        if binding.offline || path.is_empty() {
+            return Ok(path.to_vec());
+        }
+        self.storage.validate(&binding.root)?;
+        offline::tree_remote_path(&binding.root, binding.instance(), &binding.space, path)
+            .map(|(remote, _)| remote)
     }
 
     /// Observes a directory for this mount and marks a durable copy for browse reuse.
@@ -1667,14 +1693,16 @@ impl Accounts {
         binding: &MountBinding,
         path: &[String],
         parent_id: &str,
-        browse_epoch: &str,
-    ) -> Result<DirectorySnapshot, AccountError> {
+        browse: (&str, &[String]),
+    ) -> Result<(DirectorySnapshot, Option<MountDirectoryDenial>), AccountError> {
         if binding.offline {
-            return self.mount_directory(binding.instance(), binding, path, parent_id);
+            return self
+                .mount_directory(binding.instance(), binding, path, parent_id)
+                .map(|entries| (entries, None));
         }
         self.directory_inner(
             binding.instance(),
-            DirectoryAccess::Mount(binding, parent_id, Some(browse_epoch)),
+            DirectoryAccess::Mount(binding, parent_id, Some(browse)),
             path,
         )
     }
@@ -1690,7 +1718,7 @@ impl Accounts {
         path: &[String],
         parent_id: &str,
         alive: &AtomicBool,
-        browse_epoch: &str,
+        (browse_epoch, expected_remote): (&str, &[String]),
         staged: (&[FileVersion], &[(Vec<String>, String)]),
     ) -> Result<Option<MountDirectoryRefresh>, AccountError> {
         if binding.offline {
@@ -1737,10 +1765,16 @@ impl Accounts {
         )?;
         let (remote, fenced) =
             offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
-        if fenced || offline::local_directory(&session.root, session.base.as_str(), space, path)? {
+        if remote != expected_remote
+            || fenced
+            || offline::local_directory(&session.root, session.base.as_str(), space, path)?
+        {
             return Ok(None);
         }
         let observation = offline::begin_snapshot_in(&session.root)?;
+        if binding.directory_denied(&remote, parent_id) {
+            return Ok(None);
+        }
         let observed = dav::directory_snapshot_timed_in(
             &session.root,
             &session.base,
@@ -1750,6 +1784,12 @@ impl Accounts {
             &session.client,
             Duration::from_secs(2),
         );
+        if observed
+            .as_ref()
+            .is_err_and(AccountError::is_directory_forbidden)
+        {
+            binding.record_directory_denial(&remote, parent_id);
+        }
         if !available() {
             return Ok(None);
         }
@@ -1993,16 +2033,16 @@ impl Accounts {
         instance: &str,
         access: DirectoryAccess<'_>,
         path: &[String],
-    ) -> Result<DirectorySnapshot, AccountError> {
-        let (binding, parent_id, publication, browse_epoch) = match access {
+    ) -> Result<(DirectorySnapshot, Option<MountDirectoryDenial>), AccountError> {
+        let (binding, parent_id, publication, browse) = match access {
             DirectoryAccess::Cli(binding) => {
                 (binding, None, DirectorySnapshotPublication::Cli, None)
             }
-            DirectoryAccess::Mount(binding, parent_id, browse_epoch) => (
+            DirectoryAccess::Mount(binding, parent_id, browse) => (
                 binding,
                 Some(parent_id),
                 DirectorySnapshotPublication::Mount,
-                browse_epoch,
+                browse,
             ),
         };
         let cli = matches!(publication, DirectorySnapshotPublication::Cli);
@@ -2013,6 +2053,14 @@ impl Accounts {
         let observation = offline::begin_snapshot_in(&session.root)?;
         let (remote_path, move_fenced) =
             offline::tree_remote_path(&session.root, session.base.as_str(), space, path)?;
+        if browse.is_some_and(|(_, expected_remote)| remote_path != expected_remote) {
+            return Err(AccountError::new(
+                "directory metadata changed concurrently; retry",
+            ));
+        }
+        let tracked_id = browse.and(parent_id);
+        let previous_denial = tracked_id.and_then(|id| binding.directory_denial(&remote_path, id));
+        let mut recovery = None;
         let mut entries = if offline::local_directory(
             &session.root,
             session.base.as_str(),
@@ -2020,11 +2068,13 @@ impl Accounts {
             path,
         )? {
             DirectorySnapshot::empty_in(&session.root)?
+        } else if move_fenced && previous_denial.is_some() {
+            return Err(AccountError::directory_forbidden());
         } else if move_fenced {
             offline::directory_snapshot_at(&session.root, session.base.as_str(), space, path)?
                 .ok_or_else(|| AccountError::new("directory rename requires attention"))?
         } else {
-            match self.read_with_refresh(&session, session_access, |current| {
+            let observed = self.read_with_refresh_inner(&session, session_access, |current| {
                 dav::directory_snapshot_in(
                     &current.root,
                     &current.base,
@@ -2033,7 +2083,15 @@ impl Accounts {
                     &current.account.access_token,
                     &current.client,
                 )
-            }) {
+            });
+            if let Err(error) = &observed {
+                if let Some(id) = tracked_id.filter(|_| error.is_directory_forbidden()) {
+                    binding.record_directory_denial(&remote_path, id);
+                } else if !error.network {
+                    self.invalidate_mount_metadata();
+                }
+            }
+            match observed {
                 Ok(entries) => {
                     if let Some(id) = parent_id
                         && !id.is_empty()
@@ -2058,7 +2116,7 @@ impl Accounts {
                     } else {
                         None
                     };
-                    let saved = if let Some(epoch) = browse_epoch {
+                    let saved = if let Some((epoch, _)) = browse {
                         offline::save_mount_browse_snapshot(
                             observation,
                             session.base.as_str(),
@@ -2092,9 +2150,10 @@ impl Accounts {
                         path,
                         &entries,
                     )?;
+                    recovery = previous_denial;
                     entries
                 }
-                Err(error) if error.network => {
+                Err(error) if error.network && previous_denial.is_none() => {
                     let saved = offline::directory_snapshot_at(
                         &session.root,
                         session.base.as_str(),
@@ -2120,7 +2179,8 @@ impl Accounts {
                             space,
                             path,
                             Some((&session.account.issuer, &session.account.subject)),
-                        );
+                        )
+                        .map(|entries| (entries, None));
                     } else {
                         return Err(error);
                     }
@@ -2129,7 +2189,7 @@ impl Accounts {
             }
         };
         offline::apply_staged_entries(session.base.as_str(), space, path, &mut entries)?;
-        Ok(entries)
+        Ok((entries, recovery))
     }
 
     /// Opens a file within the Space bound to a mount.
@@ -2413,7 +2473,7 @@ impl Accounts {
                         &tree,
                         (retries != 0).then_some(&local_state),
                         |version, offset, length| {
-                            self.read_range_online(&binding, version, offset, length, false)
+                            self.read_range_online(&binding, version, offset, length, false, None)
                                 .map(|(bytes, _metadata)| bytes)
                         },
                         |version| {
@@ -6025,7 +6085,29 @@ impl Accounts {
         offset: u64,
         length: u32,
     ) -> Result<Vec<u8>, AccountError> {
-        self.read_range_in(&binding.root, binding, version, offset, length)
+        self.read_range_in(&binding.root, binding, version, offset, length, None)
+    }
+
+    /// Reads a speculative range without retrying a denied directory verification.
+    ///
+    /// # Errors
+    /// Reports failed verification or a known refusal of the parent directory.
+    pub fn read_range_ahead(
+        &self,
+        binding: &MountBinding,
+        version: &FileVersion,
+        offset: u64,
+        length: u32,
+        parent_id: &str,
+    ) -> Result<Vec<u8>, AccountError> {
+        self.read_range_in(
+            &binding.root,
+            binding,
+            version,
+            offset,
+            length,
+            Some(parent_id),
+        )
     }
 
     fn read_range_in(
@@ -6035,6 +6117,7 @@ impl Accounts {
         version: &FileVersion,
         offset: u64,
         length: u32,
+        speculative_parent: Option<&str>,
     ) -> Result<Vec<u8>, AccountError> {
         if length == 0
             || length > 131_072
@@ -6077,7 +6160,7 @@ impl Accounts {
                 return Err(AccountError::new("staged file changed"));
             }
             return snapshot.range_with(offset, length, |base, offset, length| {
-                self.read_range_in(root, binding, base, offset, length)
+                self.read_range_in(root, binding, base, offset, length, None)
             });
         }
         let access = SessionAccess::BoundSaved(binding);
@@ -6123,7 +6206,7 @@ impl Accounts {
             self.verify_file(binding, version)?;
             return Ok(bytes);
         }
-        match self.read_range_online(binding, version, offset, length, true) {
+        match self.read_range_online(binding, version, offset, length, true, speculative_parent) {
             Ok((bytes, _validated_metadata)) => {
                 // Clean caching is an optimization: failures never invalidate a verified read.
                 // Keep its actual validation scratch owner/allowance alive
@@ -6313,6 +6396,7 @@ impl Accounts {
         offset: u64,
         length: u32,
         allow_saved: bool,
+        speculative_parent: Option<&str>,
     ) -> Result<(Vec<u8>, DirectorySnapshot), AccountError> {
         if length == 0 || length > 131_072 || offset >= version.size {
             return Err(AccountError::new("invalid file range"));
@@ -6327,7 +6411,7 @@ impl Accounts {
         if bound_space(&session, binding)? != version.space {
             return Err(AccountError::new("file version does not match Space"));
         }
-        self.read_with_refresh(&session, access, |current| {
+        let result = self.read_with_refresh_inner(&session, access, |current| {
             let (remote_path, move_fenced) = offline::tree_remote_path(
                 &current.root,
                 current.base.as_str(),
@@ -6341,14 +6425,31 @@ impl Accounts {
                 .split_last()
                 .ok_or_else(|| AccountError::new("invalid file path"))?;
             let verify = || {
-                let entries = dav::directory_snapshot_in(
+                if speculative_parent.is_some_and(|id| binding.directory_denied(parent, id)) {
+                    return Err(AccountError::directory_forbidden());
+                }
+                // Speculation must not hide retries inside a verification call.
+                let observe = if speculative_parent.is_some() {
+                    dav::directory_snapshot_once_in
+                } else {
+                    dav::directory_snapshot_in
+                };
+                let entries = observe(
                     &current.root,
                     &current.base,
                     &version.space,
                     parent,
                     &current.account.access_token,
                     &current.client,
-                )?;
+                );
+                if let Some(id) = speculative_parent
+                    && entries
+                        .as_ref()
+                        .is_err_and(AccountError::is_directory_forbidden)
+                {
+                    binding.record_directory_denial(parent, id);
+                }
+                let entries = entries?;
                 if entries.get(name)?.is_some_and(|entry| {
                     !entry.is_directory()
                         && entry.id() == version.id
@@ -6379,16 +6480,35 @@ impl Accounts {
             self.check_cancelled()?;
             let validated_metadata = verify()?;
             Ok((bytes, validated_metadata))
-        })
+        });
+        if result.as_ref().is_err_and(|error| {
+            !error.network && !(speculative_parent.is_some() && error.is_directory_forbidden())
+        }) {
+            self.invalidate_mount_metadata();
+        }
+        result
     }
 
     fn read_with_refresh<T>(
         &self,
         session: &ReadSession,
         access: SessionAccess<'_>,
+        read: impl FnMut(&ReadSession) -> Result<T, AccountError>,
+    ) -> Result<T, AccountError> {
+        let result = self.read_with_refresh_inner(session, access, read);
+        if result.as_ref().is_err_and(|error| !error.network) {
+            self.invalidate_mount_metadata();
+        }
+        result
+    }
+
+    fn read_with_refresh_inner<T>(
+        &self,
+        session: &ReadSession,
+        access: SessionAccess<'_>,
         mut read: impl FnMut(&ReadSession) -> Result<T, AccountError>,
     ) -> Result<T, AccountError> {
-        let result = match read(session) {
+        match read(session) {
             Err(error) if error.unauthorized => self
                 .refresh_rejected_session(session, access)
                 .and_then(|renewed| read(&renewed))
@@ -6398,11 +6518,7 @@ impl Accounts {
                     error
                 }),
             result => result,
-        };
-        if result.as_ref().is_err_and(|error| !error.network) {
-            self.invalidate_mount_metadata();
         }
-        result
     }
 
     fn refresh_rejected_session(
@@ -7180,6 +7296,7 @@ fn explicit_space_binding(session: &ReadSession, id: &str, name: Option<String>)
         subject: session.account.subject.clone(),
         offline: false,
         offline_writable: false,
+        directory_denials: Arc::default(),
     }
 }
 
@@ -7277,6 +7394,7 @@ pub struct AccountError {
     network: bool,
     upload_uncertain: bool,
     unauthorized: bool,
+    directory_forbidden: bool,
     dav_properties: Option<(u16, Vec<&'static str>)>,
     yielded: bool,
     retryable_read: bool,
@@ -7326,8 +7444,19 @@ impl AccountError {
         self.unauthorized
             || matches!(
                 self.message,
-                "directory access denied or resource removed" | "directory parent identity changed"
+                "directory resource removed" | "directory parent identity changed"
             )
+    }
+
+    /// Whether the top-level DAV directory response explicitly refused access.
+    pub fn is_directory_forbidden(&self) -> bool {
+        self.directory_forbidden
+    }
+
+    fn directory_forbidden() -> Self {
+        let mut error = Self::new("directory access denied (HTTP 403)");
+        error.directory_forbidden = true;
+        error
     }
 
     fn new(message: &'static str) -> Self {
@@ -7336,6 +7465,7 @@ impl AccountError {
             network: false,
             upload_uncertain: false,
             unauthorized: false,
+            directory_forbidden: false,
             dav_properties: None,
             yielded: false,
             retryable_read: false,
@@ -7360,6 +7490,7 @@ impl AccountError {
             network: false,
             upload_uncertain: false,
             unauthorized: true,
+            directory_forbidden: false,
             dav_properties: None,
             yielded: false,
             retryable_read: false,
@@ -7390,6 +7521,7 @@ impl AccountError {
             network: connection_failure || error.is_timeout(),
             upload_uncertain: false,
             unauthorized: false,
+            directory_forbidden: false,
             dav_properties: None,
             yielded: false,
             retryable_read: false,

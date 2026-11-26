@@ -387,6 +387,7 @@ mod acceptance {
                 subject: account.subject.clone(),
                 offline: false,
                 offline_writable: false,
+                directory_denials: Default::default(),
             };
             let saved = SessionAccess::BoundSaved(&binding);
             let rejected = accounts.read_session_in(&root, &instance, saved).unwrap();

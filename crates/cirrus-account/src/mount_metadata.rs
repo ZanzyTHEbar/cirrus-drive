@@ -1,5 +1,6 @@
 //! Metadata-only mount warmup. The frontier belongs to the mount, not the inode cache.
 
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -14,6 +15,83 @@ const RETRY_DELAY: Duration = Duration::from_secs(30);
 const REFRESH_AGE: Duration = Duration::from_secs(5 * 60);
 const MAINTENANCE_TURN: Duration = Duration::from_secs(2);
 const BACKGROUND_DAV_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn walk_refresh_age() -> Duration {
+    #[cfg(feature = "fault-injection")]
+    if std::env::var_os("CIRRUS_TEST_WALK_RECHECK").is_some() {
+        return MAINTENANCE_TURN;
+    }
+    REFRESH_AGE
+}
+
+/// A refusal observed before a validated explicit retry, never a reusable authorization.
+#[derive(Debug)]
+pub struct MountDirectoryDenial(Arc<()>);
+
+// Only actual 403s allocate entries. Do not expire or evict them under pressure:
+// that would retry a known refusal. State costs one entry per distinct denied
+// binding, is released on recovery or unmount, and is never persisted.
+#[derive(Default)]
+pub(crate) struct DirectoryDenials(HashMap<Vec<String>, HashMap<String, Arc<()>>>);
+
+impl MountBinding {
+    pub(super) fn directory_denial(
+        &self,
+        remote: &[String],
+        id: &str,
+    ) -> Option<MountDirectoryDenial> {
+        self.directory_denials
+            .lock()
+            .expect("mount directory denial state poisoned")
+            .0
+            .get(remote)?
+            .get(id)
+            .map(|marker| MountDirectoryDenial(Arc::clone(marker)))
+    }
+
+    /// Whether an exact canonical remote path and directory identity is denied.
+    pub fn directory_denied(&self, remote: &[String], id: &str) -> bool {
+        self.directory_denial(remote, id).is_some()
+    }
+
+    pub(super) fn record_directory_denial(&self, remote: &[String], id: &str) {
+        self.directory_denials
+            .lock()
+            .expect("mount directory denial state poisoned")
+            .0
+            .entry(remote.to_vec())
+            .or_default()
+            .insert(id.to_owned(), Arc::new(()));
+    }
+
+    /// Admit directory publication unless denied. Only an explicit validated
+    /// retry of the current refusal can clear it, at the caller's publication boundary.
+    pub fn admit_directory_publication(
+        &self,
+        remote: &[String],
+        id: &str,
+        recovery: Option<&MountDirectoryDenial>,
+    ) -> bool {
+        let mut denials = self
+            .directory_denials
+            .lock()
+            .expect("mount directory denial state poisoned");
+        let Some(ids) = denials.0.get_mut(remote) else {
+            return true;
+        };
+        let Some(current) = ids.get(id) else {
+            return true;
+        };
+        if recovery.is_none_or(|previous| !Arc::ptr_eq(current, &previous.0)) {
+            return false;
+        }
+        ids.remove(id);
+        if ids.is_empty() {
+            denials.0.remove(remote);
+        }
+        true
+    }
+}
 
 /// An observation shared by the mounted browse path and its background walk.
 pub struct MountBrowseFlight<'a> {
@@ -139,7 +217,7 @@ impl MountMetadataWalk {
                     + if self.incomplete {
                         RETRY_DELAY
                     } else {
-                        REFRESH_AGE
+                        walk_refresh_age()
                     },
             );
             self.incomplete = false;
@@ -162,6 +240,18 @@ impl Accounts {
     ) -> Result<MountBrowseFlight<'_>, AccountError> {
         self.claim_mount_browse(mount, path, BACKGROUND_DAV_TIMEOUT)?
             .ok_or_else(|| AccountError::retryable_read("mount browse observation is busy"))
+    }
+
+    /// Claims a browse observation for background work without waiting.
+    ///
+    /// # Errors
+    /// Reports an unavailable observation state.
+    pub fn try_reserve_mount_browse(
+        &self,
+        mount: &str,
+        remote: &[String],
+    ) -> Result<Option<MountBrowseFlight<'_>>, AccountError> {
+        self.claim_mount_browse(mount, remote, Duration::ZERO)
     }
 
     fn claim_mount_browse(
@@ -275,6 +365,10 @@ impl Accounts {
             let mut flights = Vec::with_capacity(count);
             for target in walk.pending.iter().rev().take(count) {
                 let path = target.components();
+                if binding.directory_denied(&path, &target.id) {
+                    requests.push((target.clone(), path, false, true));
+                    continue;
+                }
                 let Some(flight) = self.claim_mount_browse(mount, &path, Duration::ZERO)? else {
                     return Ok(false);
                 };
@@ -288,15 +382,18 @@ impl Accounts {
                         &path,
                         &target.id,
                     )?;
-                requests.push((target.clone(), path, eligible));
+                requests.push((target.clone(), path, eligible, false));
             }
             let results = std::thread::scope(|scope| {
                 let mut workers = Vec::with_capacity(count);
-                for (_, path, eligible) in &requests {
+                for (target, path, eligible, _) in &requests {
                     let session = &session;
                     workers.push(eligible.then(|| {
                         scope.spawn(move || {
-                            dav::directory_snapshot_timed_in(
+                            if binding.directory_denied(path, &target.id) {
+                                return Err(AccountError::directory_forbidden());
+                            }
+                            let result = dav::directory_snapshot_timed_in(
                                 &session.root,
                                 &session.base,
                                 space,
@@ -304,7 +401,14 @@ impl Accounts {
                                 &session.account.access_token,
                                 &session.client,
                                 BACKGROUND_DAV_TIMEOUT,
-                            )
+                            );
+                            if result
+                                .as_ref()
+                                .is_err_and(AccountError::is_directory_forbidden)
+                            {
+                                binding.record_directory_denial(path, &target.id);
+                            }
+                            result
                         })
                     }));
                 }
@@ -342,8 +446,11 @@ impl Accounts {
             let mut records = Vec::with_capacity(count);
             let mut rejected = Vec::new();
             let mut failed = None;
-            for ((target, path, _), result) in requests.iter().zip(results) {
+            for ((target, path, _, skipped), result) in requests.iter().zip(results) {
                 match result {
+                    None if *skipped => {}
+                    Some(Err(error)) if error.is_directory_forbidden() => {}
+                    Some(Ok(_)) if binding.directory_denied(path, &target.id) => {}
                     Some(Ok(entries))
                         if target.id.is_empty() || entries.matches_parent(&target.id)? =>
                     {

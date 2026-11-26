@@ -107,7 +107,8 @@ def child(root):
              "access_token": "lab-access-rotated", "reject_old_access": False, "reject_second_access": False,
              "reject_propfind_token": None, "reject_range_token": None, "reject_range_barrier": None,
              "allow_second_refresh": False, "second_space": False, "other_dav_requests": 0,
-             "other_space_name": "Other", "extra_child": False}
+             "other_space_name": "Other", "extra_child": False,
+             "deny_directory": None, "small_browse_tree": False}
     dav_paths = []
     wide = [f"extra-{i:02d}" for i in range(70)] if browse_only else []
     wide_paths = {f"/dav/spaces/space/{name}/": name for name in wide}
@@ -123,13 +124,15 @@ def child(root):
                    DBUS_SESSION_BUS_ADDRESS=session_buses.get(runtime, session_buses["two"])[1])
         return run([str(BINARY), *map(str, args)], env=env)
 
-    def start_daemon(runtime, fault=None, bus_dir=None):
+    def start_daemon(runtime, fault=None, bus_dir=None, walk_recheck=False):
         env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime_root / runtime),
                    DBUS_SESSION_BUS_ADDRESS=session_buses.get(runtime, session_buses["two"])[1])
         if fault:
             env["CIRRUS_TEST_MOUNT_STOP"] = fault
         if bus_dir:
             env["CIRRUS_TEST_USER_BUS_DIR"] = str(bus_dir)
+        if walk_recheck:
+            env["CIRRUS_TEST_WALK_RECHECK"] = "1"
         with (root / (runtime + "-daemon.log")).open("w") as log:
             process = subprocess.Popen([str(service_binary())], env=env, stdout=subprocess.DEVNULL, stderr=log)
         daemons[runtime] = process
@@ -299,6 +302,9 @@ def child(root):
             path = urlsplit(self.path).path
             if browse_only:
                 dav_paths.append(path)
+            if path == state["deny_directory"]:
+                self.send_error(403)
+                return
             if path in wide_paths:
                 with dav_gate:
                     dav_parallel[0] += 1
@@ -323,7 +329,8 @@ def child(root):
                     rows.append((base + state["dir_name"] + "/", True, state["dir_id"]))
                     if state["file_present"]:
                         rows.append((base + "item.txt", False, "file-1"))
-                    rows.extend((base + name + "/", True, name) for name in wide)
+                    rows.extend((base + name + "/", True, name)
+                                for name in (wide[:1] if state["small_browse_tree"] else wide))
             elif path == base + state["dir_name"] + "/":
                 rows = [(path, True, state["dir_id"]), (path + "child.txt", False, "child-1")]
                 if browse_only:
@@ -469,7 +476,56 @@ def child(root):
             print("PASS: remote addition published in background, old handle stayed stable, local edit visible", flush=True)
             require(cli("one", "--unmount-space", url, "space"), "unmounting browse fixture")
             require(cli("one", "--stop"), "stopping browse fixture daemon")
-            daemons["one"].wait(timeout=5)
+            assert daemons["one"].wait(timeout=5) == 0
+
+            def retained_leaf():
+                with sqlite3.connect(database) as db:
+                    return db.execute(
+                        "SELECT entries, browse_epoch FROM snapshots WHERE space='space' AND path=?",
+                        ('["folder","branch","leaf"]',)).fetchone()
+
+            old_leaf = retained_leaf()
+            assert old_leaf is not None and "deep.txt" in old_leaf[0], old_leaf
+            state["small_browse_tree"] = True
+            start_daemon("one", walk_recheck=True)
+            state["deny_directory"] = base
+            refused = cli("one", "--mount-space", url, "space", mountpoint)
+            assert refused.returncode and "HTTP 403" in refused.stderr, refused.stderr
+            assert not os.path.ismount(mountpoint)
+
+            denied = base + "folder/branch/leaf/"
+            state["deny_directory"] = denied
+            dav_paths.clear()
+            require(cli("one", "--mount-space", url, "space", mountpoint), "mounting denial fixture")
+            # A subsequent root proves the previous pass drained its frontier.
+            # Require a complete maintenance pass, not just time spent idle.
+            wait_for(lambda: dav_paths.count(base) >= 3, "maintenance did not complete", 30)
+            sibling = base + wide[0] + "/"
+            assert dav_paths.count(sibling) >= 2, "denial prevented sibling warmup"
+            assert dav_paths.count(denied) == 1, ("background retried HTTP 403", dav_paths)
+            assert retained_leaf() == old_leaf, "denial modified retained directory data"
+
+            try:
+                os.listdir(leaf)
+            except OSError as error:
+                assert error.errno == errno.EACCES, error
+            else:
+                raise AssertionError("still-denied explicit listing was served from cache")
+            assert dav_paths.count(denied) == 2, ("explicit listing did not retry once", dav_paths)
+            passes = dav_paths.count(base)
+            wait_for(lambda: dav_paths.count(base) >= passes + 2,
+                     "maintenance did not complete after failed explicit access", 30)
+            assert dav_paths.count(denied) == 2, ("failed explicit retry lifted suppression", dav_paths)
+
+            state["deny_directory"] = None
+            assert os.listdir(leaf) == ["deep.txt"], "validated explicit retry did not recover"
+            wait_for(lambda: dav_paths.count(denied) >= 4,
+                     "recovered directory did not resume background warmup", 25)
+            print("PASS: root 403 refused mount, warmup skipped denied branch across passes, "
+                  "sibling warmed, explicit EACCES retried and recovery resumed warmup", flush=True)
+            require(cli("one", "--unmount-space", url, "space"), "unmounting denial fixture")
+            require(cli("one", "--stop"), "stopping denial fixture daemon")
+            assert daemons["one"].wait(timeout=5) == 0
             return
         start_daemon("two")
         marker_dir = runtime_root / "home" / ".local" / "state" / "cirrus-drive"

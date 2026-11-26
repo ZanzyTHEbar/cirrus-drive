@@ -177,7 +177,9 @@ impl NamespaceRefresh {
                     d.started.elapsed() >= DIRECTORY_REFRESH_AGE
                         && d.attempted.elapsed() >= DIRECTORY_REFRESH_AGE
                         && !state.directory_flights.contains(&d.ino)
-                        && state.nodes.contains_key(&d.ino)
+                        && state
+                            .live_node(d.ino)
+                            .is_some_and(|node| !d.is_denied(&self.drive.space, node))
                 })
                 .min_by_key(|(_, d)| (Some(d.ino) != state.browse_focus, d.attempted))
                 .map(|(index, _)| index);
@@ -199,7 +201,7 @@ impl NamespaceRefresh {
         drop(flight);
         let after = match result {
             Ok(after) => after,
-            Err(Errno::EAGAIN) => return Ok(()),
+            Err(Errno::EAGAIN | Errno::EACCES) => return Ok(()),
             Err(error) => {
                 return Err(io::Error::other(format!(
                     "background directory observation failed: {error:?}"
@@ -1017,16 +1019,32 @@ struct RangeKey {
     length: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RangePriority {
+#[derive(Clone, Copy)]
+enum RangePriority<'a> {
     Foreground,
-    ReadAhead,
+    ReadAhead(&'a str),
+}
+
+impl RangePriority<'_> {
+    fn read(
+        self,
+        accounts: &Accounts,
+        binding: &MountBinding,
+        version: &FileVersion,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, AccountError> {
+        match self {
+            Self::Foreground => accounts.read_range(binding, version, offset, length),
+            Self::ReadAhead(id) => accounts.read_range_ahead(binding, version, offset, length, id),
+        }
+    }
 }
 
 struct Flight {
     result: Mutex<Option<Result<Vec<u8>, ()>>>,
     ready: Condvar,
-    priority: RangePriority,
+    speculative: bool,
 }
 
 struct FlightLeader<'a> {
@@ -1083,6 +1101,7 @@ struct CachedRange {
 #[derive(Clone, PartialEq, Eq)]
 struct CachedDirectory {
     ino: u64,
+    remote_path: Vec<String>,
     parent_revision: u64,
     rejected: bool,
     started: Instant,
@@ -1090,6 +1109,12 @@ struct CachedDirectory {
     mutation_epoch: u64,
     metadata_generation: u64,
     children: DirectoryView,
+}
+
+impl CachedDirectory {
+    fn is_denied(&self, binding: &MountBinding, node: &Node) -> bool {
+        binding.directory_denied(&self.remote_path, &node.resource_id)
+    }
 }
 
 enum DirectoryObservation<'a> {
@@ -1438,6 +1463,7 @@ impl Drive {
                 d.ino == ino.0
                     && d.parent_revision == parent.revision
                     && !d.rejected
+                    && !d.is_denied(&self.space, parent)
                     && d.mutation_epoch == state.mutation_epoch
                     && d.metadata_generation == generation
                     && d.started.elapsed() < max_age
@@ -1512,6 +1538,7 @@ impl Drive {
                     cached.ino == parent.0
                         && cached.mutation_epoch == epoch
                         && cached.metadata_generation == generation
+                        && !cached.is_denied(&self.space, &parent_node)
                         && cached.children.matches(&siblings)
                 })
             {
@@ -1693,6 +1720,7 @@ impl Drive {
                         cached.ino == ino.0
                             && cached.mutation_epoch == epoch
                             && cached.metadata_generation == generation
+                            && !cached.is_denied(&self.space, node)
                             && cached.children.matches(children)
                     })
             };
@@ -1836,16 +1864,33 @@ impl Drive {
         };
         let browse_epoch = format!("{}:{generation}", self.browse_id);
         let durable_epoch = self.namespace()?.mutation_epoch;
-        let _browse_flight = if load_durable {
+        let remote_path = self
+            .accounts
+            .mount_browse_path(&self.space, &parent.path)
+            .map_err(|_| Errno::EIO)?;
+        let _browse_flight = if background.is_some() {
             Some(
                 self.accounts
-                    .reserve_mount_browse(&self.browse_id, &parent.path)
+                    .try_reserve_mount_browse(&self.browse_id, &remote_path)
+                    .map_err(|_| Errno::EIO)?
+                    .ok_or(Errno::EAGAIN)?,
+            )
+        } else if seed.is_none() && !self.space.is_offline() {
+            Some(
+                self.accounts
+                    .reserve_mount_browse(&self.browse_id, &remote_path)
                     .map_err(|_| Errno::EAGAIN)?,
             )
         } else {
             None
         };
-        let durable = if load_durable {
+        let denied = self
+            .space
+            .directory_denied(&remote_path, &parent.resource_id);
+        if denied && background.is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        let durable = if load_durable && !denied {
             // An unusable retained copy never takes down live browse.
             self.accounts
                 .load_mount_browse(
@@ -1888,7 +1933,7 @@ impl Drive {
             (ticket, state.namespace.clone())
         };
         let epoch = namespace.mutation_epoch;
-        if durable.is_some() && epoch != durable_epoch {
+        if epoch != durable_epoch {
             return Err(Errno::EAGAIN);
         }
         let staged_versions: Vec<_> = staged_files
@@ -1908,6 +1953,7 @@ impl Drive {
             .collect();
         drop(namespace);
         drop(staged_files);
+        let mut recovery = None;
         let (mut entries, confirmed, confirmed_directories) = if let Some(entries) = seed {
             (entries, Vec::new(), Vec::new())
         } else if let Some(alive) = background {
@@ -1916,12 +1962,15 @@ impl Drive {
                 &parent.path,
                 &parent.resource_id,
                 alive,
-                &browse_epoch,
+                (&browse_epoch, &remote_path),
                 (&staged_versions, &staged_directories),
             ) {
                 Ok(Some(refreshed)) => refreshed,
                 Ok(None) => return Err(Errno::EAGAIN),
                 Err(error) => {
+                    if error.is_directory_forbidden() {
+                        return Err(Errno::EACCES);
+                    }
                     if error.is_directory_binding_lost() {
                         let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
                         if alive.load(Ordering::Acquire)
@@ -1946,21 +1995,28 @@ impl Drive {
             let entries = if let Some(entries) = durable {
                 entries
             } else {
-                self.accounts
+                let (entries, validated_retry) = self
+                    .accounts
                     .observe_mount_directory(
                         &self.space,
                         &parent.path,
                         &parent.resource_id,
-                        &browse_epoch,
+                        (&browse_epoch, &remote_path),
                     )
                     .map_err(|error| {
                         eprintln!("directory listing failed: {error}");
-                        if error.is_staging_full() {
+                        if error.is_directory_forbidden() {
+                            Errno::EACCES
+                        } else if error.is_metadata_changed() {
+                            Errno::EAGAIN
+                        } else if error.is_staging_full() {
                             Errno::ENOSPC
                         } else {
                             Errno::EIO
                         }
-                    })?
+                    })?;
+                recovery = validated_retry;
+                entries
             };
             let confirmed = if staged_versions.is_empty() {
                 Vec::new()
@@ -2364,6 +2420,7 @@ impl Drive {
             };
             let cached = CachedDirectory {
                 ino: ino.0,
+                remote_path: remote_path.clone(),
                 parent_revision: parent.revision,
                 rejected: false,
                 started,
@@ -2412,6 +2469,17 @@ impl Drive {
                 });
                 detached = current_detached;
                 continue;
+            }
+            if !self.space.admit_directory_publication(
+                &remote_path,
+                &parent.resource_id,
+                recovery.as_ref(),
+            ) {
+                return Err(if background.is_some() || load_durable && !denied {
+                    Errno::EAGAIN
+                } else {
+                    Errno::EACCES
+                });
             }
             let prepared_namespace =
                 Arc::get_mut(&mut namespace).expect("private listing namespace");
@@ -2506,7 +2574,7 @@ impl Drive {
         version: &FileVersion,
         offset: u64,
         length: u32,
-        priority: RangePriority,
+        priority: RangePriority<'_>,
     ) -> Result<Vec<u8>, Errno> {
         let end = offset.checked_add(u64::from(length)).ok_or(Errno::EIO)?;
         let mut result = vec![0; length as usize];
@@ -2549,13 +2617,13 @@ impl Drive {
         version: &FileVersion,
         range: (u64, u64),
         join: bool,
-        priority: RangePriority,
+        priority: RangePriority<'_>,
     ) -> Result<(u64, u64, Vec<u8>, bool), Errno> {
         let (offset, end) = range;
         let length = u32::try_from(end - offset).map_err(|_| Errno::EIO)?;
         if !join {
-            let bytes = accounts
-                .read_range(binding, version, offset, length)
+            let bytes = priority
+                .read(accounts, binding, version, offset, length)
                 .map_err(|_| Errno::EIO)?;
             return Ok((offset, end, bytes, false));
         }
@@ -2584,7 +2652,7 @@ impl Drive {
                 let flight = Arc::new(Flight {
                     result: Mutex::new(None),
                     ready: Condvar::new(),
-                    priority,
+                    speculative: matches!(priority, RangePriority::ReadAhead(_)),
                 });
                 flights.insert(key.clone(), Arc::clone(&flight));
                 (flight, true, offset, end)
@@ -2596,7 +2664,7 @@ impl Drive {
                 key: Some(key),
                 flight: Arc::clone(&flight),
             };
-            let result = accounts.read_range(binding, version, offset, length);
+            let result = priority.read(accounts, binding, version, offset, length);
             #[cfg(feature = "fault-injection")]
             if std::env::var_os("CIRRUS_TEST_RETAINED_SH_OWNER").is_some()
                 && let Err(error) = &result
@@ -2623,10 +2691,7 @@ impl Drive {
         }
         let bytes = match shared.as_ref() {
             Some(Ok(bytes)) => bytes,
-            _ if !leader
-                && priority == RangePriority::Foreground
-                && flight.priority == RangePriority::ReadAhead =>
-            {
+            _ if !leader && matches!(priority, RangePriority::Foreground) && flight.speculative => {
                 drop(shared);
                 let bytes = accounts
                     .read_range(binding, version, offset, length)
@@ -2646,11 +2711,18 @@ impl Drive {
         Ok((overlap_start, overlap_end, overlap, !leader))
     }
 
-    fn read_ahead(&self, version: &FileVersion, offset: u64) {
-        if version.id().starts_with("cirrus-staged:")
-            || offset >= version.size()
-            || !self.accounts.reserve_read_ahead()
-        {
+    fn read_ahead(&self, ino: INodeNo, version: &FileVersion, offset: u64) {
+        if version.id().starts_with("cirrus-staged:") || offset >= version.size() {
+            return;
+        }
+        let parent_id = self.state.lock().ok().and_then(|state| {
+            let file = state.live_node(ino.0)?;
+            let parent = state.live_node(file.parent)?;
+            (file.resource_id == version.id() && file.path == version.path())
+                .then(|| parent.resource_id.clone())
+        });
+        let Some(parent_id) = parent_id else { return };
+        if !self.accounts.reserve_read_ahead() {
             return;
         }
         let accounts = Arc::clone(&self.accounts);
@@ -2670,7 +2742,7 @@ impl Drive {
                     &version,
                     offset,
                     length,
-                    RangePriority::ReadAhead,
+                    RangePriority::ReadAhead(&parent_id),
                 );
             });
     }
@@ -3040,6 +3112,15 @@ impl Drive {
             // if the same inode and empty-directory observation still apply.
             if state.mutation_epoch != epoch
                 || self.accounts.metadata_generation() != generation
+                || !state.live_node(parent.0).is_some_and(|node| {
+                    state.directories.iter().any(|cached| {
+                        cached.ino == parent.0
+                            && cached.mutation_epoch == epoch
+                            && cached.metadata_generation == generation
+                            && !cached.is_denied(&self.space, node)
+                            && cached.children.matches(&siblings)
+                    })
+                })
                 || state.paths.get(&node.path) != Some(&id)
                 || !state.nodes.get(&id).is_some_and(|current| {
                     current.parent == node.parent
@@ -3051,6 +3132,7 @@ impl Drive {
                         cached.ino == id
                             && cached.mutation_epoch == epoch
                             && cached.metadata_generation == generation
+                            && !cached.is_denied(&self.space, &node)
                             && cached.children.matches(children)
                     })
                 })
@@ -4741,7 +4823,7 @@ impl Filesystem for Drive {
                 Err(error) => return Err(error),
             };
             if sequential {
-                self.read_ahead(&version, next);
+                self.read_ahead(ino, &version, next);
             }
             Ok(bytes)
         })();
