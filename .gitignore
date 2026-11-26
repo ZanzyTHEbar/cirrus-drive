@@ -5,7 +5,7 @@
 /DESIGN.md
 /PRODUCT.md
 /docs/
-
+.unlazy/
 # Generated files and local configuration.
 __pycache__/
 *.py[cod]
